@@ -1,0 +1,29 @@
+{
+    "tcp": {
+        "enabled": true,
+        "port": 5566
+    },
+    "python": {
+        "venv_path": "C:/google_env/station_venv",
+        "python_home": "C:/Python312",
+        "dll_paths": [
+            "C:/Python312",
+            "C:/google_env/dll"
+        ],
+        "cal_path": "C:/google_env/hdf5_files"
+    },
+    "devices": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+    ]
+}

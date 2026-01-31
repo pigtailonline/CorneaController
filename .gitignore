@@ -1,0 +1,42 @@
+# Build directories
+build/
+release/
+debug/
+*.exe
+*.dll
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# Qt generated files
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+*.qm
+Makefile*
+.qmake.stash
+
+# IDE files
+.vs/
+.vscode/
+*.user
+*.pro.user*
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+*.egg-info/
+
+# Config files with local paths (template provided)
+cornea_config.json
+
+# OS files
+Thumbs.db
+.DS_Store
