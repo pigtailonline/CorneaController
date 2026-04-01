@@ -11,6 +11,7 @@
 #include <QCheckBox>
 #include <QTimer>
 #include <memory>
+#include <atomic>
 
 #include "pythonbridge.h"
 
@@ -25,6 +26,8 @@ class DeviceControlPanel : public QWidget
     Q_OBJECT
 
 public:
+    static constexpr double TEMPERATURE_LIMIT = 65.0;
+
     explicit DeviceControlPanel(int panelId, PythonBridge *bridge, QWidget *parent = nullptr);
     ~DeviceControlPanel();
 
@@ -34,13 +37,21 @@ public:
 
     // Device state
     bool isConnected() const;
+    bool isPoweredOn() const;
     void setDeviceInfo(const DeviceInfo &info);
     void setImageLoader(ImageLoader *loader);
 
     // Device info accessors
+    int deviceIndex() const { return m_deviceInfo.index; }
     QString deviceSerial() const { return m_deviceInfo.serial; }
     QString getPanelId() const;
     double getRj1Temperature() const;
+
+    // Thread-safe controller access (for TCP API, no UI)
+    CorneaController* controller() const { return m_controller.get(); }
+    double currentBrightness() const { return m_currentBrightness; }
+    QString currentVariant() const { return m_currentVariant; }
+    void setCurrentVariant(const QString &v) { m_currentVariant = v; }
 
     // Config setters (call before power on)
     void setVariant(const QString &variant);
@@ -134,7 +145,6 @@ private:
 
     // Temperature monitoring
     QTimer *m_temperatureTimer;
-    static constexpr double TEMPERATURE_LIMIT = 55.0;
     static constexpr int TEMPERATURE_CHECK_INTERVAL_MS = 5000;
 
     // Brightness protection (check temp every 1s for 5s after brightness change)
@@ -145,6 +155,18 @@ private:
 
     void applyBrightness(double brightness);
     void startBrightnessProtection();
+
+    // Cached state for thread-safe API access (no UI widget reads needed)
+    double m_currentBrightness = 0.03;
+    QString m_currentVariant = "standard";
+
+    // Async operation management
+    bool m_asyncTempBusy = false;
+    std::shared_ptr<std::atomic<bool>> m_asyncGuard;
+
+public:
+    // APL calculation with gamma LUT (fast, same result as std::pow)
+    static double calculatePatternApl(const QImage &image);
 };
 
 #endif // DEVICECONTROLPANEL_H

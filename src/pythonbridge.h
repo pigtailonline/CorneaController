@@ -8,8 +8,8 @@
 #include <QImage>
 #include <QMap>
 #include <QList>
-#include <QMutex>
-#include <QMutexLocker>
+#include <QThread>
+#include <QRandomGenerator>
 #include <memory>
 
 // Forward declare Python types to avoid including Python.h in header
@@ -34,7 +34,8 @@ public:
     // Initialization (Python interpreter - call once)
     bool initialize(const QString &venvPath);
     bool initialize(const QString &venvPath, const QString &pythonHome,
-                    const QStringList &dllPaths, const QString &calPath);
+                    const QStringList &dllPaths, const QString &calPath,
+                    bool allowDefaultHdf5 = false);
     void shutdown();
     bool isInitialized() const { return m_initialized; }
 
@@ -100,6 +101,7 @@ signals:
     void logMessage(const QString &message);
 
 private:
+    // Internal methods (only called on Python worker thread)
     bool importModule(const QString &moduleName);
     PyObject* callInstanceMethod(int instanceId, const char *methodName, PyObject *args = nullptr);
     QVariant pyObjectToVariant(PyObject *obj);
@@ -113,11 +115,13 @@ private:
     PyObject *m_module;
     PyObject *m_corneaClass;
     PyObject *m_numpyModule;
+    PyObject *m_executor;  // Python concurrent.futures.ThreadPoolExecutor
     QString m_lastError;
     QString m_venvPath;
     QString m_pythonHome;
     QStringList m_dllPaths;
     QString m_calPath;
+    bool m_allowDefaultHdf5;
 
     // Multi-instance management
     QMap<int, PyObject*> m_deviceInstances;  // instanceId -> CorneaRax720
@@ -125,9 +129,35 @@ private:
     QMap<int, QString> m_serialMap;          // instanceId -> serial number
     int m_nextInstanceId = 0;
 
-    // Thread safety for I2C bus access
-    // All Python API calls must be serialized to prevent I2C bus conflicts
-    mutable QMutex m_apiMutex;
+    // Dedicated Python worker thread
+    // All Python C API calls happen exclusively on this thread.
+    // No GIL management needed — single thread = serialized access.
+    QThread m_pythonThread;
+    QObject *m_pythonWorker = nullptr;
+
+    // Dispatch helpers: run callable on Python thread, block until done.
+    // If already on Python thread, runs directly (avoids deadlock).
+    template<typename F> auto dispatch(F &&f) -> decltype(f());
+    void dispatchVoid(std::function<void()> f);
+
+#ifdef QT_DEBUG
+    // Debug simulation mode — no hardware, no Python, fake 12 devices.
+    // Enabled automatically in debug builds.
+    static constexpr bool m_simulateMode = true;
+    static constexpr int SIM_DEVICE_COUNT = 12;
+    static constexpr int SIM_DELAY_MS = 1000;
+
+    struct SimDevice {
+        QString serial;
+        bool connected = false;
+        double brightness = 0.0;
+        bool xFlip = false;
+        bool yFlip = false;
+    };
+    QMap<int, SimDevice> m_simDevices;
+#else
+    static constexpr bool m_simulateMode = false;
+#endif
 };
 
 #endif // PYTHONBRIDGE_H

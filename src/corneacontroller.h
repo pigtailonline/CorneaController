@@ -34,6 +34,7 @@ public:
     bool powerOff();
     bool setVsysEnabled(bool enabled);
     bool isPoweredOn() const { return m_poweredOn; }
+    QString lastError() const;
 
     // Brightness
     bool setBrightness(double level);
@@ -92,6 +93,9 @@ signals:
 
 private slots:
     void onTemperaturePollTimeout();
+
+    // Check if device is ready for commands (connected + powered on)
+    bool requirePoweredOn(const QString &operation);
 
 private:
     PythonBridge *m_bridge;  // Shared, not owned

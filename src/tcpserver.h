@@ -9,6 +9,10 @@
 #include <QJsonArray>
 #include <QList>
 #include <QMap>
+#include <QPointer>
+#include <QSet>
+#include <atomic>
+#include <memory>
 
 class CorneaWidget;
 
@@ -52,16 +56,21 @@ private:
     QJsonObject handleGetStatus(const QJsonObject &params);
     QJsonObject handleListDevices(const QJsonObject &params);
     QJsonObject handleRefreshDevices(const QJsonObject &params);
+    QJsonObject handleListImages(const QJsonObject &params);
+    QJsonObject handleSendImageByName(const QJsonObject &params);
 
     // Helper methods
     QJsonObject makeSuccess(const QVariant &data = QVariant());
     QJsonObject makeError(const QString &message);
     void sendResponse(QTcpSocket *client, const QJsonObject &response);
+    static bool isAsyncCommand(const QString &cmdName);
 
     QTcpServer *m_server;
     QList<QTcpSocket*> m_clients;
     QMap<QTcpSocket*, QByteArray> m_buffers;  // Per-client receive buffer
     CorneaWidget *m_corneaWidget;
+
+    std::shared_ptr<std::atomic<bool>> m_asyncGuard;
 };
 
 #endif // TCPSERVER_H

@@ -4,6 +4,7 @@
 #include "devicecontrolpanel.h"
 #include "imageloader.h"
 #include "tcpserver.h"
+#include "corneacontroller.h"
 
 #include <QMessageBox>
 #include <QDateTime>
@@ -13,6 +14,7 @@
 #include <QDir>
 #include <QCoreApplication>
 #include <QResizeEvent>
+#include <QThread>
 
 CorneaWidget::CorneaWidget(QWidget *parent)
     : QWidget(parent)
@@ -28,6 +30,22 @@ CorneaWidget::CorneaWidget(QWidget *parent)
 CorneaWidget::~CorneaWidget()
 {
     m_pythonOutputTimer->stop();
+
+    // Stop TCP server before deleting UI — TcpServer::stop() emits logMessage
+    // which writes to ui->txtLog, so the server must be stopped while UI is alive
+    if (m_tcpServer) {
+        m_tcpServer->disconnect(this);
+        m_tcpServer.reset();
+    }
+
+    // Destroy device panels before members (PythonBridge) are destroyed.
+    // Panels are QWidget children, normally destroyed in QWidget::~QWidget()
+    // which runs AFTER member destruction — but panels access PythonBridge
+    // in their destructor, so we must delete them while PythonBridge is alive.
+    qDeleteAll(m_devicePanels);
+    m_devicePanels.clear();
+    m_indexToPanelMap.clear();
+
     delete ui;
 }
 
@@ -93,7 +111,7 @@ bool CorneaWidget::initializePythonBridge()
     }
 
     // Initialize with config values
-    if (!m_pythonBridge->initialize(py.venvPath, py.pythonHome, py.dllPaths, py.calPath)) {
+    if (!m_pythonBridge->initialize(py.venvPath, py.pythonHome, py.dllPaths, py.calPath, py.allowDefaultHdf5)) {
         appendLog("Warning: Failed to initialize Python bridge. Check config paths.");
         QMessageBox::warning(this, "Initialization Warning",
             "Failed to initialize Python bridge.\n"
@@ -372,76 +390,81 @@ double CorneaWidget::getRj1Temperature(int index) const
 
 // === Public API (by serial) ===
 
+// ---------------------------------------------------------------------------
+// Thread-safe helper: get controller directly, bypassing panel UI.
+// All *BySerial() methods below use this for TCP async safety.
+// ---------------------------------------------------------------------------
+CorneaController* CorneaWidget::getControllerBySerial(const QString &serial) const
+{
+    DeviceControlPanel *panel = getPanelBySerial(serial);
+    return panel ? panel->controller() : nullptr;
+}
+
 bool CorneaWidget::powerOnBySerial(const QString &serial)
 {
     DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) {
-        appendLog(QString("powerOnBySerial: device %1 not found").arg(serial));
-        return false;
-    }
-    return panel->powerOnDirect();
+    if (!panel) return false;
+
+    CorneaController *ctrl = panel->controller();
+    if (ctrl->isConnected()) return true;
+
+    // Thread-safe: controller->connect() calls PythonBridge::dispatch().
+    // CorneaController emits connected() signal which auto-queues to main thread,
+    // triggering DeviceControlPanel::onControllerConnected() for UI updates.
+    return ctrl->connect(panel->deviceIndex(), panel->currentVariant());
+}
+
+bool CorneaWidget::powerOnBySerial(const QString &serial, const QString &variant)
+{
+    DeviceControlPanel *panel = getPanelBySerial(serial);
+    if (!panel) return false;
+
+    // Thread-safe: update cached variant, schedule UI update on main thread
+    panel->setCurrentVariant(variant);
+    QMetaObject::invokeMethod(panel, [panel, variant]() {
+        panel->setVariant(variant);
+    }, Qt::QueuedConnection);
+
+    CorneaController *ctrl = panel->controller();
+    if (ctrl->isConnected()) return true;
+
+    return ctrl->connect(panel->deviceIndex(), variant);
 }
 
 bool CorneaWidget::powerOffBySerial(const QString &serial)
 {
-    DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) {
-        appendLog(QString("powerOffBySerial: device %1 not found").arg(serial));
-        return false;
-    }
-    return panel->powerOffDirect();
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (!ctrl || !ctrl->isConnected()) return true;
+    ctrl->disconnect();
+    return true;
 }
 
 bool CorneaWidget::sendImageBySerial(const QString &serial, const QString &imagePath)
 {
     QImage image(imagePath);
-    if (image.isNull()) {
-        appendLog(QString("sendImageBySerial: failed to load image %1").arg(imagePath));
-        return false;
-    }
+    if (image.isNull()) return false;
     return sendImageBySerial(serial, image);
 }
 
 bool CorneaWidget::sendImageBySerial(const QString &serial, const QImage &image)
 {
-    DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) {
-        appendLog(QString("sendImageBySerial: device %1 not found").arg(serial));
-        return false;
-    }
-    if (!panel->isConnected()) {
-        appendLog(QString("sendImageBySerial: device %1 not connected").arg(serial));
-        return false;
-    }
-    return panel->sendImageDirect(image);
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (!ctrl || !ctrl->isConnected()) return false;
+    return ctrl->sendImage(image);
 }
 
 bool CorneaWidget::setBrightnessBySerial(const QString &serial, double level)
 {
-    DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) {
-        appendLog(QString("setBrightnessBySerial: device %1 not found").arg(serial));
-        return false;
-    }
-    if (!panel->isConnected()) {
-        appendLog(QString("setBrightnessBySerial: device %1 not connected").arg(serial));
-        return false;
-    }
-    return panel->setBrightnessDirect(level);
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (!ctrl || !ctrl->isConnected()) return false;
+    return ctrl->setBrightness(level);
 }
 
 bool CorneaWidget::setFlipBySerial(const QString &serial, bool xFlip, bool yFlip)
 {
-    DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) {
-        appendLog(QString("setFlipBySerial: device %1 not found").arg(serial));
-        return false;
-    }
-    if (!panel->isConnected()) {
-        appendLog(QString("setFlipBySerial: device %1 not connected").arg(serial));
-        return false;
-    }
-    return panel->setFlipDirect(xFlip, yFlip);
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (!ctrl || !ctrl->isConnected()) return false;
+    return ctrl->setXFlip(xFlip) && ctrl->setYFlip(yFlip);
 }
 
 ApiResult CorneaWidget::sendImageBySerialEx(const QString &serial, const QString &imagePath)
@@ -456,58 +479,95 @@ ApiResult CorneaWidget::sendImageBySerialEx(const QString &serial, const QString
 ApiResult CorneaWidget::sendImageBySerialEx(const QString &serial, const QImage &image)
 {
     DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) {
-        return ApiResult::fail(QString("Device not found: %1").arg(serial));
+    if (!panel) return ApiResult::fail(QString("Device not found: %1").arg(serial));
+
+    CorneaController *ctrl = panel->controller();
+    if (!ctrl->isConnected()) return ApiResult::fail(QString("Device not connected: %1").arg(serial));
+
+    // APL check (thread-safe: static method + cached brightness)
+    double patternApl = DeviceControlPanel::calculatePatternApl(image);
+    double brightness = panel->currentBrightness();
+    double totalApl = patternApl * brightness;
+
+    const double APL_LIMIT = 0.06;
+    if (totalApl > APL_LIMIT) {
+        return ApiResult::fail(QString("APL_EXCEEDED: Total APL %1 > limit %2 (pattern=%3, brightness=%4)")
+                                   .arg(totalApl, 0, 'f', 4).arg(APL_LIMIT, 0, 'f', 2)
+                                   .arg(patternApl, 0, 'f', 4).arg(brightness, 0, 'f', 2));
     }
-    if (!panel->isConnected()) {
-        return ApiResult::fail(QString("Device not connected: %1").arg(serial));
+
+    if (ctrl->sendImage(image)) {
+        return ApiResult::ok();
     }
-    return panel->sendImageDirectEx(image);
+    return ApiResult::fail("Failed to send image to device");
 }
 
 ApiResult CorneaWidget::setBrightnessBySerialEx(const QString &serial, double level, bool waitProtection)
 {
     DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) {
-        return ApiResult::fail(QString("Device not found: %1").arg(serial));
+    if (!panel) return ApiResult::fail(QString("Device not found: %1").arg(serial));
+
+    CorneaController *ctrl = panel->controller();
+    if (!ctrl->isConnected()) return ApiResult::fail(QString("Device not connected: %1").arg(serial));
+
+    if (!ctrl->setBrightness(level)) {
+        return ApiResult::fail("Failed to set brightness");
     }
-    if (!panel->isConnected()) {
-        return ApiResult::fail(QString("Device not connected: %1").arg(serial));
+
+    if (waitProtection) {
+        for (int i = 0; i < 5; ++i) {
+            QThread::msleep(1000);
+            if (!ctrl->isConnected()) return ApiResult::fail("Device disconnected during protection check");
+
+            double rj1 = ctrl->getRj1Temperature();
+            double da9272 = ctrl->getDa9272Temperature();
+            double maxTemp = qMax(rj1, da9272);
+
+            if (maxTemp > DeviceControlPanel::TEMPERATURE_LIMIT) {
+                ctrl->powerOff();
+                return ApiResult::fail(QString("OVERHEAT: Temp %1°C > %2°C limit")
+                    .arg(maxTemp, 0, 'f', 1).arg(DeviceControlPanel::TEMPERATURE_LIMIT, 0, 'f', 1));
+            }
+        }
     }
-    return panel->setBrightnessDirectEx(level, waitProtection);
+    return ApiResult::ok();
 }
 
 bool CorneaWidget::isConnectedBySerial(const QString &serial) const
 {
-    DeviceControlPanel *panel = getPanelBySerial(serial);
-    return panel && panel->isConnected();
+    CorneaController *ctrl = getControllerBySerial(serial);
+    return ctrl && ctrl->isConnected();
 }
 
 QString CorneaWidget::getPanelIdBySerial(const QString &serial) const
 {
-    DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel || !panel->isConnected()) {
-        return QString();
-    }
-    return panel->getPanelId();
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (!ctrl || !ctrl->isConnected()) return QString();
+    return ctrl->getPanelId();
 }
 
 double CorneaWidget::getTemperatureBySerial(const QString &serial) const
 {
-    DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel || !panel->isConnected()) {
-        return -999.0;
-    }
-    return panel->getRj1Temperature();
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (!ctrl || !ctrl->isConnected()) return -999.0;
+    return ctrl->getRj1Temperature();
 }
 
 QString CorneaWidget::getVariantBySerial(const QString &serial) const
 {
     DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) {
-        return QString();
-    }
-    return panel->getVariant();
+    if (!panel) return QString();
+    return panel->currentVariant();
+}
+
+QStringList CorneaWidget::getImageNames() const
+{
+    return m_imageLoader ? m_imageLoader->getImageNames() : QStringList();
+}
+
+QImage CorneaWidget::getImageByName(const QString &name) const
+{
+    return m_imageLoader ? m_imageLoader->getImage(name) : QImage();
 }
 
 QStringList CorneaWidget::getDeviceSerials() const
@@ -632,23 +692,44 @@ void CorneaWidget::refreshDeviceList()
     // Update device count label
     ui->lblDeviceCount->setText(QString("Devices: %1").arg(devices.size()));
 
-    // Disconnect all existing panels first (before deleting)
+    // Build a map of active (powered on) panels by serial — these must survive refresh
+    QMap<QString, DeviceControlPanel*> activePanels;
     for (DeviceControlPanel *panel : m_devicePanels) {
-        if (panel && panel->isConnected()) {
-            panel->powerOffDirect();
-            appendLog(QString("Disconnecting %1 before refresh...").arg(panel->panelLabel()));
+        if (panel && panel->isConnected() && panel->isPoweredOn()) {
+            QString serial = panel->controller()->getDeviceSerial();
+            activePanels[serial] = panel;
+            appendLog(QString("Keeping %1 alive during refresh (powered on)").arg(panel->panelLabel()));
         }
     }
 
-    // Clear existing tabs and panels
-    while (ui->tabDevices->count() > 0) {
-        QWidget *widget = ui->tabDevices->widget(0);
-        ui->tabDevices->removeTab(0);
-        delete widget;  // Delete immediately instead of deleteLater to ensure cleanup
+    // Remove all non-DeviceControlPanel tabs (e.g. "No Devices" placeholder)
+    for (int i = ui->tabDevices->count() - 1; i >= 0; --i) {
+        QWidget *w = ui->tabDevices->widget(i);
+        if (!qobject_cast<DeviceControlPanel*>(w)) {
+            ui->tabDevices->removeTab(i);
+            delete w;
+        }
+    }
+
+    // Disconnect idle panels, remove tabs (but don't delete active ones)
+    for (DeviceControlPanel *panel : m_devicePanels) {
+        if (panel && !activePanels.values().contains(panel)) {
+            if (panel->isConnected()) {
+                panel->powerOffDirect();
+                appendLog(QString("Disconnecting idle %1 before refresh...").arg(panel->panelLabel()));
+            }
+            int tabIdx = ui->tabDevices->indexOf(panel);
+            if (tabIdx >= 0) ui->tabDevices->removeTab(tabIdx);
+            delete panel;
+        } else {
+            // Remove active panel's tab (will be re-added in correct order below)
+            int tabIdx = ui->tabDevices->indexOf(panel);
+            if (tabIdx >= 0) ui->tabDevices->removeTab(tabIdx);
+        }
     }
     m_devicePanels.clear();
 
-    // Create one tab per detected device
+    // Rebuild tabs: reuse active panels, create new ones for the rest
     for (int i = 0; i < devices.size(); ++i) {
         const DeviceInfo &info = devices[i];
 
@@ -661,37 +742,42 @@ void CorneaWidget::refreshDeviceList()
             }
         }
 
-        // Get device config for variant and brightness
         DeviceConfig devConfig = m_config.getDevice(configIndex);
 
-        // Create panel for this device
-        DeviceControlPanel *panel = new DeviceControlPanel(i, m_pythonBridge.get(), this);
-        panel->setImageLoader(m_imageLoader.get());
+        DeviceControlPanel *panel = nullptr;
+        if (activePanels.contains(info.serial)) {
+            // Reuse existing active panel
+            panel = activePanels.take(info.serial);
+            panel->setDeviceInfo(info);  // Update info but keep connection alive
+        } else {
+            // Create new panel
+            panel = new DeviceControlPanel(i, m_pythonBridge.get(), this);
+            panel->setImageLoader(m_imageLoader.get());
+            panel->setDeviceInfo(info);
 
-        // Set the device info for this panel
-        panel->setDeviceInfo(info);
+            if (devConfig.isValid()) {
+                panel->setVariant(devConfig.variant);
+                panel->setInitialBrightness(devConfig.brightness);
+            }
 
-        // Apply config settings
-        if (devConfig.isValid()) {
-            panel->setVariant(devConfig.variant);
-            panel->setInitialBrightness(devConfig.brightness);
+            connect(panel, &DeviceControlPanel::logMessage,
+                    this, &CorneaWidget::onPanelLogMessage);
+            connect(panel, &DeviceControlPanel::connectionChanged,
+                    this, &CorneaWidget::onPanelConnectionChanged);
+            connect(panel, &DeviceControlPanel::variantChanged,
+                    this, &CorneaWidget::onPanelVariantChanged);
         }
 
-        // Connect panel signals
-        connect(panel, &DeviceControlPanel::logMessage,
-                this, &CorneaWidget::onPanelLogMessage);
-        connect(panel, &DeviceControlPanel::connectionChanged,
-                this, &CorneaWidget::onPanelConnectionChanged);
-        connect(panel, &DeviceControlPanel::variantChanged,
-                this, &CorneaWidget::onPanelVariantChanged);
-
-        // Add tab with device display name
-        QString tabLabel = QString("Device %1").arg(i);
-        if (!info.serial.isEmpty()) {
-            tabLabel = info.serial;
-        }
+        QString tabLabel = info.serial.isEmpty() ? QString("Device %1").arg(i) : info.serial;
         ui->tabDevices->addTab(panel, tabLabel);
         m_devicePanels.append(panel);
+    }
+
+    // Clean up any active panels whose serial no longer exists in device list
+    for (DeviceControlPanel *orphan : activePanels.values()) {
+        appendLog(QString("Active panel no longer detected, disconnecting: %1").arg(orphan->panelLabel()));
+        orphan->powerOffDirect();
+        delete orphan;
     }
 
     // If no devices found, show a placeholder tab

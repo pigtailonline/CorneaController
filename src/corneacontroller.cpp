@@ -24,6 +24,11 @@ CorneaController::~CorneaController()
     disconnect();
 }
 
+QString CorneaController::lastError() const
+{
+    return m_bridge ? m_bridge->getLastError() : QString();
+}
+
 bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant)
 {
     if (m_instanceId >= 0) {
@@ -36,8 +41,10 @@ bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant)
         m_deviceIndex = deviceIndex;
         m_deviceSerial = m_bridge->getDeviceSerial(instanceId);
         m_currentBrightness = m_bridge->getBrightness(instanceId);
+        m_poweredOn = true;
 
         emit connected();
+        emit powerStateChanged(true);
         emit logMessage(QString("Connected to device: %1").arg(getDeviceLabel()));
         return true;
     }
@@ -131,12 +138,26 @@ bool CorneaController::setVsysEnabled(bool enabled)
     return m_bridge->enableVsys(m_instanceId, enabled);
 }
 
-bool CorneaController::setBrightness(double level)
+bool CorneaController::requirePoweredOn(const QString &operation)
 {
     if (!isConnected()) {
-        emit errorOccurred("Not connected to device");
+        QString err = QString("%1 failed: device not connected").arg(operation);
+        emit errorOccurred(err);
+        qWarning() << err;
         return false;
     }
+    if (!isPoweredOn()) {
+        QString err = QString("%1 failed: device is powered off (possibly overheated)").arg(operation);
+        emit errorOccurred(err);
+        qWarning() << err;
+        return false;
+    }
+    return true;
+}
+
+bool CorneaController::setBrightness(double level)
+{
+    if (!requirePoweredOn("setBrightness")) return false;
 
     // Clamp to valid range
     level = qBound(0.0, level, 1.0);
@@ -165,10 +186,7 @@ double CorneaController::getBrightness()
 
 bool CorneaController::setXFlip(bool flip)
 {
-    if (!isConnected()) {
-        emit errorOccurred("Not connected to device");
-        return false;
-    }
+    if (!requirePoweredOn("setXFlip")) return false;
 
     if (m_bridge->setXFlip(m_instanceId, flip)) {
         m_currentXFlip = flip;
@@ -180,10 +198,7 @@ bool CorneaController::setXFlip(bool flip)
 
 bool CorneaController::setYFlip(bool flip)
 {
-    if (!isConnected()) {
-        emit errorOccurred("Not connected to device");
-        return false;
-    }
+    if (!requirePoweredOn("setYFlip")) return false;
 
     if (m_bridge->setYFlip(m_instanceId, flip)) {
         m_currentYFlip = flip;
@@ -215,10 +230,7 @@ bool CorneaController::getYFlip()
 
 bool CorneaController::sendImage(const QImage &image)
 {
-    if (!isConnected()) {
-        emit errorOccurred("Not connected to device");
-        return false;
-    }
+    if (!requirePoweredOn("sendImage")) return false;
 
     bool success = m_bridge->writeFrame(m_instanceId, image);
     emit imageSent(success);
@@ -227,10 +239,7 @@ bool CorneaController::sendImage(const QImage &image)
 
 bool CorneaController::sendImageFile(const QString &filePath)
 {
-    if (!isConnected()) {
-        emit errorOccurred("Not connected to device");
-        return false;
-    }
+    if (!requirePoweredOn("sendImageFile")) return false;
 
     bool success = m_bridge->writeFrameFromPath(m_instanceId, filePath);
     emit imageSent(success);
@@ -239,9 +248,7 @@ bool CorneaController::sendImageFile(const QString &filePath)
 
 QString CorneaController::getPanelId()
 {
-    if (!isConnected()) {
-        return QString();
-    }
+    if (!requirePoweredOn("getPanelId")) return QString();
 
     return m_bridge->getPanelId(m_instanceId);
 }

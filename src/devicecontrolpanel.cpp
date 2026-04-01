@@ -4,13 +4,14 @@
 #include "corneawidget.h"  // For ApiResult
 
 #include <cmath>
+#include <QThread>
+#include <QtConcurrent>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QFormLayout>
 #include <QMessageBox>
 #include <QApplication>
-#include <QThread>
 
 DeviceControlPanel::DeviceControlPanel(int panelId, PythonBridge *bridge, QWidget *parent)
     : QWidget(parent)
@@ -29,10 +30,14 @@ DeviceControlPanel::DeviceControlPanel(int panelId, PythonBridge *bridge, QWidge
 
     // Setup brightness protection timer
     connect(m_brightnessProtectionTimer, &QTimer::timeout, this, &DeviceControlPanel::onBrightnessProtectionTimeout);
+
+    m_asyncGuard = std::make_shared<std::atomic<bool>>(true);
 }
 
 DeviceControlPanel::~DeviceControlPanel()
 {
+    m_asyncGuard->store(false);
+
     // Stop timers
     if (m_temperatureTimer) {
         m_temperatureTimer->stop();
@@ -57,6 +62,11 @@ QString DeviceControlPanel::panelLabel() const
 bool DeviceControlPanel::isConnected() const
 {
     return m_controller->isConnected();
+}
+
+bool DeviceControlPanel::isPoweredOn() const
+{
+    return m_controller && m_controller->isPoweredOn();
 }
 
 QString DeviceControlPanel::getPanelId() const
@@ -87,6 +97,7 @@ void DeviceControlPanel::setImageLoader(ImageLoader *loader)
 
 void DeviceControlPanel::setVariant(const QString &variant)
 {
+    m_currentVariant = variant;
     int index = m_cmbVariant->findText(variant);
     if (index >= 0) {
         m_cmbVariant->setCurrentIndex(index);
@@ -95,6 +106,7 @@ void DeviceControlPanel::setVariant(const QString &variant)
 
 void DeviceControlPanel::setInitialBrightness(double brightness)
 {
+    m_currentBrightness = brightness;
     m_spinBrightness->setValue(brightness);
     m_sliderBrightness->setValue(static_cast<int>(brightness * 100));
 }
@@ -102,18 +114,50 @@ void DeviceControlPanel::setInitialBrightness(double brightness)
 bool DeviceControlPanel::powerOnDirect()
 {
     if (isConnected()) {
-        return true;  // Already connected
+        return true;
     }
-    onPowerOnClicked();
-    return isConnected();
+    if (m_deviceInfo.index < 0) {
+        return false;
+    }
+
+    // Thread-safe: only use m_controller, no UI widgets.
+    // UI will be updated via connected/disconnected signals.
+    QString variant = m_currentVariant;
+    int deviceIndex = m_deviceInfo.index;
+    emit logMessage(panelLabel(), QString("API: Powering on device %1 (variant: %2)...")
+                        .arg(deviceIndex).arg(variant));
+
+    bool success = m_controller->connect(deviceIndex, variant);
+
+    // Update UI from main thread
+    QString lastErr = success ? QString() : m_controller->lastError();
+    QMetaObject::invokeMethod(this, [this, success, lastErr]() {
+        updateUIState();
+        if (success) {
+            updatePanelInfo();
+        } else if (lastErr.contains("UCID")) {
+            // Missing HDF5 calibration file — show UCID so operator can fetch the file
+            QMessageBox::warning(this, "缺少校准文件", lastErr);
+        }
+    }, Qt::QueuedConnection);
+
+    return success;
 }
 
 bool DeviceControlPanel::powerOffDirect()
 {
     if (!isConnected()) {
-        return true;  // Already disconnected
+        return true;
     }
-    onPowerOffClicked();
+
+    // Thread-safe: only use m_controller, no UI widgets.
+    emit logMessage(panelLabel(), "API: Powering off...");
+    m_controller->disconnect();
+
+    QMetaObject::invokeMethod(this, [this]() {
+        updateUIState();
+    }, Qt::QueuedConnection);
+
     return !isConnected();
 }
 
@@ -123,23 +167,8 @@ bool DeviceControlPanel::sendImageDirect(const QImage &image)
         return false;
     }
 
-    // Calculate Pattern APL using gamma 2.2 formula:
-    // Pattern APL = Σ[(R/255)^2.2 + (G/255)^2.2 + (B/255)^2.2] / (width * height * 3)
-    double totalGammaValue = 0;
-    int pixelCount = image.width() * image.height();
-
-    for (int y = 0; y < image.height(); ++y) {
-        for (int x = 0; x < image.width(); ++x) {
-            QColor color = image.pixelColor(x, y);
-            double r = color.red() / 255.0;
-            double g = color.green() / 255.0;
-            double b = color.blue() / 255.0;
-            totalGammaValue += std::pow(r, 2.2) + std::pow(g, 2.2) + std::pow(b, 2.2);
-        }
-    }
-
-    double patternApl = totalGammaValue / (pixelCount * 3.0);
-    double currentBrightness = m_spinBrightness->value();
+    double patternApl = calculatePatternApl(image);
+    double currentBrightness = m_currentBrightness;
     double totalApl = patternApl * currentBrightness;
 
     emit logMessage(panelLabel(), QString("Pattern APL: %1, Brightness: %2, Total APL: %3")
@@ -165,6 +194,7 @@ bool DeviceControlPanel::setBrightnessDirect(double level)
     if (!isConnected()) {
         return false;
     }
+    m_currentBrightness = level;
     m_spinBrightness->blockSignals(true);
     m_sliderBrightness->blockSignals(true);
     m_spinBrightness->setValue(level);
@@ -209,6 +239,7 @@ void DeviceControlPanel::setupUI()
     m_cmbVariant->addItem("standard");
     m_cmbVariant->addItem("F33R");
     m_cmbVariant->addItem("F33L");
+    m_cmbVariant->addItem("F33LP");
     m_cmbVariant->setCurrentIndex(0);  // Default: standard
     m_cmbVariant->setMinimumWidth(80);
 
@@ -377,21 +408,30 @@ void DeviceControlPanel::updatePanelInfo()
         return;
     }
 
-    // Try to get panel info with retry
-    QString panelId = m_controller->getPanelId();
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
 
-    // Retry once if empty (device may need more time)
-    if (panelId.isEmpty()) {
-        QThread::msleep(200);
-        panelId = m_controller->getPanelId();
-    }
+    QtConcurrent::run([this, guard, controller]() {
+        if (!guard->load()) return;
+        QString panelId = controller->getPanelId();
 
-    m_lblPanelId->setText(panelId.isEmpty() ? "-" : panelId);
+        // Retry once if empty (device may need more time)
+        if (panelId.isEmpty() && guard->load()) {
+            QThread::msleep(200);
+            panelId = controller->getPanelId();
+        }
 
-    // Update temperatures (RJ1-RAX and DA9272 only)
-    double rj1 = m_controller->getRj1Temperature();
-    double da9272 = m_controller->getDa9272Temperature();
-    onControllerTemperatureUpdated(rj1, da9272);
+        if (!guard->load()) return;
+        double rj1 = controller->getRj1Temperature();
+        if (!guard->load()) return;
+        double da9272 = controller->getDa9272Temperature();
+
+        QMetaObject::invokeMethod(this, [this, guard, panelId, rj1, da9272]() {
+            if (!guard->load()) return;
+            m_lblPanelId->setText(panelId.isEmpty() ? "-" : panelId);
+            onControllerTemperatureUpdated(rj1, da9272);
+        }, Qt::QueuedConnection);
+    });
 }
 
 void DeviceControlPanel::onPowerOnClicked()
@@ -407,21 +447,24 @@ void DeviceControlPanel::onPowerOnClicked()
     m_cmbVariant->setEnabled(false);
     m_lblStatus->setText("Powering on...");
     m_lblStatus->setStyleSheet("color: orange; font-weight: bold;");
-    QApplication::processEvents();
 
     QString variant = m_cmbVariant->currentText();
-    emit logMessage(panelLabel(), QString("Powering on %1 (variant: %2)...").arg(m_deviceInfo.displayName, variant));
+    int deviceIndex = m_deviceInfo.index;
+    QString deviceName = m_deviceInfo.displayName;
+    emit logMessage(panelLabel(), QString("Powering on %1 (variant: %2)...").arg(deviceName, variant));
 
-    bool success = m_controller->connect(m_deviceInfo.index, variant);
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
 
-    updateUIState();
+    QtConcurrent::run([this, guard, controller, deviceIndex, variant]() {
+        if (!guard->load()) return;
+        bool success = controller->connect(deviceIndex, variant);
 
-    if (success) {
-        // Small delay to let device fully initialize before reading info
-        QApplication::processEvents();
-        QThread::msleep(100);
-        updatePanelInfo();
-    }
+        QMetaObject::invokeMethod(this, [this, guard, success]() {
+            if (!guard->load()) return;
+            updateUIState();
+        }, Qt::QueuedConnection);
+    });
 }
 
 void DeviceControlPanel::onPowerOffClicked()
@@ -431,12 +474,21 @@ void DeviceControlPanel::onPowerOffClicked()
     m_btnPowerOff->setEnabled(false);
     m_lblStatus->setText("Powering off...");
     m_lblStatus->setStyleSheet("color: orange; font-weight: bold;");
-    QApplication::processEvents();
 
     emit logMessage(panelLabel(), "Powering off...");
-    m_controller->disconnect();
 
-    updateUIState();
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
+
+    QtConcurrent::run([this, guard, controller]() {
+        if (!guard->load()) return;
+        controller->disconnect();
+
+        QMetaObject::invokeMethod(this, [this, guard]() {
+            if (!guard->load()) return;
+            updateUIState();
+        }, Qt::QueuedConnection);
+    });
 }
 
 void DeviceControlPanel::onBrightnessSliderChanged(int value)
@@ -469,11 +521,22 @@ void DeviceControlPanel::applyBrightness(double brightness)
         return;
     }
 
+    m_currentBrightness = brightness;
     emit logMessage(panelLabel(), QString("Setting brightness to %1").arg(brightness, 0, 'f', 2));
-    m_controller->setBrightness(brightness);
 
-    // Start brightness protection monitoring
-    startBrightnessProtection();
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
+
+    QtConcurrent::run([this, guard, controller, brightness]() {
+        if (!guard->load()) return;
+        controller->setBrightness(brightness);
+
+        QMetaObject::invokeMethod(this, [this, guard]() {
+            if (!guard->load()) return;
+            // Start brightness protection monitoring after brightness is set
+            startBrightnessProtection();
+        }, Qt::QueuedConnection);
+    });
 }
 
 void DeviceControlPanel::startBrightnessProtection()
@@ -491,41 +554,62 @@ void DeviceControlPanel::onBrightnessProtectionTimeout()
     }
 
     m_brightnessProtectionCount++;
+    int checkNum = m_brightnessProtectionCount;
 
-    // Get current temperature (RJ1)
-    double rj1 = m_controller->getRj1Temperature();
-    double da9272 = m_controller->getDa9272Temperature();
-
-    // Update UI
-    onControllerTemperatureUpdated(rj1, da9272);
-
-    double maxTemp = qMax(rj1, da9272);
-    emit logMessage(panelLabel(), QString("Protection check %1/5: RJ1=%2°C, DA9272=%3°C")
-                        .arg(m_brightnessProtectionCount)
-                        .arg(rj1, 0, 'f', 1)
-                        .arg(da9272, 0, 'f', 1));
-
-    // Check temperature limit
-    if (maxTemp > TEMPERATURE_LIMIT) {
-        m_brightnessProtectionTimer->stop();
-
-        QString warning = QString("OVERHEAT during brightness change!\nTemp: %1°C > %2°C limit\nEmergency power off!")
-                              .arg(maxTemp, 0, 'f', 1)
-                              .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
-        emit logMessage(panelLabel(), QString("EMERGENCY: %1").arg(warning));
-
-        // Emergency power off
-        m_controller->powerOff();
-
-        QMessageBox::critical(this, "Overheat Protection", warning);
-        return;
-    }
-
-    // Stop after 5 checks
+    // Stop timer after dispatching the last check
     if (m_brightnessProtectionCount >= BRIGHTNESS_PROTECTION_CHECKS) {
         m_brightnessProtectionTimer->stop();
-        emit logMessage(panelLabel(), "Brightness protection: completed, temp OK");
     }
+
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
+
+    QtConcurrent::run([this, guard, controller, checkNum]() {
+        if (!guard->load()) return;
+        double rj1 = controller->getRj1Temperature();
+        if (!guard->load()) return;
+        double da9272 = controller->getDa9272Temperature();
+
+        QMetaObject::invokeMethod(this, [this, guard, rj1, da9272, checkNum]() {
+            if (!guard->load() || !isConnected()) return;
+
+            onControllerTemperatureUpdated(rj1, da9272);
+
+            double maxTemp = qMax(rj1, da9272);
+            emit logMessage(panelLabel(), QString("Protection check %1/%2: RJ1=%3°C, DA9272=%4°C")
+                                .arg(checkNum)
+                                .arg(BRIGHTNESS_PROTECTION_CHECKS)
+                                .arg(rj1, 0, 'f', 1)
+                                .arg(da9272, 0, 'f', 1));
+
+            if (maxTemp > TEMPERATURE_LIMIT) {
+                m_brightnessProtectionTimer->stop();
+
+                QString warning = QString("OVERHEAT during brightness change!\nTemp: %1°C > %2°C limit\nEmergency power off!")
+                                      .arg(maxTemp, 0, 'f', 1)
+                                      .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
+                emit logMessage(panelLabel(), QString("EMERGENCY: %1").arg(warning));
+
+                auto g = m_asyncGuard;
+                auto c = m_controller.get();
+                QtConcurrent::run([g, c]() {
+                    if (!g->load()) return;
+                    c->powerOff();
+                });
+                m_lblStatus->setText("OVERHEAT!");
+                m_lblStatus->setStyleSheet("color: red; font-weight: bold;");
+                // Non-modal dialog: visible but doesn't block the main thread
+                auto *msg = new QMessageBox(QMessageBox::Critical, "Overheat Protection", warning, QMessageBox::Ok, this);
+                msg->setAttribute(Qt::WA_DeleteOnClose);
+                msg->show();
+                return;
+            }
+
+            if (checkNum >= BRIGHTNESS_PROTECTION_CHECKS) {
+                emit logMessage(panelLabel(), "Brightness protection: completed, temp OK");
+            }
+        }, Qt::QueuedConnection);
+    });
 }
 
 void DeviceControlPanel::onRefreshInfoClicked()
@@ -547,23 +631,8 @@ void DeviceControlPanel::onSendImageClicked()
         return;
     }
 
-    // Calculate Pattern APL using gamma 2.2 formula:
-    // Pattern APL = Σ[(R/255)^2.2 + (G/255)^2.2 + (B/255)^2.2] / (width * height * 3)
-    double totalGammaValue = 0;
-    int pixelCount = image.width() * image.height();
-
-    for (int y = 0; y < image.height(); ++y) {
-        for (int x = 0; x < image.width(); ++x) {
-            QColor color = image.pixelColor(x, y);
-            double r = color.red() / 255.0;
-            double g = color.green() / 255.0;
-            double b = color.blue() / 255.0;
-            totalGammaValue += std::pow(r, 2.2) + std::pow(g, 2.2) + std::pow(b, 2.2);
-        }
-    }
-
-    double patternApl = totalGammaValue / (pixelCount * 3.0);
-    double currentBrightness = m_spinBrightness->value();
+    double patternApl = calculatePatternApl(image);
+    double currentBrightness = m_currentBrightness;
     double totalApl = patternApl * currentBrightness;
 
     emit logMessage(panelLabel(), QString("Pattern APL: %1, Brightness: %2, Total APL: %3")
@@ -592,7 +661,20 @@ void DeviceControlPanel::onSendImageClicked()
     }
 
     emit logMessage(panelLabel(), QString("Sending image: %1").arg(m_imageLoader->getCurrentImageName()));
-    m_controller->sendImage(image);
+
+    m_btnSendImage->setEnabled(false);
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
+
+    QtConcurrent::run([this, guard, controller, image]() {
+        if (!guard->load()) return;
+        controller->sendImage(image);
+
+        QMetaObject::invokeMethod(this, [this, guard]() {
+            if (!guard->load()) return;
+            m_btnSendImage->setEnabled(isConnected());
+        }, Qt::QueuedConnection);
+    });
 }
 
 void DeviceControlPanel::onControllerConnected()
@@ -601,39 +683,82 @@ void DeviceControlPanel::onControllerConnected()
     emit connectionChanged(m_panelId, true);
     emit logMessage(panelLabel(), QString("Connected: %1").arg(m_controller->getDeviceLabel()));
 
-    // Apply saved brightness from config when device connects
+    // Run all post-connect Python calls in background to keep UI responsive
     double savedBrightness = m_spinBrightness->value();
-    if (m_controller->setBrightness(savedBrightness)) {
-        emit logMessage(panelLabel(), QString("Applied saved brightness: %1").arg(savedBrightness, 0, 'f', 2));
-    }
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
 
-    // Get actual brightness from device and verify
-    double actualBrightness = m_controller->getBrightness();
-    m_lblActualBrightness->setText(QString::number(actualBrightness, 'f', 2));
+    QtConcurrent::run([this, guard, controller, savedBrightness]() {
+        if (!guard->load()) return;
+        bool brightnessOk = controller->setBrightness(savedBrightness);
+        if (!guard->load()) return;
+        double actualBrightness = controller->getBrightness();
+        if (!guard->load()) return;
+        bool xFlip = controller->getXFlip();
+        if (!guard->load()) return;
+        bool yFlip = controller->getYFlip();
 
-    // Check if brightness values match (compare to 2 decimal places)
-    if (qRound(actualBrightness * 100) != qRound(savedBrightness * 100)) {
-        QString warning = QString("Brightness mismatch!\nSet: %1, Actual: %2")
-                              .arg(savedBrightness, 0, 'f', 2)
-                              .arg(actualBrightness, 0, 'f', 2);
-        emit logMessage(panelLabel(), warning);
-        QMessageBox::warning(this, "Brightness Warning", warning);
-    }
+        // Get panel ID (with retry — device may need time after connect)
+        if (!guard->load()) return;
+        QString panelId = controller->getPanelId();
+        if (panelId.isEmpty() && guard->load()) {
+            QThread::msleep(500);
+            panelId = controller->getPanelId();
+        }
+        if (panelId.isEmpty() && guard->load()) {
+            QThread::msleep(1000);
+            panelId = controller->getPanelId();
+        }
 
-    // Read current flip state from device
-    bool xFlip = m_controller->getXFlip();
-    bool yFlip = m_controller->getYFlip();
-    m_chkXFlip->blockSignals(true);
-    m_chkYFlip->blockSignals(true);
-    m_chkXFlip->setChecked(xFlip);
-    m_chkYFlip->setChecked(yFlip);
-    m_chkXFlip->blockSignals(false);
-    m_chkYFlip->blockSignals(false);
-    emit logMessage(panelLabel(), QString("Flip state: X=%1, Y=%2").arg(xFlip ? "true" : "false").arg(yFlip ? "true" : "false"));
+        // Get initial temperatures
+        if (!guard->load()) return;
+        double rj1 = controller->getRj1Temperature();
+        if (!guard->load()) return;
+        double da9272 = controller->getDa9272Temperature();
 
-    // Start temperature monitoring timer (5 seconds interval)
-    m_temperatureTimer->start(TEMPERATURE_CHECK_INTERVAL_MS);
-    emit logMessage(panelLabel(), "Temperature monitoring started (5s interval)");
+        QMetaObject::invokeMethod(this, [this, guard, savedBrightness, brightnessOk,
+                                         actualBrightness, xFlip, yFlip,
+                                         panelId, rj1, da9272]() {
+            if (!guard->load()) return;
+
+            if (brightnessOk) {
+                emit logMessage(panelLabel(), QString("Applied saved brightness: %1").arg(savedBrightness, 0, 'f', 2));
+            }
+
+            m_lblActualBrightness->setText(QString::number(actualBrightness, 'f', 2));
+
+            if (qRound(actualBrightness * 100) != qRound(savedBrightness * 100)) {
+                emit logMessage(panelLabel(), QString("Brightness mismatch: set=%1, actual=%2")
+                                    .arg(savedBrightness, 0, 'f', 2).arg(actualBrightness, 0, 'f', 2));
+            }
+
+            m_chkXFlip->blockSignals(true);
+            m_chkYFlip->blockSignals(true);
+            m_chkXFlip->setChecked(xFlip);
+            m_chkYFlip->setChecked(yFlip);
+            m_chkXFlip->blockSignals(false);
+            m_chkYFlip->blockSignals(false);
+            emit logMessage(panelLabel(), QString("Flip state: X=%1, Y=%2").arg(xFlip ? "true" : "false").arg(yFlip ? "true" : "false"));
+
+            // Update panel info labels
+            m_lblPanelId->setText(panelId.isEmpty() ? "-" : panelId);
+            onControllerTemperatureUpdated(rj1, da9272);
+            if (!panelId.isEmpty()) {
+                emit logMessage(panelLabel(), QString("Panel ID: %1").arg(panelId));
+            }
+        }, Qt::QueuedConnection);
+    });
+
+    // Start temperature monitoring timer, staggered by panel ID to avoid
+    // all devices polling simultaneously and blocking the UI
+    int staggerMs = m_panelId * 1000;  // 0s, 1s, 2s, 3s, ... offset
+    QTimer::singleShot(staggerMs, this, [this]() {
+        if (isConnected()) {
+            m_temperatureTimer->start(TEMPERATURE_CHECK_INTERVAL_MS);
+        }
+    });
+    emit logMessage(panelLabel(), QString("Temperature monitoring starts in %1s (%2s interval)")
+                        .arg(staggerMs / 1000).arg(TEMPERATURE_CHECK_INTERVAL_MS / 1000));
 }
 
 void DeviceControlPanel::onControllerDisconnected()
@@ -654,6 +779,7 @@ void DeviceControlPanel::onControllerDisconnected()
 
 void DeviceControlPanel::onControllerBrightnessChanged(double level)
 {
+    m_currentBrightness = level;
     m_sliderBrightness->blockSignals(true);
     m_spinBrightness->blockSignals(true);
     m_sliderBrightness->setValue(static_cast<int>(level * 100));
@@ -667,7 +793,12 @@ void DeviceControlPanel::onXFlipChanged(bool checked)
     if (!isConnected()) {
         return;
     }
-    m_controller->setXFlip(checked);
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
+    QtConcurrent::run([guard, controller, checked]() {
+        if (!guard->load()) return;
+        controller->setXFlip(checked);
+    });
 }
 
 void DeviceControlPanel::onYFlipChanged(bool checked)
@@ -675,7 +806,12 @@ void DeviceControlPanel::onYFlipChanged(bool checked)
     if (!isConnected()) {
         return;
     }
-    m_controller->setYFlip(checked);
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
+    QtConcurrent::run([guard, controller, checked]() {
+        if (!guard->load()) return;
+        controller->setYFlip(checked);
+    });
 }
 
 void DeviceControlPanel::onControllerXFlipChanged(bool flip)
@@ -738,39 +874,49 @@ void DeviceControlPanel::onControllerTemperatureUpdated(double rj1, double da927
 
 void DeviceControlPanel::onTemperatureMonitorTimeout()
 {
-    if (!isConnected()) {
-        return;
-    }
+    if (!isConnected() || m_asyncTempBusy) return;
+    m_asyncTempBusy = true;
 
-    // Get current temperatures
-    double rj1 = m_controller->getRj1Temperature();
-    double da9272 = m_controller->getDa9272Temperature();
+    auto guard = m_asyncGuard;
+    auto controller = m_controller.get();
 
-    // Update UI
-    onControllerTemperatureUpdated(rj1, da9272);
+    QtConcurrent::run([this, guard, controller]() {
+        if (!guard->load()) return;
+        double rj1 = controller->getRj1Temperature();
+        if (!guard->load()) return;
+        double da9272 = controller->getDa9272Temperature();
 
-    // Also update actual brightness
-    double actualBrightness = m_controller->getBrightness();
-    m_lblActualBrightness->setText(QString::number(actualBrightness, 'f', 2));
+        QMetaObject::invokeMethod(this, [this, guard, rj1, da9272]() {
+            m_asyncTempBusy = false;
+            if (!guard->load() || !isConnected()) return;
 
-    // Check temperature limit (use the higher of the two temperatures)
-    double maxTemp = qMax(rj1, da9272);
-    if (maxTemp > TEMPERATURE_LIMIT) {
-        // Stop timer first to prevent multiple warnings
-        m_temperatureTimer->stop();
+            onControllerTemperatureUpdated(rj1, da9272);
+            m_lblActualBrightness->setText(QString::number(m_currentBrightness, 'f', 2));
 
-        QString warning = QString("Temperature exceeded %1°C!\nRJ1: %2°C, DA9272: %3°C\nDevice will be powered off.")
-                              .arg(TEMPERATURE_LIMIT, 0, 'f', 1)
-                              .arg(rj1, 0, 'f', 1)
-                              .arg(da9272, 0, 'f', 1);
-        emit logMessage(panelLabel(), QString("OVERHEAT WARNING: %1").arg(warning));
+            double maxTemp = qMax(rj1, da9272);
+            if (maxTemp > TEMPERATURE_LIMIT) {
+                m_temperatureTimer->stop();
 
-        // Power off the device
-        m_controller->powerOff();
+                QString warning = QString("Temperature exceeded %1°C!\nRJ1: %2°C, DA9272: %3°C\nDevice will be powered off.")
+                                      .arg(TEMPERATURE_LIMIT, 0, 'f', 1)
+                                      .arg(rj1, 0, 'f', 1)
+                                      .arg(da9272, 0, 'f', 1);
+                emit logMessage(panelLabel(), QString("OVERHEAT WARNING: %1").arg(warning));
 
-        // Show warning to user
-        QMessageBox::critical(this, "Temperature Warning", warning);
-    }
+                auto g = m_asyncGuard;
+                auto c = m_controller.get();
+                QtConcurrent::run([g, c]() {
+                    if (!g->load()) return;
+                    c->powerOff();
+                });
+                m_lblStatus->setText("OVERHEAT!");
+                m_lblStatus->setStyleSheet("color: red; font-weight: bold;");
+                auto *msg = new QMessageBox(QMessageBox::Critical, "Temperature Warning", warning, QMessageBox::Ok, this);
+                msg->setAttribute(Qt::WA_DeleteOnClose);
+                msg->show();
+            }
+        }, Qt::QueuedConnection);
+    });
 }
 
 void DeviceControlPanel::onControllerError(const QString &error)
@@ -785,6 +931,7 @@ void DeviceControlPanel::onControllerLog(const QString &message)
 
 void DeviceControlPanel::onVariantChanged(const QString &variant)
 {
+    m_currentVariant = variant;
     if (!m_deviceInfo.serial.isEmpty()) {
         emit variantChanged(m_deviceInfo.serial, variant);
     }
@@ -796,22 +943,8 @@ ApiResult DeviceControlPanel::sendImageDirectEx(const QImage &image)
         return ApiResult::fail("Device not connected");
     }
 
-    // Calculate Pattern APL using gamma 2.2 formula
-    double totalGammaValue = 0;
-    int pixelCount = image.width() * image.height();
-
-    for (int y = 0; y < image.height(); ++y) {
-        for (int x = 0; x < image.width(); ++x) {
-            QColor color = image.pixelColor(x, y);
-            double r = color.red() / 255.0;
-            double g = color.green() / 255.0;
-            double b = color.blue() / 255.0;
-            totalGammaValue += std::pow(r, 2.2) + std::pow(g, 2.2) + std::pow(b, 2.2);
-        }
-    }
-
-    double patternApl = totalGammaValue / (pixelCount * 3.0);
-    double currentBrightness = m_spinBrightness->value();
+    double patternApl = calculatePatternApl(image);
+    double currentBrightness = m_currentBrightness;
     double totalApl = patternApl * currentBrightness;
 
     emit logMessage(panelLabel(), QString("Pattern APL: %1, Brightness: %2, Total APL: %3")
@@ -845,6 +978,7 @@ ApiResult DeviceControlPanel::setBrightnessDirectEx(double level, bool waitProte
         return ApiResult::fail("Device not connected");
     }
 
+    m_currentBrightness = level;
     m_spinBrightness->blockSignals(true);
     m_sliderBrightness->blockSignals(true);
     m_spinBrightness->setValue(level);
@@ -897,4 +1031,35 @@ ApiResult DeviceControlPanel::setBrightnessDirectEx(double level, bool waitProte
     }
 
     return ApiResult::ok();
+}
+
+double DeviceControlPanel::calculatePatternApl(const QImage &image)
+{
+    // Pre-computed gamma 2.2 lookup table (thread-safe static initialization)
+    static double gammaLUT[256];
+    static bool initialized = []() {
+        for (int i = 0; i < 256; ++i) {
+            gammaLUT[i] = std::pow(i / 255.0, 2.2);
+        }
+        return true;
+    }();
+    Q_UNUSED(initialized);
+
+    // Use scanLine for direct pixel access (much faster than pixelColor)
+    QImage rgbImage = image.format() == QImage::Format_RGB32
+        ? image : image.convertToFormat(QImage::Format_RGB32);
+
+    double totalGamma = 0;
+    int pixelCount = rgbImage.width() * rgbImage.height();
+
+    for (int y = 0; y < rgbImage.height(); ++y) {
+        const QRgb *line = reinterpret_cast<const QRgb*>(rgbImage.constScanLine(y));
+        for (int x = 0; x < rgbImage.width(); ++x) {
+            totalGamma += gammaLUT[qRed(line[x])]
+                        + gammaLUT[qGreen(line[x])]
+                        + gammaLUT[qBlue(line[x])];
+        }
+    }
+
+    return pixelCount > 0 ? totalGamma / (pixelCount * 3.0) : 0;
 }

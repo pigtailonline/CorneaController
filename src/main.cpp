@@ -5,21 +5,111 @@
 #include <QStyleFactory>
 #include <QFileInfo>
 #include <QDir>
+#include <QFile>
+#include <QTextStream>
+#include <QDateTime>
+#include <QMutex>
+
+// ---------------------------------------------------------------------------
+// File logger — writes daily log files to <app_dir>/log/YYYY-MM-DD.log
+// All qDebug/qWarning/qCritical output is captured via qInstallMessageHandler.
+// Since CorneaWidget::appendLog() calls qDebug(), this also captures Python
+// output and all application-level logs.
+// ---------------------------------------------------------------------------
+
+static QFile    g_logFile;
+static QMutex   g_logMutex;
+static QString  g_logDate;
+static QString  g_logDir;
+
+static void openLogFileForDate(const QString &date)
+{
+    if (g_logFile.isOpen()) {
+        g_logFile.flush();
+        g_logFile.close();
+    }
+    g_logDate = date;
+    g_logFile.setFileName(g_logDir + "/" + date + ".log");
+    g_logFile.open(QIODevice::Append | QIODevice::Text);
+}
+
+static void fileMessageHandler(QtMsgType type,
+                               const QMessageLogContext &context,
+                               const QString &msg)
+{
+    Q_UNUSED(context);
+    if (msg.isEmpty()) return;
+
+    QMutexLocker locker(&g_logMutex);
+
+    // Date rollover check
+    QString today = QDate::currentDate().toString("yyyy-MM-dd");
+    if (today != g_logDate) {
+        openLogFileForDate(today);
+    }
+
+    // Build the line to write
+    // Messages from appendLog already have timestamps (start with "20xx-")
+    // Raw Qt debug/warning messages need a timestamp prefix
+    QString line;
+    bool hasTimestamp = (msg.length() > 4 && msg[4] == QChar('-')
+                         && msg[0].isDigit() && msg[1].isDigit());
+    if (hasTimestamp) {
+        line = msg;
+    } else {
+        QDateTime now = QDateTime::currentDateTime();
+        QString ts = now.toString("yyyy-MM-dd hh:mm:ss");
+        int msec = now.time().msec();
+
+        const char *level = "DEBUG";
+        switch (type) {
+        case QtWarningMsg:  level = "WARN "; break;
+        case QtCriticalMsg: level = "ERROR"; break;
+        case QtFatalMsg:    level = "FATAL"; break;
+        default: break;
+        }
+        line = QString("%1,%2 [%3] : %4")
+                   .arg(ts)
+                   .arg(msec, 3, 10, QChar('0'))
+                   .arg(QLatin1String(level))
+                   .arg(msg);
+    }
+
+    // Write to file and flush immediately (crash-safe)
+    if (g_logFile.isOpen()) {
+        QTextStream stream(&g_logFile);
+        stream << line << "\n";
+        stream.flush();
+    }
+
+    // Also output to stderr so Qt Creator console still works
+    fprintf(stderr, "%s\n", line.toLocal8Bit().constData());
+}
+
+// ---------------------------------------------------------------------------
 
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
 
     app.setApplicationName("Cornea Controller");
-    app.setApplicationVersion("1.0.0");
+    app.setApplicationVersion("1.0.9");
     app.setOrganizationName("Google AR Display Lab");
+
+    // Setup file logging: <app_dir>/log/
+    g_logDir = QCoreApplication::applicationDirPath() + "/log";
+    QDir().mkpath(g_logDir);
+    openLogFileForDate(QDate::currentDate().toString("yyyy-MM-dd"));
+    qInstallMessageHandler(fileMessageHandler);
 
     // Use Fusion style for consistent look
     app.setStyle(QStyleFactory::create("Fusion"));
 
     // Create main window to host CorneaWidget
     QMainWindow mainWindow;
-    mainWindow.setWindowTitle("Cornea Controller");
+    QString title = QString("%1 v%2")
+        .arg(app.applicationName(), app.applicationVersion());
+    mainWindow.setWindowTitle(title);
     mainWindow.resize(1000, 900);
 
     // Create CorneaWidget as central widget

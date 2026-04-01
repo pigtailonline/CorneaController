@@ -237,7 +237,7 @@ win32 {
 | `python.cal_path` | Path to HDF5 calibration files |
 | `devices` | Array of device configurations (max 12) |
 | `devices[].serial` | Device serial number |
-| `devices[].variant` | Hardware variant: `standard`, `F33R`, or `F33L` |
+| `devices[].variant` | Hardware variant: `standard`, `F33R`, `F33L`, or `F33LP` |
 | `devices[].brightness` | Default brightness (0.0 - 1.0) |
 
 **Note:** New devices are automatically added to the first `null` slot when discovered.
@@ -421,13 +421,14 @@ static const int MAX_DEVICES = 12;  // Maximum supported devices
 
 ## Part 5: Hardware Variants
 
-The Cornea RAX720 supports three hardware variants with different I2C addresses:
+The Cornea RAX720 supports four hardware variants with different I2C addresses:
 
 | Variant | Description | Use Case |
 |---------|-------------|----------|
 | `standard` | V53/H79/PSA | Default configuration |
 | `F33R` | F33 Right | F33 right eye module |
 | `F33L` | F33 Left | F33 left eye module |
+| `F33LP` | F33 Left Pilot run | F33LP pilot run for LBU |
 
 Set the variant in the configuration file or through the UI dropdown before powering on.
 
@@ -531,7 +532,7 @@ cornea->stopTcpServer();
 
 | Command | Parameters | Response | Description |
 |---------|-----------|----------|-------------|
-| `powerOn` | `serial` | `success` | Power on device |
+| `powerOn` | `serial`, `variant`(optional) | `success` | Power on device (optionally set variant before connecting) |
 | `powerOff` | `serial` | `success` | Power off device |
 | `sendImage` | `serial`, `path` | `success` | Send image file (with APL check) |
 | `setBrightness` | `serial`, `level` | `success` | Set brightness (0.0-1.0) + auto protection |
@@ -553,6 +554,12 @@ Response:
 ```json
 {"success": true}
 ```
+
+**Power on device with variant** (updates variant before connecting):
+```json
+{"cmd": "powerOn", "serial": "LITE20240101", "variant": "F33R"}
+```
+Supported variants: `standard`, `F33R`, `F33L`, `F33LP`
 
 **Send image:**
 ```json
@@ -622,6 +629,7 @@ def send_command(cmd, **params):
 # Example usage
 print(send_command("listDevices"))
 print(send_command("powerOn", serial="LITE20240101"))
+print(send_command("powerOn", serial="LITE20240101", variant="F33R"))  # with variant
 print(send_command("setBrightness", serial="LITE20240101", level=0.05))
 print(send_command("sendImage", serial="LITE20240101", path="D:/test/image.png"))
 print(send_command("powerOff", serial="LITE20240101"))

@@ -10,6 +10,7 @@ struct PythonConfig {
     QString pythonHome;
     QStringList dllPaths;
     QString calPath;
+    bool allowDefaultHdf5 = false;
 };
 
 struct DeviceConfig {

@@ -22,6 +22,7 @@ namespace Ui { class CorneaWidget; }
 QT_END_NAMESPACE
 
 class PythonBridge;
+class CorneaController;
 class DeviceControlPanel;
 class ImageLoader;
 class TcpServer;
@@ -63,6 +64,7 @@ public:
 
     // === Public API (by serial) ===
     bool powerOnBySerial(const QString &serial);
+    bool powerOnBySerial(const QString &serial, const QString &variant);
     bool powerOffBySerial(const QString &serial);
     bool sendImageBySerial(const QString &serial, const QString &imagePath);
     bool sendImageBySerial(const QString &serial, const QImage &image);
@@ -79,6 +81,10 @@ public:
     QString getPanelIdBySerial(const QString &serial) const;
     double getTemperatureBySerial(const QString &serial) const;
     QString getVariantBySerial(const QString &serial) const;
+
+    // === Image Access (for TCP API) ===
+    QStringList getImageNames() const;
+    QImage getImageByName(const QString &name) const;
 
     // === Device List ===
     QStringList getDeviceSerials() const;
@@ -133,6 +139,9 @@ private:
     DeviceControlPanel* getPanelByIndex(int index) const;
     DeviceControlPanel* getPanelBySerial(const QString &serial) const;
     int findPanelIndexBySerial(const QString &serial) const;
+
+    // Thread-safe: get controller without touching UI (for TCP async commands)
+    CorneaController* getControllerBySerial(const QString &serial) const;
 
     Ui::CorneaWidget *ui;
 

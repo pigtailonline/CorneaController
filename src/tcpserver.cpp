@@ -5,18 +5,27 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QImage>
+#include <QtConcurrent>
+#include <QThreadPool>
 
 TcpServer::TcpServer(CorneaWidget *corneaWidget, QObject *parent)
     : QObject(parent)
     , m_server(new QTcpServer(this))
     , m_corneaWidget(corneaWidget)
+    , m_asyncGuard(std::make_shared<std::atomic<bool>>(true))
 {
     connect(m_server, &QTcpServer::newConnection, this, &TcpServer::onNewConnection);
 }
 
 TcpServer::~TcpServer()
 {
+    m_asyncGuard->store(false);
     stop();
+    // Wait for in-flight QtConcurrent tasks that captured 'this' to complete
+    // before destroying. TcpServer is destroyed before PythonBridge (reverse
+    // member declaration order), so dispatched Python calls still work here.
+    QThreadPool::globalInstance()->waitForDone();
 }
 
 bool TcpServer::start(quint16 port)
@@ -36,9 +45,11 @@ bool TcpServer::start(quint16 port)
 
 void TcpServer::stop()
 {
-    // Disconnect all clients
+    // Disconnect all clients — disconnect signals first to prevent stale events
     for (QTcpSocket *client : m_clients) {
+        client->disconnect(this);
         client->disconnectFromHost();
+        client->deleteLater();
     }
     m_clients.clear();
     m_buffers.clear();
@@ -80,6 +91,10 @@ void TcpServer::onClientDisconnected()
     QTcpSocket *client = qobject_cast<QTcpSocket*>(sender());
     if (client) {
         QString address = QString("%1:%2").arg(client->peerAddress().toString()).arg(client->peerPort());
+
+        // Disconnect all signals FIRST to prevent stale readyRead delivery
+        client->disconnect(this);
+
         m_clients.removeOne(client);
         m_buffers.remove(client);
         client->deleteLater();
@@ -98,7 +113,7 @@ void TcpServer::onReadyRead()
     m_buffers[client].append(client->readAll());
 
     // Process complete lines (commands end with \n)
-    while (true) {
+    while (m_clients.contains(client)) {
         int idx = m_buffers[client].indexOf('\n');
         if (idx < 0) break;
 
@@ -113,17 +128,74 @@ void TcpServer::onReadyRead()
         QJsonParseError parseError;
         QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
 
-        QJsonObject response;
         if (parseError.error != QJsonParseError::NoError) {
-            response = makeError(QString("JSON parse error: %1").arg(parseError.errorString()));
-        } else if (!doc.isObject()) {
-            response = makeError("Invalid command format: expected JSON object");
-        } else {
-            response = processCommand(doc.object());
+            sendResponse(client, makeError(QString("JSON parse error: %1").arg(parseError.errorString())));
+            continue;
+        }
+        if (!doc.isObject()) {
+            sendResponse(client, makeError("Invalid command format: expected JSON object"));
+            continue;
         }
 
-        sendResponse(client, response);
+        QJsonObject cmd = doc.object();
+        QString cmdName = cmd["cmd"].toString().toLower();
+
+        // Log received command (skip high-frequency getTemperature)
+        if (cmdName != "gettemperature") {
+            QString cmdStr = QJsonDocument(cmd).toJson(QJsonDocument::Compact);
+            qInfo() << "[TCP] RX <<" << cmdStr;
+        }
+
+        // Echo back cmd and serial in every response so clients can match
+        // responses to requests without relying on FIFO ordering
+        QString origCmd = cmd["cmd"].toString();
+        QString origSerial = cmd["serial"].toString();
+
+        if (isAsyncCommand(cmdName)) {
+            // Heavy PythonBridge commands: run in thread pool, respond when done
+            auto guard = m_asyncGuard;
+            QPointer<QTcpSocket> clientPtr(client);
+
+            QtConcurrent::run([this, guard, clientPtr, cmd, origCmd, origSerial]() {
+                if (!guard->load()) return;
+                QJsonObject response;
+                try {
+                    response = processCommand(cmd);
+                } catch (const std::exception &e) {
+                    response = makeError(QString("Exception: %1").arg(e.what()));
+                } catch (...) {
+                    response = makeError("Unknown exception in async command");
+                }
+                // Always echo cmd+serial so client can match response
+                response["cmd"] = origCmd;
+                if (!origSerial.isEmpty()) response["serial"] = origSerial;
+
+                QMetaObject::invokeMethod(this, [this, guard, clientPtr, response]() {
+                    if (!guard->load()) return;
+                    if (clientPtr && m_clients.contains(clientPtr.data())) {
+                        sendResponse(clientPtr.data(), response);
+                    }
+                }, Qt::QueuedConnection);
+            });
+        } else {
+            // Light commands: process on main thread
+            QJsonObject response = processCommand(cmd);
+            response["cmd"] = origCmd;
+            if (!origSerial.isEmpty()) response["serial"] = origSerial;
+            sendResponse(client, response);
+        }
     }
+}
+
+bool TcpServer::isAsyncCommand(const QString &cmdName)
+{
+    static const QSet<QString> asyncCommands = {
+        "poweron", "poweroff",
+        "sendimage", "sendimagebyname",
+        "gettemperature", "getpanelid",
+        "setbrightness"
+    };
+    return asyncCommands.contains(cmdName);
 }
 
 QJsonObject TcpServer::processCommand(const QJsonObject &cmd)
@@ -152,6 +224,10 @@ QJsonObject TcpServer::processCommand(const QJsonObject &cmd)
         return handleListDevices(cmd);
     } else if (cmdName == "refreshdevices") {
         return handleRefreshDevices(cmd);
+    } else if (cmdName == "listimages") {
+        return handleListImages(cmd);
+    } else if (cmdName == "sendimagebyname") {
+        return handleSendImageByName(cmd);
     } else {
         return makeError(QString("Unknown command: %1").arg(cmdName));
     }
@@ -164,7 +240,10 @@ QJsonObject TcpServer::handlePowerOn(const QJsonObject &params)
         return makeError("Missing 'serial' parameter");
     }
 
-    bool result = m_corneaWidget->powerOnBySerial(serial);
+    QString variant = params["variant"].toString();
+    bool result = variant.isEmpty()
+        ? m_corneaWidget->powerOnBySerial(serial)
+        : m_corneaWidget->powerOnBySerial(serial, variant);
     if (result) {
         return makeSuccess();
     } else {
@@ -340,6 +419,41 @@ QJsonObject TcpServer::handleRefreshDevices(const QJsonObject &params)
     return makeSuccess(data);
 }
 
+QJsonObject TcpServer::handleListImages(const QJsonObject &params)
+{
+    Q_UNUSED(params);
+    QStringList names = m_corneaWidget->getImageNames();
+    QJsonArray arr;
+    for (const QString &name : names) {
+        arr.append(name);
+    }
+    QJsonObject data;
+    data["images"] = arr;
+    data["count"] = arr.size();
+    return makeSuccess(data);
+}
+
+QJsonObject TcpServer::handleSendImageByName(const QJsonObject &params)
+{
+    QString serial = params["serial"].toString();
+    QString name = params["name"].toString();
+
+    if (serial.isEmpty())
+        return makeError("Missing 'serial' parameter");
+    if (name.isEmpty())
+        return makeError("Missing 'name' parameter");
+
+    QImage image = m_corneaWidget->getImageByName(name);
+    if (image.isNull())
+        return makeError(QString("Image not found: %1").arg(name));
+
+    ApiResult result = m_corneaWidget->sendImageBySerialEx(serial, image);
+    if (result.success)
+        return makeSuccess();
+    else
+        return makeError(result.error);
+}
+
 QJsonObject TcpServer::makeSuccess(const QVariant &data)
 {
     QJsonObject obj;
@@ -366,8 +480,20 @@ QJsonObject TcpServer::makeError(const QString &message)
 
 void TcpServer::sendResponse(QTcpSocket *client, const QJsonObject &response)
 {
+    if (!client || client->state() == QAbstractSocket::UnconnectedState) {
+        qWarning() << "[TCP] Cannot send response: client disconnected";
+        return;
+    }
+
     QJsonDocument doc(response);
     QByteArray data = doc.toJson(QJsonDocument::Compact) + "\n";
+
+    // Log sent response (skip high-frequency getTemperature)
+    QString cmd = response.value("cmd").toString();
+    if (cmd != "getTemperature") {
+        qInfo() << "[TCP] TX >>" << data.trimmed();
+    }
+
     client->write(data);
     client->flush();
 

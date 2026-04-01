@@ -76,6 +76,7 @@ bool CorneaConfig::load(const QString &path)
     m_python.venvPath = pythonObj["venv_path"].toString();
     m_python.pythonHome = pythonObj["python_home"].toString();
     m_python.calPath = pythonObj["cal_path"].toString();
+    m_python.allowDefaultHdf5 = pythonObj["allow_default_hdf5"].toBool(false);
 
     m_python.dllPaths.clear();
     QJsonArray dllArray = pythonObj["dll_paths"].toArray();
@@ -122,6 +123,7 @@ bool CorneaConfig::save(const QString &path)
     pythonObj["venv_path"] = m_python.venvPath;
     pythonObj["python_home"] = m_python.pythonHome;
     pythonObj["cal_path"] = m_python.calPath;
+    pythonObj["allow_default_hdf5"] = m_python.allowDefaultHdf5;
 
     QJsonArray dllArray;
     for (const auto &dll : m_python.dllPaths) {
