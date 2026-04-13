@@ -24,6 +24,7 @@ CorneaWidget::CorneaWidget(QWidget *parent)
     , m_pythonOutputTimer(new QTimer(this))
 {
     ui->setupUi(this);
+    ui->txtLog->document()->setMaximumBlockCount(5000);
     setupConnections();
 }
 
@@ -111,6 +112,8 @@ bool CorneaWidget::initializePythonBridge()
     }
 
     // Initialize with config values
+    m_pythonBridge->setSpiClkFreq(py.spiClkFreq);
+    appendLog(QString("SPI clock freq: %1 MHz (from config)").arg(py.spiClkFreq / 1e6, 0, 'f', 1));
     if (!m_pythonBridge->initialize(py.venvPath, py.pythonHome, py.dllPaths, py.calPath, py.allowDefaultHdf5)) {
         appendLog("Warning: Failed to initialize Python bridge. Check config paths.");
         QMessageBox::warning(this, "Initialization Warning",
@@ -906,7 +909,8 @@ void CorneaWidget::onBridgeLogMessage(const QString &message)
         "UsbK Handles", "DevK Handles", "OvlK Handles", "OvlPoolK",
         "StmK Handles", "IsochK Handles", "KLST_DEVINFO", "HandleSize",
         "PoolSize", "contiguous memory", "bytes each", "Dynamically allocated",
-        "pmic_mux_sel_level", "got an unexpected keyword argument"
+        "pmic_mux_sel_level", "got an unexpected keyword argument",
+        "Detected panel version", "Using TMP108", "retina_temp_readout"
     };
 
     for (const QString &pattern : noisePatterns) {

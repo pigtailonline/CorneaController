@@ -645,7 +645,9 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         PyDict_SetItemString(kwargs, "cal_revision", Py_None);
         PyDict_SetItemString(kwargs, "cornea_serial", Py_None);
         PyDict_SetItemString(kwargs, "rj1_version", Py_None);
-        PyDict_SetItemString(kwargs, "spi_clk_freq", Py_None);
+        PyDict_SetItemString(kwargs, "spi_clk_freq", PyFloat_FromDouble(m_spiClkFreq));
+        emit logMessage(QString("[Instance %1] SPI clock freq: %2 Hz (%3 MHz)")
+                        .arg(instanceId).arg(m_spiClkFreq, 0, 'f', 0).arg(m_spiClkFreq / 1e6, 0, 'f', 1));
         PyDict_SetItemString(kwargs, "console_log_level", PyLong_FromLong(20));
         PyDict_SetItemString(kwargs, "hardware_variant", PyUnicode_FromString(hardwareVariant.toUtf8().constData()));
 

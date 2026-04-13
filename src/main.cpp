@@ -63,6 +63,7 @@ static void fileMessageHandler(QtMsgType type,
 
         const char *level = "DEBUG";
         switch (type) {
+        case QtInfoMsg:     level = "INFO "; break;
         case QtWarningMsg:  level = "WARN "; break;
         case QtCriticalMsg: level = "ERROR"; break;
         case QtFatalMsg:    level = "FATAL"; break;
@@ -93,7 +94,7 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
 
     app.setApplicationName("Cornea Controller");
-    app.setApplicationVersion("1.1.0");
+    app.setApplicationVersion("1.1.1");
     app.setOrganizationName("Google AR Display Lab");
 
     // Setup file logging: <app_dir>/log/

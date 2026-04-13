@@ -11,6 +11,7 @@ struct PythonConfig {
     QStringList dllPaths;
     QString calPath;
     bool allowDefaultHdf5 = false;
+    double spiClkFreq = 15e6;       // SPI clock frequency in Hz (default 15MHz)
 };
 
 struct DeviceConfig {

@@ -21,6 +21,7 @@ MainWindow::MainWindow(QWidget *parent)
     , m_pythonOutputTimer(new QTimer(this))
 {
     ui->setupUi(this);
+    ui->txtLog->document()->setMaximumBlockCount(5000);
 
     // Set venv path
     m_venvPath = "D:/projects/src/google driver/Sunny Release 2025.11.28/station_venv";
@@ -261,7 +262,8 @@ void MainWindow::onBridgeLogMessage(const QString &message)
         "UsbK Handles", "DevK Handles", "OvlK Handles", "OvlPoolK",
         "StmK Handles", "IsochK Handles", "KLST_DEVINFO", "HandleSize",
         "PoolSize", "contiguous memory", "bytes each", "Dynamically allocated",
-        "pmic_mux_sel_level", "got an unexpected keyword argument"
+        "pmic_mux_sel_level", "got an unexpected keyword argument",
+        "Detected panel version", "Using TMP108", "retina_temp_readout"
     };
 
     for (const QString &pattern : noisePatterns) {

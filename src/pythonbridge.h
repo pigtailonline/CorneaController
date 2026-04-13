@@ -36,6 +36,8 @@ public:
     bool initialize(const QString &venvPath, const QString &pythonHome,
                     const QStringList &dllPaths, const QString &calPath,
                     bool allowDefaultHdf5 = false);
+    void setSpiClkFreq(double freq) { m_spiClkFreq = freq; }
+    double spiClkFreq() const { return m_spiClkFreq; }
     void shutdown();
     bool isInitialized() const { return m_initialized; }
 
@@ -122,6 +124,7 @@ private:
     QStringList m_dllPaths;
     QString m_calPath;
     bool m_allowDefaultHdf5;
+    double m_spiClkFreq = 15e6;
 
     // Multi-instance management
     QMap<int, PyObject*> m_deviceInstances;  // instanceId -> CorneaRax720
