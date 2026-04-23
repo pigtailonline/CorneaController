@@ -113,21 +113,27 @@ void DeviceControlPanel::setInitialBrightness(double brightness)
 
 bool DeviceControlPanel::powerOnDirect()
 {
-    if (isConnected()) {
+    if (isConnected() && m_controller->isPoweredOn()) {
         return true;
     }
     if (m_deviceInfo.index < 0) {
         return false;
     }
 
-    // Thread-safe: only use m_controller, no UI widgets.
-    // UI will be updated via connected/disconnected signals.
     QString variant = m_currentVariant;
     int deviceIndex = m_deviceInfo.index;
-    emit logMessage(panelLabel(), QString("API: Powering on device %1 (variant: %2)...")
-                        .arg(deviceIndex).arg(variant));
 
-    bool success = m_controller->connect(deviceIndex, variant);
+    bool success;
+    if (m_controller->isConnected() && !m_controller->isPoweredOn()) {
+        // Instance exists (from preInit or previous powerOff) — just re-power
+        emit logMessage(panelLabel(), QString("Re-powering existing instance (variant: %1)...").arg(variant));
+        success = m_controller->powerOn();
+    } else {
+        // No instance — full connect
+        emit logMessage(panelLabel(), QString("Powering on device %1 (variant: %2)...")
+                            .arg(deviceIndex).arg(variant));
+        success = m_controller->connect(deviceIndex, variant);
+    }
 
     // Update UI from main thread
     QString lastErr = success ? QString() : m_controller->lastError();
@@ -374,26 +380,29 @@ void DeviceControlPanel::setupConnections()
 
 void DeviceControlPanel::updateUIState()
 {
-    bool connected = isConnected();
+    // Use power-on state, not connected state — powerOff keeps the controller
+    // instance alive (for fast re-power) so isConnected() stays true even when
+    // the rails are down. UI must reflect actual power state.
+    bool poweredOn = isPoweredOn();
     bool hasDevice = m_deviceInfo.index >= 0;
 
     // Power buttons - mutually exclusive
-    m_btnPowerOn->setEnabled(!connected && hasDevice);
-    m_btnPowerOff->setEnabled(connected);
+    m_btnPowerOn->setEnabled(!poweredOn && hasDevice);
+    m_btnPowerOff->setEnabled(poweredOn);
 
     // Variant can only be changed when powered off
-    m_cmbVariant->setEnabled(!connected);
+    m_cmbVariant->setEnabled(!poweredOn);
 
-    // Other controls
-    m_sliderBrightness->setEnabled(connected);
-    m_spinBrightness->setEnabled(connected);
-    m_chkXFlip->setEnabled(connected);
-    m_chkYFlip->setEnabled(connected);
-    m_btnRefreshInfo->setEnabled(connected);
-    m_btnSendImage->setEnabled(connected);
+    // Other controls only make sense when powered
+    m_sliderBrightness->setEnabled(poweredOn);
+    m_spinBrightness->setEnabled(poweredOn);
+    m_chkXFlip->setEnabled(poweredOn);
+    m_chkYFlip->setEnabled(poweredOn);
+    m_btnRefreshInfo->setEnabled(poweredOn);
+    m_btnSendImage->setEnabled(poweredOn);
 
     // Update status label
-    if (connected) {
+    if (poweredOn) {
         m_lblStatus->setText("On");
         m_lblStatus->setStyleSheet("color: green; font-weight: bold;");
     } else {
@@ -458,7 +467,16 @@ void DeviceControlPanel::onPowerOnClicked()
 
     QtConcurrent::run([this, guard, controller, deviceIndex, variant]() {
         if (!guard->load()) return;
-        bool success = controller->connect(deviceIndex, variant);
+        bool success;
+        if (controller->isConnected() && !controller->isPoweredOn()) {
+            // Instance exists (from preInit or previous powerOff) — just re-power
+            // Note: if variant changed, need full reconnect
+            success = controller->powerOn();
+        } else if (controller->isConnected() && controller->isPoweredOn()) {
+            success = true;
+        } else {
+            success = controller->connect(deviceIndex, variant);
+        }
 
         QMetaObject::invokeMethod(this, [this, guard, success]() {
             if (!guard->load()) return;
@@ -482,7 +500,8 @@ void DeviceControlPanel::onPowerOffClicked()
 
     QtConcurrent::run([this, guard, controller]() {
         if (!guard->load()) return;
-        controller->disconnect();
+        // Software power-off only — keep instance alive for fast re-power
+        controller->powerOff();
 
         QMetaObject::invokeMethod(this, [this, guard]() {
             if (!guard->load()) return;
