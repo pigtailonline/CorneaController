@@ -560,9 +560,18 @@ void DeviceControlPanel::applyBrightness(double brightness)
 
 void DeviceControlPanel::startBrightnessProtection()
 {
+    // Reset remaining checks to the full count. If the timer is already
+    // running (e.g. another setBrightness came in mid-protection), this
+    // EXTENDS the protection window rather than stacking multiple runs.
+    // The CorneaController cache ensures redundant reads within 1 s are
+    // deduplicated, so extending never creates extra I2C traffic.
     m_brightnessProtectionCount = 0;
-    m_brightnessProtectionTimer->start(BRIGHTNESS_PROTECTION_INTERVAL_MS);
-    emit logMessage(panelLabel(), "Brightness protection: monitoring temp for 5 seconds...");
+    if (!m_brightnessProtectionTimer->isActive()) {
+        m_brightnessProtectionTimer->start(BRIGHTNESS_PROTECTION_INTERVAL_MS);
+        emit logMessage(panelLabel(), "Brightness protection: monitoring temp for 5 seconds...");
+    } else {
+        emit logMessage(panelLabel(), "Brightness protection: extended (5 more seconds)");
+    }
 }
 
 void DeviceControlPanel::onBrightnessProtectionTimeout()

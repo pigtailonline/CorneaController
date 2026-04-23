@@ -5,6 +5,8 @@
 #include <QString>
 #include <QImage>
 #include <QTimer>
+#include <QMutex>
+#include <QElapsedTimer>
 #include <memory>
 
 class PythonBridge;
@@ -20,6 +22,7 @@ public:
 
     // Connection
     bool connect(int deviceIndex, const QString &hardwareVariant = "standard");
+    bool preInit(int deviceIndex, const QString &hardwareVariant = "standard"); // FTDI only, no panel needed
     void disconnect();
     bool isConnected() const;
     bool isInitOk() const;
@@ -57,6 +60,9 @@ public:
     // Temperature
     double getRj1Temperature();     // RJ1-RAX internal temp sensor
     double getDa9272Temperature();
+
+    // Power (for Harriet Panel Tester report)
+    QVariantMap getPowerMeasurements();  // {vsys_power_mw, vddio_power_mw}
     void startTemperaturePolling(int intervalMs = 5000);
     void stopTemperaturePolling();
 
@@ -109,6 +115,16 @@ private:
     int m_instanceId = -1;      // Instance ID in PythonBridge (-1 = not connected)
     int m_deviceIndex = -1;     // Device index
     QString m_deviceSerial;     // Device serial number
+
+    // Per-controller RJ1 temperature cache: deduplicates reads within a short
+    // window so rapid TCP traffic (setBrightness + sendImage bursts) don't each
+    // trigger a real I2C transaction. Overheat protection still reacts within
+    // CACHE_TTL_MS, well under the ~3 s burn margin.
+    static constexpr qint64 RJ1_CACHE_TTL_MS = 1000;
+    mutable QMutex m_tempCacheMutex;
+    qint64 m_lastRj1ReadMs = 0;   // monotonic (QElapsedTimer) elapsed since class init
+    double m_cachedRj1Temp = -999.0;
+    QElapsedTimer m_cacheClock;   // started in ctor; provides monotonic ms
 };
 
 #endif // CORNEACONTROLLER_H

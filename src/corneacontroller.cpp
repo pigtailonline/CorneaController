@@ -14,6 +14,7 @@ CorneaController::CorneaController(PythonBridge *sharedBridge, QObject *parent)
     , m_instanceId(-1)
     , m_deviceIndex(-1)
 {
+    m_cacheClock.start();
     QObject::connect(m_tempPollTimer, &QTimer::timeout,
                      this, &CorneaController::onTemperaturePollTimeout);
 }
@@ -46,6 +47,26 @@ bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant)
         emit connected();
         emit powerStateChanged(true);
         emit logMessage(QString("Connected to device: %1").arg(getDeviceLabel()));
+        return true;
+    }
+
+    return false;
+}
+
+bool CorneaController::preInit(int deviceIndex, const QString &hardwareVariant)
+{
+    if (m_instanceId >= 0) {
+        return true; // Already initialized
+    }
+
+    int instanceId = m_bridge->preInitDeviceInstance(deviceIndex, hardwareVariant);
+    if (instanceId >= 0) {
+        m_instanceId = instanceId;
+        m_deviceIndex = deviceIndex;
+        m_deviceSerial = m_bridge->getDeviceSerial(instanceId);
+        m_poweredOn = false; // FTDI ready but not powered on
+
+        emit logMessage(QString("Pre-init OK: %1 (FTDI ready)").arg(getDeviceLabel()));
         return true;
     }
 
@@ -268,16 +289,46 @@ double CorneaController::getRj1Temperature()
         return -999.0;
     }
 
-    return m_bridge->getLeaTemperature(m_instanceId);
+    // Dedupe reads within RJ1_CACHE_TTL_MS. Rapid TCP traffic (brightness
+    // protection checks, UI refresh, sendImage flow) hits the same value
+    // instead of queueing multiple I2C round-trips. Each controller has its
+    // own cache — Panel A's cache does not affect Panel B.
+    const qint64 now = m_cacheClock.elapsed();
+    {
+        QMutexLocker lock(&m_tempCacheMutex);
+        if (m_cachedRj1Temp > -900.0 && (now - m_lastRj1ReadMs) < RJ1_CACHE_TTL_MS) {
+            return m_cachedRj1Temp;
+        }
+    }
+
+    double temp = m_bridge->getLeaTemperature(m_instanceId);
+    if (temp > -900.0) {
+        QMutexLocker lock(&m_tempCacheMutex);
+        m_cachedRj1Temp = temp;
+        m_lastRj1ReadMs = now;
+    }
+    return temp;
 }
 
 double CorneaController::getDa9272Temperature()
 {
-    if (!isConnected()) {
-        return -999.0;
-    }
+    // DA9272 temperature probe is not used by the station — it often NACKs on
+    // our hardware, wasting ~1 s per poll in retry loops and blocking the
+    // single Python dispatch thread (which starves sendImage/brightness/etc.).
+    // Skip the actual I2C read; UI shows "-" when value <= -900 and overheat
+    // protection uses qMax(rj1, da9272) so RJ1 alone still governs shutdown.
+    return -999.0;
+}
 
-    return m_bridge->getDa9272Temperature(m_instanceId);
+QVariantMap CorneaController::getPowerMeasurements()
+{
+    if (!isConnected()) {
+        QVariantMap v;
+        v["vsys_power_mw"] = -999.0;
+        v["vddio_power_mw"] = -999.0;
+        return v;
+    }
+    return m_bridge->getPowerMeasurements(m_instanceId);
 }
 
 void CorneaController::startTemperaturePolling(int intervalMs)
