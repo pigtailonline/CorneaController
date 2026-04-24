@@ -374,6 +374,17 @@ void DeviceControlPanel::setupConnections()
             this, &DeviceControlPanel::onControllerTemperatureUpdated);
     connect(m_controller.get(), &CorneaController::errorOccurred,
             this, &DeviceControlPanel::onControllerError);
+
+    // Refresh UI whenever the controller's power state changes. Without this
+    // connection, TCP-triggered powerOn/powerOff (called via the controller
+    // directly rather than the GUI buttons) leaves the Power On/Off buttons
+    // and the status label stale: the panel is actually lit and reports a
+    // Panel ID, but the UI still shows "Off". Using Qt::QueuedConnection so
+    // the UI update always happens on the GUI thread even though the signal
+    // is emitted from the Python/worker thread.
+    connect(m_controller.get(), &CorneaController::powerStateChanged,
+            this, [this](bool){ updateUIState(); },
+            Qt::QueuedConnection);
     connect(m_controller.get(), &CorneaController::logMessage,
             this, &DeviceControlPanel::onControllerLog);
 }

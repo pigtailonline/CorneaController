@@ -9,6 +9,7 @@
 #include <QMap>
 #include <QList>
 #include <QThread>
+#include <QMutex>
 #include <QRandomGenerator>
 #include <memory>
 
@@ -46,6 +47,7 @@ public:
 
     // Multi-instance device management
     int createDeviceInstance(int deviceIndex, const QString &hardwareVariant = "standard");  // Returns instanceId, -1 on failure
+    int preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant = "standard"); // Light init: FTDI only, no RJ1/panel needed
     void destroyDeviceInstance(int instanceId);
     bool isDeviceConnected(int instanceId) const;
     bool isDeviceInitOk(int instanceId) const;
@@ -76,6 +78,9 @@ public:
     QString getChipRevision(int instanceId);
     double getLeaTemperature(int instanceId);   // RJ1-RAX internal temp sensor
     double getDa9272Temperature(int instanceId);
+    // Power measurements (for Harriet "Panel Tester" report)
+    // Returns {vsys_power_mw, vddio_power_mw}
+    QVariantMap getPowerMeasurements(int instanceId);
     QVariantMap getPackageVersions(int instanceId);
     QString getPanelId(int instanceId);
 
@@ -119,6 +124,7 @@ private:
     PyObject *m_numpyModule;
     PyObject *m_executor;  // Python concurrent.futures.ThreadPoolExecutor
     QString m_lastError;
+    mutable QMutex m_lastErrorMutex;
     QString m_venvPath;
     QString m_pythonHome;
     QStringList m_dllPaths;
@@ -132,16 +138,41 @@ private:
     QMap<int, QString> m_serialMap;          // instanceId -> serial number
     int m_nextInstanceId = 0;
 
-    // Dedicated Python worker thread
-    // All Python C API calls happen exclusively on this thread.
-    // No GIL management needed — single thread = serialized access.
+    // Main Python worker thread — used for interpreter init, module imports,
+    // device enumeration, and other non-per-instance work. Per-instance ops
+    // run on per-device worker threads instead (see below).
     QThread m_pythonThread;
     QObject *m_pythonWorker = nullptr;
 
-    // Dispatch helpers: run callable on Python thread, block until done.
-    // If already on Python thread, runs directly (avoids deadlock).
+    // Per-device worker threads. Each `createDeviceInstance` /
+    // `preInitDeviceInstance` spins up a dedicated QThread + QObject worker
+    // for that instanceId. Commands for that device run on its own thread so
+    // multiple panels can have their Python/I-O overlap (pyftdi + SPI release
+    // the GIL during transactions). Dying instances have their thread joined
+    // and deleted.
+    QMap<int, QThread*>  m_deviceThreads;
+    QMap<int, QObject*>  m_deviceWorkers;
+    mutable QMutex m_deviceThreadsMutex;
+
+    // Main-interpreter thread state saved after init so worker threads can
+    // acquire the GIL via PyGILState_Ensure. Restored (briefly) at shutdown.
+    void *m_savedThreadState = nullptr;  // actually PyThreadState*
+
+    // Dispatch helpers: run callable on a Python-capable thread, block until
+    // done. Both acquire the GIL before running `f()` (via PyGILState_Ensure)
+    // and release it after, so callers can use the Python C API directly
+    // inside their lambdas.
+    //   - dispatch / dispatchVoid → main Python worker thread
+    //   - dispatchToDevice / dispatchVoidToDevice → the instanceId's worker
     template<typename F> auto dispatch(F &&f) -> decltype(f());
     void dispatchVoid(std::function<void()> f);
+    template<typename F> auto dispatchToDevice(int instanceId, F &&f) -> decltype(f());
+    void dispatchVoidToDevice(int instanceId, std::function<void()> f);
+
+    // Create / destroy a device-specific worker thread. Called from
+    // (pre)InitDeviceInstance and destroyDeviceInstance respectively.
+    QObject *ensureDeviceWorker(int instanceId);
+    void destroyDeviceWorker(int instanceId);
 
 #ifdef QT_DEBUG
     // Debug simulation mode — no hardware, no Python, fake 12 devices.

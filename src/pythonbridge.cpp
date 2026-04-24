@@ -27,31 +27,170 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QMetaObject>
+#include <QSemaphore>
 #include <functional>
 
 // ---------------------------------------------------------------------------
-// Dispatch helpers: run work on the dedicated Python thread.
-// BlockingQueuedConnection blocks the caller until the lambda finishes.
-// If already on the Python thread, run directly to avoid deadlock.
+// Dispatch helpers: run work on a Python-capable thread with proper GIL
+// handling. After initialize() calls PyEval_SaveThread(), the GIL is no
+// longer held by any C++ thread. Every dispatch lambda acquires the GIL via
+// PyGILState_Ensure(), runs the work, then releases it. This is what enables
+// several device-worker threads to call Python in parallel (pyftdi/SPI I/O
+// releases the GIL internally, letting other threads make progress).
 // ---------------------------------------------------------------------------
+
+// Invokes f() on `worker` and blocks the caller until it completes.
+// When `acquireGil` is true, the GIL is wrapped around f()'s invocation so
+// the lambda can freely use the Python C API.
 template<typename F>
-auto PythonBridge::dispatch(F &&f) -> decltype(f()) {
-    if (QThread::currentThread() == &m_pythonThread) {
+static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
+                           bool acquireGil, const char *timeoutTag,
+                           std::function<void(const QString&)> logFn)
+    -> decltype(f())
+{
+    if (QThread::currentThread() == thread) {
+        if (acquireGil) {
+            PyGILState_STATE g = PyGILState_Ensure();
+            auto r = f();
+            PyGILState_Release(g);
+            return r;
+        }
         return f();
     }
     decltype(f()) result{};
-    QMetaObject::invokeMethod(m_pythonWorker, [&f, &result]() {
-        result = f();
-    }, Qt::BlockingQueuedConnection);
+    QSemaphore done;
+    QMetaObject::invokeMethod(worker, [&f, &result, &done, acquireGil]() {
+        if (acquireGil) {
+            PyGILState_STATE g = PyGILState_Ensure();
+            result = f();
+            PyGILState_Release(g);
+        } else {
+            result = f();
+        }
+        done.release();
+    }, Qt::QueuedConnection);
+    if (!done.tryAcquire(1, 15000)) {
+        if (logFn) logFn(QString("[PythonBridge] %1 TIMEOUT (15s) — thread may be stuck").arg(timeoutTag));
+        return result;
+    }
     return result;
+}
+
+template<typename F>
+auto PythonBridge::dispatch(F &&f) -> decltype(f()) {
+    auto log = [this](const QString &msg){ emit logMessage(msg); };
+    return invokeOnWorker(m_pythonWorker, &m_pythonThread, std::forward<F>(f),
+                          /*acquireGil*/ true, "dispatch", log);
 }
 
 void PythonBridge::dispatchVoid(std::function<void()> f) {
     if (QThread::currentThread() == &m_pythonThread) {
+        PyGILState_STATE g = PyGILState_Ensure();
         f();
+        PyGILState_Release(g);
         return;
     }
-    QMetaObject::invokeMethod(m_pythonWorker, std::move(f), Qt::BlockingQueuedConnection);
+    QSemaphore done;
+    auto wrapped = [fn = std::move(f), &done]() {
+        PyGILState_STATE g = PyGILState_Ensure();
+        fn();
+        PyGILState_Release(g);
+        done.release();
+    };
+    QMetaObject::invokeMethod(m_pythonWorker, std::move(wrapped), Qt::QueuedConnection);
+    if (!done.tryAcquire(1, 15000)) {
+        emit logMessage("[PythonBridge] dispatchVoid TIMEOUT (15s) — Python thread may be stuck");
+    }
+}
+
+template<typename F>
+auto PythonBridge::dispatchToDevice(int instanceId, F &&f) -> decltype(f()) {
+    QObject *worker = nullptr;
+    QThread *thread = nullptr;
+    {
+        QMutexLocker lock(&m_deviceThreadsMutex);
+        worker = m_deviceWorkers.value(instanceId, nullptr);
+        thread = m_deviceThreads.value(instanceId, nullptr);
+    }
+    // Fallback to the main Python thread if the instance has no dedicated
+    // worker yet (shouldn't happen post-createDeviceInstance, but keeps the
+    // method safe against lookup misses).
+    if (!worker || !thread) {
+        return dispatch(std::forward<F>(f));
+    }
+    auto log = [this, instanceId](const QString &msg) {
+        emit logMessage(QString("[PythonBridge/inst=%1] %2").arg(instanceId).arg(msg));
+    };
+    return invokeOnWorker(worker, thread, std::forward<F>(f),
+                          /*acquireGil*/ true, "dispatchToDevice", log);
+}
+
+void PythonBridge::dispatchVoidToDevice(int instanceId, std::function<void()> f) {
+    QObject *worker = nullptr;
+    QThread *thread = nullptr;
+    {
+        QMutexLocker lock(&m_deviceThreadsMutex);
+        worker = m_deviceWorkers.value(instanceId, nullptr);
+        thread = m_deviceThreads.value(instanceId, nullptr);
+    }
+    if (!worker || !thread) {
+        dispatchVoid(std::move(f));
+        return;
+    }
+    if (QThread::currentThread() == thread) {
+        PyGILState_STATE g = PyGILState_Ensure();
+        f();
+        PyGILState_Release(g);
+        return;
+    }
+    QSemaphore done;
+    auto wrapped = [fn = std::move(f), &done]() {
+        PyGILState_STATE g = PyGILState_Ensure();
+        fn();
+        PyGILState_Release(g);
+        done.release();
+    };
+    QMetaObject::invokeMethod(worker, std::move(wrapped), Qt::QueuedConnection);
+    if (!done.tryAcquire(1, 15000)) {
+        emit logMessage(QString("[PythonBridge/inst=%1] dispatchVoidToDevice TIMEOUT (15s)").arg(instanceId));
+    }
+}
+
+// Per-instance worker lifecycle.
+QObject *PythonBridge::ensureDeviceWorker(int instanceId)
+{
+    QMutexLocker lock(&m_deviceThreadsMutex);
+    QObject *existing = m_deviceWorkers.value(instanceId, nullptr);
+    if (existing) return existing;
+
+    QThread *t = new QThread();
+    t->setObjectName(QString("CorneaDev%1").arg(instanceId));
+    QObject *w = new QObject();
+    w->moveToThread(t);
+    t->start();
+    m_deviceThreads[instanceId] = t;
+    m_deviceWorkers[instanceId] = w;
+    return w;
+}
+
+void PythonBridge::destroyDeviceWorker(int instanceId)
+{
+    QThread *t = nullptr;
+    QObject *w = nullptr;
+    {
+        QMutexLocker lock(&m_deviceThreadsMutex);
+        t = m_deviceThreads.take(instanceId);
+        w = m_deviceWorkers.take(instanceId);
+    }
+    if (!t && !w) return;
+    if (t) {
+        t->quit();
+        t->wait();
+        delete t;
+    }
+    // Worker is owned by its thread's event loop; safe to delete now that
+    // the thread has exited.
+    delete w;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +247,12 @@ bool PythonBridge::initialize(const QString &venvPath, const QString &pythonHome
 #endif
     // Dispatch entire initialization to the Python worker thread.
     // Python interpreter will be created on that thread.
-    return dispatch([=]() -> bool {
+    // NOTE: bypass the GIL-acquiring dispatch here because Python isn't
+    // initialized yet; PyGILState_Ensure would be a no-op at best and
+    // undefined behavior at worst. The lambda internally runs Py_Initialize
+    // and ends with PyEval_SaveThread so subsequent dispatches can use GIL
+    // management normally.
+    auto initLambda = [=]() -> bool {
         if (m_initialized) {
             return true;
         }
@@ -291,9 +435,27 @@ bool PythonBridge::initialize(const QString &venvPath, const QString &pythonHome
         }
 
         m_initialized = true;
+        // Release the GIL held by the main Python thread so per-device worker
+        // threads can acquire it via PyGILState_Ensure. Saved state is
+        // restored (briefly) at shutdown before Py_Finalize.
+        m_savedThreadState = PyEval_SaveThread();
         emit logMessage("Python bridge initialized successfully");
         return true;
-    });
+    };
+
+    // Manual invoke (bypass dispatch()'s GIL wrapping) because the
+    // interpreter isn't live yet when this runs.
+    if (QThread::currentThread() == &m_pythonThread) {
+        return initLambda();
+    }
+    bool result = false;
+    QSemaphore done;
+    QMetaObject::invokeMethod(m_pythonWorker, [&initLambda, &result, &done]() {
+        result = initLambda();
+        done.release();
+    }, Qt::QueuedConnection);
+    done.acquire();  // init can take a while; no timeout here
+    return result;
 }
 
 void PythonBridge::shutdown()
@@ -305,13 +467,27 @@ void PythonBridge::shutdown()
     m_initialized = false;
     return;
 #endif
-    dispatchVoid([this]() {
-        QList<int> instanceIds = m_deviceInstances.keys();
-        for (int id : instanceIds) {
-            // destroyDeviceInstance dispatches, but we're already on Python thread → runs directly
-            destroyDeviceInstance(id);
+    // First destroy per-device workers (outside GIL — they use the GIL
+    // internally as they run). Each destroyDeviceInstance also tears down
+    // its thread so we stop having threads holding Python references.
+    {
+        QList<int> instanceIds;
+        {
+            QMutexLocker lock(&m_deviceThreadsMutex);
+            instanceIds = m_deviceWorkers.keys();
         }
+        for (int id : instanceIds) destroyDeviceInstance(id);
+    }
 
+    // Restore the main thread state so Py_Finalize can run on it normally.
+    if (m_savedThreadState) {
+        PyEval_RestoreThread(reinterpret_cast<PyThreadState*>(m_savedThreadState));
+        m_savedThreadState = nullptr;
+    }
+
+    // Execute the rest of shutdown with the GIL already held by this thread.
+    // Use a non-GIL-wrapped invoke — GIL is held by main-thread context above.
+    auto shutdownLambda = [this]() {
         if (m_initialized) {
             // Shutdown ThreadPoolExecutor (wait for pending tasks)
             if (m_executor) {
@@ -344,7 +520,20 @@ void PythonBridge::shutdown()
             Py_Finalize();
             m_initialized = false;
         }
-    });
+    };
+
+    // Run shutdown on the main Python worker thread. GIL is held (restored
+    // above), so no PyGILState_Ensure wrapping is needed.
+    if (QThread::currentThread() == &m_pythonThread) {
+        shutdownLambda();
+    } else {
+        QSemaphore done;
+        QMetaObject::invokeMethod(m_pythonWorker, [&shutdownLambda, &done]() {
+            shutdownLambda();
+            done.release();
+        }, Qt::QueuedConnection);
+        done.acquire();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +964,76 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         emit logMessage(QString("[Instance %1] Connected to device %2 (Serial: %3)")
                         .arg(instanceId).arg(deviceIndex).arg(serial));
 
+        // Spin up a dedicated worker thread for this instance so subsequent
+        // per-device calls (sendImage / setBrightness / getTemperature) run
+        // concurrently with other panels.
+        ensureDeviceWorker(instanceId);
+
+        return instanceId;
+    });
+}
+
+int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant)
+{
+#ifdef QT_DEBUG
+    return createDeviceInstance(deviceIndex, hardwareVariant);
+#endif
+    return dispatch([this, deviceIndex, hardwareVariant]() -> int {
+        if (!m_initialized) {
+            setError("Python bridge not initialized");
+            return -1;
+        }
+
+        int instanceId = m_nextInstanceId++;
+
+        emit logMessage(QString("[Instance %1] Pre-init: FTDI-only for device index %2 (init_rj1=False)...")
+                        .arg(instanceId).arg(deviceIndex));
+
+        PyObject *kwargs = PyDict_New();
+        PyDict_SetItemString(kwargs, "cornea_index", PyLong_FromLong(deviceIndex));
+        PyDict_SetItemString(kwargs, "init_cornea", Py_True);
+        PyDict_SetItemString(kwargs, "init_rj1", Py_False);  // Skip RJ1 — no panel needed
+        PyDict_SetItemString(kwargs, "cal_path", PyUnicode_FromString(m_calPath.toUtf8().constData()));
+        PyDict_SetItemString(kwargs, "rj1_use_i2c", Py_True);
+        PyDict_SetItemString(kwargs, "rj1_use_spi", Py_True);
+        PyDict_SetItemString(kwargs, "allow_default_hdf5", Py_True);
+        PyDict_SetItemString(kwargs, "cal_revision", Py_None);
+        PyDict_SetItemString(kwargs, "cornea_serial", Py_None);
+        PyDict_SetItemString(kwargs, "rj1_version", Py_None);
+        PyDict_SetItemString(kwargs, "spi_clk_freq", PyFloat_FromDouble(m_spiClkFreq));
+        PyDict_SetItemString(kwargs, "console_log_level", PyLong_FromLong(20));
+        PyDict_SetItemString(kwargs, "hardware_variant", PyUnicode_FromString(hardwareVariant.toUtf8().constData()));
+
+        PyObject *args = PyTuple_New(0);
+        PyObject *instance = PyObject_Call(m_corneaClass, args, kwargs);
+        Py_DECREF(args);
+        Py_DECREF(kwargs);
+
+        if (!instance) {
+            PyErr_Print();
+            emit logMessage(QString("[Instance %1] Pre-init FAILED").arg(instanceId));
+            m_nextInstanceId--;
+            return -1;
+        }
+
+        QString serial;
+        PyObject *serialObj = PyObject_GetAttrString(instance, "cornea_serial");
+        if (serialObj && PyUnicode_Check(serialObj)) {
+            serial = QString::fromUtf8(PyUnicode_AsUTF8(serialObj));
+        }
+        Py_XDECREF(serialObj);
+
+        m_deviceInstances[instanceId] = instance;
+        m_initOkMap[instanceId] = false;  // Not fully initialized yet
+        m_serialMap[instanceId] = serial;
+
+        emit logMessage(QString("[Instance %1] Pre-init OK: device %2 (Serial: %3) — FTDI ready, awaiting powerOn")
+                        .arg(instanceId).arg(deviceIndex).arg(serial));
+
+        // Spin up a dedicated worker thread for this instance (same reason
+        // as in createDeviceInstance).
+        ensureDeviceWorker(instanceId);
+
         return instanceId;
     });
 }
@@ -788,7 +1047,10 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
     emit logMessage(QString("[SIM] Device instance %1 destroyed").arg(instanceId));
     return;
 #endif
-    dispatchVoid([this, instanceId]() {
+    // Run the Python teardown on the device's own worker thread if it has
+    // one (ensures no other call is mid-flight on this instance). Falls
+    // back to the main worker via dispatchVoid if no device worker exists.
+    auto teardown = [this, instanceId]() {
         if (!m_deviceInstances.contains(instanceId)) {
             return;
         }
@@ -807,7 +1069,20 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
 
         Py_DECREF(instance);
         emit logMessage(QString("[Instance %1] Disconnected (Serial: %2)").arg(instanceId).arg(serial));
-    });
+    };
+
+    bool hasDeviceWorker;
+    {
+        QMutexLocker lock(&m_deviceThreadsMutex);
+        hasDeviceWorker = m_deviceWorkers.contains(instanceId);
+    }
+    if (hasDeviceWorker) {
+        dispatchVoidToDevice(instanceId, teardown);
+        // Now that Python state is released, stop and delete the worker.
+        destroyDeviceWorker(instanceId);
+    } else {
+        dispatchVoid(teardown);
+    }
 }
 
 bool PythonBridge::isDeviceConnected(int instanceId) const
@@ -844,7 +1119,7 @@ bool PythonBridge::systemPowerOn(int instanceId)
     simSleep(SIM_DELAY_MS);
     return m_simDevices.contains(instanceId);
 #endif
-    return dispatch([this, instanceId]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_on");
         if (result) {
             Py_DECREF(result);
@@ -865,7 +1140,7 @@ bool PythonBridge::systemPowerOff(int instanceId)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].connected = false;
     return true;
 #endif
-    return dispatch([this, instanceId]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_off");
         if (result) {
             Py_DECREF(result);
@@ -884,7 +1159,7 @@ bool PythonBridge::enableVsys(int instanceId, bool enable)
     Q_UNUSED(enable);
     return m_simDevices.contains(instanceId);
 #endif
-    return dispatch([this, instanceId, enable]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId, enable]() -> bool {
         PyObject *args = PyTuple_Pack(1, enable ? Py_True : Py_False);
         PyObject *result = callInstanceMethod(instanceId, "enable_vsys", args);
         Py_DECREF(args);
@@ -903,7 +1178,7 @@ bool PythonBridge::setBrightness(int instanceId, double level)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].brightness = level;
     return m_simDevices.contains(instanceId);
 #endif
-    return dispatch([this, instanceId, level]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId, level]() -> bool {
         PyObject *args = PyTuple_Pack(1, PyFloat_FromDouble(level));
         PyObject *result = callInstanceMethod(instanceId, "set_brightness", args);
         Py_DECREF(args);
@@ -921,7 +1196,7 @@ double PythonBridge::getBrightness(int instanceId)
 #ifdef QT_DEBUG
     return m_simDevices.contains(instanceId) ? m_simDevices[instanceId].brightness : -1.0;
 #endif
-    return dispatch([this, instanceId]() -> double {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> double {
         PyObject *result = callInstanceMethod(instanceId, "get_brightness");
         if (result) {
             double value = PyFloat_AsDouble(result);
@@ -938,7 +1213,7 @@ bool PythonBridge::setXFlip(int instanceId, bool flip)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].xFlip = flip;
     return m_simDevices.contains(instanceId);
 #endif
-    return dispatch([this, instanceId, flip]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId, flip]() -> bool {
         PyObject *args = PyTuple_Pack(2, flip ? Py_True : Py_False, Py_None);
         PyObject *result = callInstanceMethod(instanceId, "rj1_set_x_flip_offset", args);
         Py_DECREF(args);
@@ -957,7 +1232,7 @@ bool PythonBridge::setYFlip(int instanceId, bool flip)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].yFlip = flip;
     return m_simDevices.contains(instanceId);
 #endif
-    return dispatch([this, instanceId, flip]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId, flip]() -> bool {
         PyObject *args = PyTuple_Pack(2, flip ? Py_True : Py_False, Py_None);
         PyObject *result = callInstanceMethod(instanceId, "rj1_set_y_flip_offset", args);
         Py_DECREF(args);
@@ -975,7 +1250,7 @@ bool PythonBridge::getXFlip(int instanceId)
 #ifdef QT_DEBUG
     return m_simDevices.contains(instanceId) ? m_simDevices[instanceId].xFlip : false;
 #endif
-    return dispatch([this, instanceId]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "rj1_get_x_flip_offset");
         if (result && PyTuple_Check(result) && PyTuple_Size(result) >= 1) {
             PyObject *flipObj = PyTuple_GetItem(result, 0);
@@ -993,7 +1268,7 @@ bool PythonBridge::getYFlip(int instanceId)
 #ifdef QT_DEBUG
     return m_simDevices.contains(instanceId) ? m_simDevices[instanceId].yFlip : false;
 #endif
-    return dispatch([this, instanceId]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "rj1_get_y_flip_offset");
         if (result && PyTuple_Check(result) && PyTuple_Size(result) >= 1) {
             PyObject *flipObj = PyTuple_GetItem(result, 0);
@@ -1014,7 +1289,7 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image)
     simSleep(SIM_DELAY_MS);
     return m_simDevices.contains(instanceId);
 #endif
-    return dispatch([this, instanceId, image]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId, image]() -> bool {
         PyObject *instance = getDeviceInstance(instanceId);
         if (!instance) {
             setError(QString("Device instance %1 not found").arg(instanceId));
@@ -1078,7 +1353,7 @@ QVariantMap PythonBridge::getChipInfo(int instanceId)
     info["instance"] = instanceId;
     return info;
 #endif
-    return dispatch([this, instanceId]() -> QVariantMap {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> QVariantMap {
         QVariantMap result;
         PyObject *pyResult = callInstanceMethod(instanceId, "get_rj1_chip_info");
         if (pyResult) {
@@ -1094,7 +1369,7 @@ QVariantMap PythonBridge::getChipInfoDecoded(int instanceId)
 #ifdef QT_DEBUG
     return getChipInfo(instanceId);
 #endif
-    return dispatch([this, instanceId]() -> QVariantMap {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> QVariantMap {
         QVariantMap result;
         PyObject *pyResult = callInstanceMethod(instanceId, "get_rj1_chip_info_decoded");
         if (pyResult) {
@@ -1111,7 +1386,7 @@ QString PythonBridge::getChipRevision(int instanceId)
     Q_UNUSED(instanceId);
     return "B1";
 #endif
-    return dispatch([this, instanceId]() -> QString {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> QString {
         PyObject *result = callInstanceMethod(instanceId, "get_rj1_chip_info_decoded");
         if (result && PyDict_Check(result)) {
             PyObject *revision = PyDict_GetItemString(result, "revision");
@@ -1141,7 +1416,7 @@ double PythonBridge::getLeaTemperature(int instanceId)
     Q_UNUSED(instanceId);
     return 25.0 + QRandomGenerator::global()->bounded(5.0);
 #endif
-    return dispatch([this, instanceId]() -> double {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> double {
         PyObject *instance = getDeviceInstance(instanceId);
         if (!instance) {
             return -999.0;
@@ -1185,7 +1460,7 @@ double PythonBridge::getDa9272Temperature(int instanceId)
     Q_UNUSED(instanceId);
     return 24.0 + QRandomGenerator::global()->bounded(4.0);
 #endif
-    return dispatch([this, instanceId]() -> double {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> double {
         PyObject *result = callInstanceMethod(instanceId, "get_da9272_temperature");
         if (result && result != Py_None) {
             double temp = -999.0;
@@ -1203,6 +1478,50 @@ double PythonBridge::getDa9272Temperature(int instanceId)
     });
 }
 
+QVariantMap PythonBridge::getPowerMeasurements(int instanceId)
+{
+#ifdef QT_DEBUG
+    Q_UNUSED(instanceId);
+    QVariantMap v;
+    v["vsys_power_mw"] = 500.0 + QRandomGenerator::global()->bounded(100.0);
+    v["vddio_power_mw"] = 50.0 + QRandomGenerator::global()->bounded(20.0);
+    return v;
+#endif
+    return dispatchToDevice(instanceId, [this, instanceId]() -> QVariantMap {
+        QVariantMap result;
+        PyObject *instance = getDeviceInstance(instanceId);
+        if (!instance) return result;
+
+        // Python equivalent of:
+        //   vsys_power_mw  = cornea_ctrl.pwr["vsys"].get_power() * 1000
+        //   vddio_power_mw = cornea_ctrl.pwr["vddio"].get_power() * 1000
+        auto readPower = [&](const char *railName, double &outMw) -> bool {
+            PyObject *pwr = PyObject_GetAttrString(instance, "pwr");
+            if (!pwr) { PyErr_Clear(); return false; }
+            PyObject *rail = PyObject_GetItem(pwr, PyUnicode_FromString(railName));
+            Py_DECREF(pwr);
+            if (!rail) { PyErr_Clear(); return false; }
+            PyObject *result = PyObject_CallMethod(rail, "get_power", nullptr);
+            Py_DECREF(rail);
+            if (!result) { PyErr_Clear(); return false; }
+            if (PyFloat_Check(result)) {
+                outMw = PyFloat_AsDouble(result) * 1000.0; // W → mW
+            } else if (PyLong_Check(result)) {
+                outMw = static_cast<double>(PyLong_AsLong(result)) * 1000.0;
+            }
+            Py_DECREF(result);
+            return true;
+        };
+
+        double vsysMw = -999.0, vddioMw = -999.0;
+        readPower("vsys", vsysMw);
+        readPower("vddio", vddioMw);
+        result["vsys_power_mw"] = vsysMw;
+        result["vddio_power_mw"] = vddioMw;
+        return result;
+    });
+}
+
 QVariantMap PythonBridge::getPackageVersions(int instanceId)
 {
 #ifdef QT_DEBUG
@@ -1212,7 +1531,7 @@ QVariantMap PythonBridge::getPackageVersions(int instanceId)
     v["ar_display_lab_lib"] = "1.0.0-sim";
     return v;
 #endif
-    return dispatch([this, instanceId]() -> QVariantMap {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> QVariantMap {
         QVariantMap result;
         PyObject *pyResult = callInstanceMethod(instanceId, "get_pkg_versions");
         if (pyResult) {
@@ -1228,7 +1547,7 @@ QString PythonBridge::getPanelId(int instanceId)
 #ifdef QT_DEBUG
     return QString("SIM-PANEL-%1").arg(instanceId);
 #endif
-    return dispatch([this, instanceId]() -> QString {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> QString {
         PyObject *result = callInstanceMethod(instanceId, "get_rj1_chip_info_decoded");
         if (result && PyDict_Check(result)) {
             PyObject *ucidStr = PyDict_GetItemString(result, "unique_chip_id_str");
@@ -1251,7 +1570,7 @@ int PythonBridge::readRj1Register(int instanceId, int address)
     Q_UNUSED(instanceId); Q_UNUSED(address);
     return 0;
 #endif
-    return dispatch([this, instanceId, address]() -> int {
+    return dispatchToDevice(instanceId, [this, instanceId, address]() -> int {
         PyObject *args = PyTuple_Pack(1, PyLong_FromLong(address));
         PyObject *result = callInstanceMethod(instanceId, "read_rj1_reg", args);
         Py_DECREF(args);
@@ -1270,7 +1589,7 @@ bool PythonBridge::writeRj1Register(int instanceId, int address, int data)
     Q_UNUSED(instanceId); Q_UNUSED(address); Q_UNUSED(data);
     return true;
 #endif
-    return dispatch([this, instanceId, address, data]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId, address, data]() -> bool {
         PyObject *args = PyTuple_Pack(2, PyLong_FromLong(address), PyLong_FromLong(data));
         PyObject *result = callInstanceMethod(instanceId, "write_rj1_reg", args);
         Py_DECREF(args);
@@ -1288,7 +1607,7 @@ QVariantMap PythonBridge::getRj1Dacs(int instanceId)
     Q_UNUSED(instanceId);
     return QVariantMap();
 #endif
-    return dispatch([this, instanceId]() -> QVariantMap {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> QVariantMap {
         QVariantMap result;
         PyObject *pyResult = callInstanceMethod(instanceId, "get_rj1_dacs");
         if (pyResult) {
@@ -1305,7 +1624,7 @@ bool PythonBridge::setRj1Dacs(int instanceId, const QVariantMap &dacValues)
     Q_UNUSED(instanceId); Q_UNUSED(dacValues);
     return true;
 #endif
-    return dispatch([this, instanceId, dacValues]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId, dacValues]() -> bool {
         PyObject *pyDict = PyDict_New();
         for (auto it = dacValues.begin(); it != dacValues.end(); ++it) {
             PyObject *key = PyUnicode_FromString(it.key().toUtf8().constData());
@@ -1334,7 +1653,7 @@ bool PythonBridge::setDemuraEnable(int instanceId, bool enable)
     Q_UNUSED(instanceId); Q_UNUSED(enable);
     return true;
 #endif
-    return dispatch([this, instanceId, enable]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId, enable]() -> bool {
         PyObject *args = PyTuple_Pack(1, enable ? Py_True : Py_False);
         PyObject *result = callInstanceMethod(instanceId, "rj1_demura_enable", args);
         Py_DECREF(args);
@@ -1352,7 +1671,7 @@ bool PythonBridge::setRlutEnable(int instanceId, bool enable)
     Q_UNUSED(instanceId); Q_UNUSED(enable);
     return true;
 #endif
-    return dispatch([this, instanceId, enable]() -> bool {
+    return dispatchToDevice(instanceId, [this, instanceId, enable]() -> bool {
         PyObject *args = PyTuple_Pack(1, enable ? Py_True : Py_False);
         PyObject *result = callInstanceMethod(instanceId, "rj1_rlut_enable", args);
         Py_DECREF(args);
@@ -1373,7 +1692,7 @@ QVariantMap PythonBridge::getDemuraRlutState(int instanceId)
     state["rlut"] = true;
     return state;
 #endif
-    return dispatch([this, instanceId]() -> QVariantMap {
+    return dispatchToDevice(instanceId, [this, instanceId]() -> QVariantMap {
         QVariantMap result;
         PyObject *pyResult = callInstanceMethod(instanceId, "rj1_get_demura_rlut_state");
         if (pyResult) {
