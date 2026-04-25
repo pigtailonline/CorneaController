@@ -467,9 +467,9 @@ void PythonBridge::shutdown()
     m_initialized = false;
     return;
 #endif
-    // First destroy per-device workers (outside GIL — they use the GIL
-    // internally as they run). Each destroyDeviceInstance also tears down
-    // its thread so we stop having threads holding Python references.
+    // First destroy per-device workers. Each destroyDeviceInstance dispatches
+    // the Python teardown to the device's own thread (which uses PyGILState)
+    // then tears down that thread, so references drop in the correct order.
     {
         QList<int> instanceIds;
         {
@@ -479,15 +479,17 @@ void PythonBridge::shutdown()
         for (int id : instanceIds) destroyDeviceInstance(id);
     }
 
-    // Restore the main thread state so Py_Finalize can run on it normally.
-    if (m_savedThreadState) {
-        PyEval_RestoreThread(reinterpret_cast<PyThreadState*>(m_savedThreadState));
-        m_savedThreadState = nullptr;
-    }
-
-    // Execute the rest of shutdown with the GIL already held by this thread.
-    // Use a non-GIL-wrapped invoke — GIL is held by main-thread context above.
+    // Everything below runs ON m_pythonThread — that's the thread that holds
+    // the saved main interpreter state. Restoring a PyThreadState has to
+    // happen on the thread the state was created on, otherwise Py_Finalize
+    // walks a corrupt state and segfaults (v1.1.6 bug seen at GUI close).
     auto shutdownLambda = [this]() {
+        // Re-acquire GIL + main thread state on this thread.
+        if (m_savedThreadState) {
+            PyEval_RestoreThread(reinterpret_cast<PyThreadState*>(m_savedThreadState));
+            m_savedThreadState = nullptr;
+        }
+
         if (m_initialized) {
             // Shutdown ThreadPoolExecutor (wait for pending tasks)
             if (m_executor) {
@@ -522,8 +524,8 @@ void PythonBridge::shutdown()
         }
     };
 
-    // Run shutdown on the main Python worker thread. GIL is held (restored
-    // above), so no PyGILState_Ensure wrapping is needed.
+    // Always run shutdown on m_pythonThread. If we're not already on it,
+    // post via invokeMethod and wait.
     if (QThread::currentThread() == &m_pythonThread) {
         shutdownLambda();
     } else {
@@ -1711,19 +1713,28 @@ void PythonBridge::flushPythonOutput()
     // Use QueuedConnection (non-blocking) so this never blocks the main thread.
     // When Python worker is busy with a long operation (e.g. powerOn ~10s),
     // BlockingQueuedConnection would freeze the UI until that operation finishes.
+    //
+    // Since v1.1.6 the interpreter releases the GIL after init
+    // (PyEval_SaveThread), so this lambda MUST acquire it via
+    // PyGILState_Ensure before touching any Python C API; otherwise it
+    // will segfault on the very first 100 ms tick.
     QMetaObject::invokeMethod(m_pythonWorker, [this]() {
         if (!m_initialized) {
             return;
         }
 
+        PyGILState_STATE gstate = PyGILState_Ensure();
+
         PyObject *mainModule = PyImport_AddModule("__main__");
         if (!mainModule) {
+            PyGILState_Release(gstate);
             return;
         }
 
         PyObject *captureObj = PyObject_GetAttrString(mainModule, "_qt_output_capture");
         if (!captureObj) {
             PyErr_Clear();
+            PyGILState_Release(gstate);
             return;
         }
 
@@ -1731,6 +1742,7 @@ void PythonBridge::flushPythonOutput()
         if (!getMethod) {
             Py_DECREF(captureObj);
             PyErr_Clear();
+            PyGILState_Release(gstate);
             return;
         }
 
@@ -1740,6 +1752,7 @@ void PythonBridge::flushPythonOutput()
 
         if (!result) {
             PyErr_Clear();
+            PyGILState_Release(gstate);
             return;
         }
 
@@ -1755,5 +1768,6 @@ void PythonBridge::flushPythonOutput()
         }
 
         Py_DECREF(result);
+        PyGILState_Release(gstate);
     }, Qt::QueuedConnection);
 }

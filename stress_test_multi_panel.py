@@ -54,7 +54,9 @@ def send_tcp(host: str, port: int, payload: dict, timeout: float = 20.0) -> tupl
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
             s.settimeout(timeout)
-            s.sendall(json.dumps(payload).encode("utf-8"))
+            # Server parses one command per newline — without it, the server
+            # buffers indefinitely and the client times out at 20 s.
+            s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
             # The server closes the connection after responding in most flows;
             # read until EOF or newline.
             buf = b""
@@ -111,6 +113,12 @@ def panel_worker(host: str, port: int, serial: str, iterations: int,
 
         # Alternate brightness to exercise BrightnessProtection
         level = 0.50 if level < 0.1 else 0.05
+
+        # Progress ping every 10 iterations so the user sees liveness.
+        if (i + 1) % 10 == 0:
+            print(f"  [{stats.serial}] iter={i + 1}/{iterations} "
+                  f"ok={stats.ok} fail={stats.fail} timeout={stats.timeout}",
+                  flush=True)
 
 
 def summarize(stats: PanelStats) -> str:

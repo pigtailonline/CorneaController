@@ -2,6 +2,14 @@ QT += core gui widgets network concurrent
 
 CONFIG += c++17
 
+# Emit .pdb in Release builds so Windows Error Reporting / Visual Studio can
+# resolve crash offsets to function + line number. `force_debug_info` adds
+# debug info without disabling optimizations. Without this, the exe ships
+# optimized but with no symbols, and WER crash reports give only raw offsets.
+CONFIG += force_debug_info
+QMAKE_CXXFLAGS_RELEASE += /Zi
+QMAKE_LFLAGS_RELEASE   += /DEBUG /OPT:REF /OPT:ICF
+
 TARGET = CorneaController
 TEMPLATE = app
 
