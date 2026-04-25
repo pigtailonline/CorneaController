@@ -81,6 +81,7 @@ public:
     QString getPanelIdBySerial(const QString &serial) const;
     double getTemperatureBySerial(const QString &serial) const;
     QString getVariantBySerial(const QString &serial) const;
+    QVariantMap getPowerBySerial(const QString &serial) const;  // {vsys_power_mw, vddio_power_mw}
 
     // === Image Access (for TCP API) ===
     QStringList getImageNames() const;
@@ -89,6 +90,7 @@ public:
     // === Device List ===
     QStringList getDeviceSerials() const;
     void refreshDevices();
+
 
     // === TCP Server ===
     bool startTcpServer(quint16 port = 5566);

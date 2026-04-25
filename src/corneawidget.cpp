@@ -67,6 +67,25 @@ bool CorneaWidget::loadConfig(const QString &configPath)
     // Refresh device list
     refreshDeviceList();
 
+    // Pre-create FTDI connections for all detected devices at startup.
+    // Uses init_rj1=False so no panel/光機 is needed — only driver board.
+    // This ensures pyftdi SPI/I2C controllers are created once for all devices.
+    // Subsequent powerOn uses system_power_on() on existing instances.
+    for (DeviceControlPanel *panel : m_devicePanels) {
+        CorneaController *ctrl = panel->controller();
+        if (ctrl && !ctrl->isConnected()) {
+            QString variant = panel->currentVariant();
+            appendLog(QString("Pre-init: %1 (variant=%2, FTDI only)...")
+                      .arg(panel->deviceSerial(), variant));
+            if (ctrl->preInit(panel->deviceIndex(), variant)) {
+                appendLog(QString("Pre-init: %1 OK").arg(panel->deviceSerial()));
+            } else {
+                appendLog(QString("Pre-init: %1 FAILED (will retry on powerOn)")
+                          .arg(panel->deviceSerial()));
+            }
+        }
+    }
+
     // Save config to persist any newly discovered devices
     saveConfig();
 
@@ -409,11 +428,18 @@ bool CorneaWidget::powerOnBySerial(const QString &serial)
     if (!panel) return false;
 
     CorneaController *ctrl = panel->controller();
-    if (ctrl->isConnected()) return true;
 
-    // Thread-safe: controller->connect() calls PythonBridge::dispatch().
-    // CorneaController emits connected() signal which auto-queues to main thread,
-    // triggering DeviceControlPanel::onControllerConnected() for UI updates.
+    // Already connected and powered on — nothing to do
+    if (ctrl->isConnected() && ctrl->isPoweredOn()) return true;
+
+    // Connected but powered off — re-power without creating new instance
+    // This avoids pyftdi resetting all SPI/I2C controllers on the USB hub
+    if (ctrl->isConnected() && !ctrl->isPoweredOn()) {
+        appendLog(QString("[PowerOn] %1 — re-powering existing instance").arg(serial));
+        return ctrl->powerOn();
+    }
+
+    // Not connected — first time, full connect (creates Python SDK instance)
     return ctrl->connect(panel->deviceIndex(), panel->currentVariant());
 }
 
@@ -429,7 +455,13 @@ bool CorneaWidget::powerOnBySerial(const QString &serial, const QString &variant
     }, Qt::QueuedConnection);
 
     CorneaController *ctrl = panel->controller();
-    if (ctrl->isConnected()) return true;
+
+    if (ctrl->isConnected() && ctrl->isPoweredOn()) return true;
+
+    if (ctrl->isConnected() && !ctrl->isPoweredOn()) {
+        appendLog(QString("[PowerOn] %1 — re-powering existing instance").arg(serial));
+        return ctrl->powerOn();
+    }
 
     return ctrl->connect(panel->deviceIndex(), variant);
 }
@@ -438,8 +470,11 @@ bool CorneaWidget::powerOffBySerial(const QString &serial)
 {
     CorneaController *ctrl = getControllerBySerial(serial);
     if (!ctrl || !ctrl->isConnected()) return true;
-    ctrl->disconnect();
-    return true;
+
+    // Software power-off only — keep the Python SDK instance alive.
+    // This avoids pyftdi resetting all SPI/I2C controllers when the
+    // next powerOn creates a new instance.
+    return ctrl->powerOff();
 }
 
 bool CorneaWidget::sendImageBySerial(const QString &serial, const QString &imagePath)
@@ -554,6 +589,18 @@ double CorneaWidget::getTemperatureBySerial(const QString &serial) const
     CorneaController *ctrl = getControllerBySerial(serial);
     if (!ctrl || !ctrl->isConnected()) return -999.0;
     return ctrl->getRj1Temperature();
+}
+
+QVariantMap CorneaWidget::getPowerBySerial(const QString &serial) const
+{
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (!ctrl || !ctrl->isConnected()) {
+        QVariantMap v;
+        v["vsys_power_mw"] = -999.0;
+        v["vddio_power_mw"] = -999.0;
+        return v;
+    }
+    return ctrl->getPowerMeasurements();
 }
 
 QString CorneaWidget::getVariantBySerial(const QString &serial) const

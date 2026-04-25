@@ -11,6 +11,7 @@
 #include <QMap>
 #include <QPointer>
 #include <QSet>
+#include <QReadWriteLock>
 #include <atomic>
 #include <memory>
 
@@ -53,6 +54,7 @@ private:
     QJsonObject handleIsConnected(const QJsonObject &params);
     QJsonObject handleGetPanelId(const QJsonObject &params);
     QJsonObject handleGetTemperature(const QJsonObject &params);
+    QJsonObject handleGetPower(const QJsonObject &params);
     QJsonObject handleGetStatus(const QJsonObject &params);
     QJsonObject handleListDevices(const QJsonObject &params);
     QJsonObject handleRefreshDevices(const QJsonObject &params);
@@ -71,6 +73,10 @@ private:
     CorneaWidget *m_corneaWidget;
 
     std::shared_ptr<std::atomic<bool>> m_asyncGuard;
+
+    // Protect against powerOn/powerOff resetting SPI/I2C while other commands run.
+    // powerOn/powerOff take write lock (exclusive), all others take read lock (shared).
+    QReadWriteLock m_deviceLock;
 };
 
 #endif // TCPSERVER_H

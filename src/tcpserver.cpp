@@ -155,9 +155,22 @@ void TcpServer::onReadyRead()
             // Heavy PythonBridge commands: run in thread pool, respond when done
             auto guard = m_asyncGuard;
             QPointer<QTcpSocket> clientPtr(client);
+            bool isExclusive = (cmdName == "poweron" || cmdName == "poweroff");
 
-            QtConcurrent::run([this, guard, clientPtr, cmd, origCmd, origSerial]() {
+            QtConcurrent::run([this, guard, clientPtr, cmd, origCmd, origSerial, isExclusive]() {
                 if (!guard->load()) return;
+
+                // powerOn/powerOff resets shared SPI/I2C controllers — take exclusive
+                // lock so no sendImage/getTemp runs during initialization.
+                // Other commands take shared lock — can run concurrently with each other.
+                if (isExclusive) {
+                    qInfo() << "[TCP] Waiting for exclusive lock:" << origCmd;
+                    m_deviceLock.lockForWrite();
+                    qInfo() << "[TCP] Acquired exclusive lock:" << origCmd;
+                } else {
+                    m_deviceLock.lockForRead();
+                }
+
                 QJsonObject response;
                 try {
                     response = processCommand(cmd);
@@ -166,6 +179,12 @@ void TcpServer::onReadyRead()
                 } catch (...) {
                     response = makeError("Unknown exception in async command");
                 }
+
+                m_deviceLock.unlock();
+                if (isExclusive) {
+                    qInfo() << "[TCP] Released exclusive lock:" << origCmd;
+                }
+
                 // Always echo cmd+serial so client can match response
                 response["cmd"] = origCmd;
                 if (!origSerial.isEmpty()) response["serial"] = origSerial;
@@ -193,7 +212,7 @@ bool TcpServer::isAsyncCommand(const QString &cmdName)
         "poweron", "poweroff",
         "sendimage", "sendimagebyname",
         "gettemperature", "getpanelid",
-        "setbrightness"
+        "setbrightness", "getpower"
     };
     return asyncCommands.contains(cmdName);
 }
@@ -218,6 +237,8 @@ QJsonObject TcpServer::processCommand(const QJsonObject &cmd)
         return handleGetPanelId(cmd);
     } else if (cmdName == "gettemperature") {
         return handleGetTemperature(cmd);
+    } else if (cmdName == "getpower") {
+        return handleGetPower(cmd);
     } else if (cmdName == "getstatus") {
         return handleGetStatus(cmd);
     } else if (cmdName == "listdevices") {
@@ -367,6 +388,23 @@ QJsonObject TcpServer::handleGetTemperature(const QJsonObject &params)
 
     QJsonObject data;
     data["temperature"] = temp;
+    return makeSuccess(data);
+}
+
+QJsonObject TcpServer::handleGetPower(const QJsonObject &params)
+{
+    QString serial = params["serial"].toString();
+    if (serial.isEmpty()) {
+        return makeError("Missing 'serial' parameter");
+    }
+
+    QVariantMap p = m_corneaWidget->getPowerBySerial(serial);
+    double vsys = p.value("vsys_power_mw", -999.0).toDouble();
+    double vddio = p.value("vddio_power_mw", -999.0).toDouble();
+
+    QJsonObject data;
+    data["vsys_power_mw"] = vsys;
+    data["vddio_power_mw"] = vddio;
     return makeSuccess(data);
 }
 
