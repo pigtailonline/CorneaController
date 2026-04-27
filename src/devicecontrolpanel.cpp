@@ -182,9 +182,15 @@ bool DeviceControlPanel::sendImageDirect(const QImage &image)
                         .arg(currentBrightness, 0, 'f', 2)
                         .arg(totalApl, 0, 'f', 4));
 
-    // Check if Total APL > 0.06
+    // Check if Total APL > 0.06 (with epsilon tolerance).
+    // 1.5M-pixel accumulation in calculatePatternApl plus QDoubleSpinBox's
+    // floating-point representation of 0.06 push the boundary case
+    // (100% white × 0.06) just above 0.06 in MSVC's math, even though it
+    // mathematically equals the limit exactly. Customers explicitly want
+    // 0.06 × 255-white to send; treat 0.0600 → 0.0601 as on-limit.
     const double APL_BRIGHTNESS_LIMIT = 0.06;
-    if (totalApl > APL_BRIGHTNESS_LIMIT) {
+    const double APL_LIMIT_EPSILON   = 1e-4;
+    if (totalApl > APL_BRIGHTNESS_LIMIT + APL_LIMIT_EPSILON) {
         emit logMessage(panelLabel(), QString("BLOCKED: Total APL(%1) > %2")
                             .arg(totalApl, 0, 'f', 4)
                             .arg(APL_BRIGHTNESS_LIMIT, 0, 'f', 2));
@@ -679,9 +685,15 @@ void DeviceControlPanel::onSendImageClicked()
                         .arg(currentBrightness, 0, 'f', 2)
                         .arg(totalApl, 0, 'f', 4));
 
-    // Check if Total APL > 0.06
+    // Check if Total APL > 0.06 (with epsilon tolerance).
+    // 1.5M-pixel accumulation in calculatePatternApl plus QDoubleSpinBox's
+    // floating-point representation of 0.06 push the boundary case
+    // (100% white × 0.06) just above 0.06 in MSVC's math, even though it
+    // mathematically equals the limit exactly. Customers explicitly want
+    // 0.06 × 255-white to send; treat 0.0600 → 0.0601 as on-limit.
     const double APL_BRIGHTNESS_LIMIT = 0.06;
-    if (totalApl > APL_BRIGHTNESS_LIMIT) {
+    const double APL_LIMIT_EPSILON   = 1e-4;
+    if (totalApl > APL_BRIGHTNESS_LIMIT + APL_LIMIT_EPSILON) {
         QString warning = QString("Total APL exceeds limit!\n\n"
                                   "Pattern APL: %1\n"
                                   "Brightness: %2\n"
@@ -991,9 +1003,15 @@ ApiResult DeviceControlPanel::sendImageDirectEx(const QImage &image)
                         .arg(currentBrightness, 0, 'f', 2)
                         .arg(totalApl, 0, 'f', 4));
 
-    // Check if Total APL > 0.06
+    // Check if Total APL > 0.06 (with epsilon tolerance).
+    // 1.5M-pixel accumulation in calculatePatternApl plus QDoubleSpinBox's
+    // floating-point representation of 0.06 push the boundary case
+    // (100% white × 0.06) just above 0.06 in MSVC's math, even though it
+    // mathematically equals the limit exactly. Customers explicitly want
+    // 0.06 × 255-white to send; treat 0.0600 → 0.0601 as on-limit.
     const double APL_BRIGHTNESS_LIMIT = 0.06;
-    if (totalApl > APL_BRIGHTNESS_LIMIT) {
+    const double APL_LIMIT_EPSILON   = 1e-4;
+    if (totalApl > APL_BRIGHTNESS_LIMIT + APL_LIMIT_EPSILON) {
         QString error = QString("APL_EXCEEDED: Total APL %1 > limit %2 (pattern=%3, brightness=%4)")
                             .arg(totalApl, 0, 'f', 4)
                             .arg(APL_BRIGHTNESS_LIMIT, 0, 'f', 2)

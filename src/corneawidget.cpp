@@ -527,8 +527,10 @@ ApiResult CorneaWidget::sendImageBySerialEx(const QString &serial, const QImage 
     double brightness = panel->currentBrightness();
     double totalApl = patternApl * brightness;
 
+    // 0.06 boundary tolerance — see DeviceControlPanel sendImageDirect for rationale.
     const double APL_LIMIT = 0.06;
-    if (totalApl > APL_LIMIT) {
+    const double APL_LIMIT_EPSILON = 1e-4;
+    if (totalApl > APL_LIMIT + APL_LIMIT_EPSILON) {
         return ApiResult::fail(QString("APL_EXCEEDED: Total APL %1 > limit %2 (pattern=%3, brightness=%4)")
                                    .arg(totalApl, 0, 'f', 4).arg(APL_LIMIT, 0, 'f', 2)
                                    .arg(patternApl, 0, 'f', 4).arg(brightness, 0, 'f', 2));
