@@ -388,8 +388,22 @@ void DeviceControlPanel::setupConnections()
     // Panel ID, but the UI still shows "Off". Using Qt::QueuedConnection so
     // the UI update always happens on the GUI thread even though the signal
     // is emitted from the Python/worker thread.
+    //
+    // On power-on (re-power of an existing instance OR fresh connect), also
+    // re-read panel ID + temperature. Without this, swapping the panel while
+    // the same USB controller stays plugged in leaves the UI showing the
+    // previous panel's ID/temp because onControllerConnected() only fires on
+    // a fresh USB-level connect.
     connect(m_controller.get(), &CorneaController::powerStateChanged,
-            this, [this](bool){ updateUIState(); },
+            this, [this](bool poweredOn){
+                updateUIState();
+                if (poweredOn) {
+                    // Reset overheat counter on every fresh power-on so a stale
+                    // count from the previous panel doesn't carry into this one.
+                    m_overheatSampleCount = 0;
+                    updatePanelInfo();
+                }
+            },
             Qt::QueuedConnection);
     connect(m_controller.get(), &CorneaController::logMessage,
             this, &DeviceControlPanel::onControllerLog);
@@ -627,12 +641,40 @@ void DeviceControlPanel::onBrightnessProtectionTimeout()
                                 .arg(rj1, 0, 'f', 1)
                                 .arg(da9272, 0, 'f', 1));
 
-            if (maxTemp > TEMPERATURE_LIMIT) {
-                m_brightnessProtectionTimer->stop();
+            // Same tiered protection as the main monitor. Brightness-protection
+            // polls every 1s for 5s after a brightness change, so the
+            // 2-consecutive-sample requirement adds at most 1s extra delay before
+            // shutting down — well within the 85°C panel-damage margin.
+            bool overheat = false;
+            QString reason;
+            if (maxTemp > OVERHEAT_HARD_LIMIT) {
+                overheat = true;
+                reason = QString(">%1°C hard limit").arg(OVERHEAT_HARD_LIMIT, 0, 'f', 1);
+            } else if (maxTemp > TEMPERATURE_LIMIT) {
+                m_overheatSampleCount++;
+                if (m_overheatSampleCount >= OVERHEAT_REQUIRED_SAMPLES) {
+                    overheat = true;
+                    reason = QString("%1 consecutive samples > %2°C")
+                                 .arg(OVERHEAT_REQUIRED_SAMPLES)
+                                 .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
+                } else {
+                    emit logMessage(panelLabel(),
+                        QString("Brightness check %1: temp %2°C above %3°C (sample %4/%5, awaiting confirmation)")
+                            .arg(checkNum).arg(maxTemp, 0, 'f', 1).arg(TEMPERATURE_LIMIT, 0, 'f', 1)
+                            .arg(m_overheatSampleCount).arg(OVERHEAT_REQUIRED_SAMPLES));
+                }
+            } else if (m_overheatSampleCount > 0) {
+                m_overheatSampleCount = 0;
+            }
 
-                QString warning = QString("OVERHEAT during brightness change!\nTemp: %1°C > %2°C limit\nEmergency power off!")
-                                      .arg(maxTemp, 0, 'f', 1)
-                                      .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
+            if (overheat) {
+                m_brightnessProtectionTimer->stop();
+                m_overheatSampleCount = 0;
+
+                QString warning = QString("OVERHEAT during brightness change (%1)\nRJ1: %2°C, DA9272: %3°C\nEmergency power off!")
+                                      .arg(reason)
+                                      .arg(rj1, 0, 'f', 1)
+                                      .arg(da9272, 0, 'f', 1);
                 emit logMessage(panelLabel(), QString("EMERGENCY: %1").arg(warning));
 
                 auto g = m_asyncGuard;
@@ -944,12 +986,42 @@ void DeviceControlPanel::onTemperatureMonitorTimeout()
             onControllerTemperatureUpdated(rj1, da9272);
             m_lblActualBrightness->setText(QString::number(m_currentBrightness, 'f', 2));
 
+            // Tiered overheat protection — see TEMPERATURE_LIMIT / OVERHEAT_HARD_LIMIT
+            // in the header for rationale.
             double maxTemp = qMax(rj1, da9272);
-            if (maxTemp > TEMPERATURE_LIMIT) {
-                m_temperatureTimer->stop();
+            bool overheat = false;
+            QString reason;
+            if (maxTemp > OVERHEAT_HARD_LIMIT) {
+                overheat = true;
+                reason = QString(">%1°C hard limit").arg(OVERHEAT_HARD_LIMIT, 0, 'f', 1);
+            } else if (maxTemp > TEMPERATURE_LIMIT) {
+                m_overheatSampleCount++;
+                if (m_overheatSampleCount >= OVERHEAT_REQUIRED_SAMPLES) {
+                    overheat = true;
+                    reason = QString("%1 consecutive samples > %2°C")
+                                 .arg(OVERHEAT_REQUIRED_SAMPLES)
+                                 .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
+                } else {
+                    emit logMessage(panelLabel(),
+                        QString("Temp %1°C above %2°C limit (sample %3/%4, awaiting confirmation)")
+                            .arg(maxTemp, 0, 'f', 1).arg(TEMPERATURE_LIMIT, 0, 'f', 1)
+                            .arg(m_overheatSampleCount).arg(OVERHEAT_REQUIRED_SAMPLES));
+                }
+            } else {
+                // Cool sample resets the counter so transient spikes don't accumulate.
+                if (m_overheatSampleCount > 0) {
+                    emit logMessage(panelLabel(),
+                        QString("Temp recovered to %1°C, overheat counter reset").arg(maxTemp, 0, 'f', 1));
+                }
+                m_overheatSampleCount = 0;
+            }
 
-                QString warning = QString("Temperature exceeded %1°C!\nRJ1: %2°C, DA9272: %3°C\nDevice will be powered off.")
-                                      .arg(TEMPERATURE_LIMIT, 0, 'f', 1)
+            if (overheat) {
+                m_temperatureTimer->stop();
+                m_overheatSampleCount = 0;
+
+                QString warning = QString("Temperature exceeded safe limit (%1)\nRJ1: %2°C, DA9272: %3°C\nDevice will be powered off.")
+                                      .arg(reason)
                                       .arg(rj1, 0, 'f', 1)
                                       .arg(da9272, 0, 'f', 1);
                 emit logMessage(panelLabel(), QString("OVERHEAT WARNING: %1").arg(warning));
@@ -1072,10 +1144,36 @@ ApiResult DeviceControlPanel::setBrightnessDirectEx(double level, bool waitProte
                                 .arg(rj1, 0, 'f', 1)
                                 .arg(da9272, 0, 'f', 1));
 
-            if (maxTemp > TEMPERATURE_LIMIT) {
-                QString error = QString("OVERHEAT: Temp %1°C > %2°C limit - emergency power off")
-                                    .arg(maxTemp, 0, 'f', 1)
-                                    .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
+            // Same tiered protection as the async monitor — sync polling here is at
+            // 1s intervals so 2-consecutive adds at most 1s extra delay.
+            bool overheat = false;
+            QString reason;
+            if (maxTemp > OVERHEAT_HARD_LIMIT) {
+                overheat = true;
+                reason = QString(">%1°C hard limit").arg(OVERHEAT_HARD_LIMIT, 0, 'f', 1);
+            } else if (maxTemp > TEMPERATURE_LIMIT) {
+                m_overheatSampleCount++;
+                if (m_overheatSampleCount >= OVERHEAT_REQUIRED_SAMPLES) {
+                    overheat = true;
+                    reason = QString("%1 consecutive samples > %2°C")
+                                 .arg(OVERHEAT_REQUIRED_SAMPLES)
+                                 .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
+                } else {
+                    emit logMessage(panelLabel(),
+                        QString("Sync brightness check %1: temp %2°C above limit (sample %3/%4, awaiting confirmation)")
+                            .arg(i + 1).arg(maxTemp, 0, 'f', 1)
+                            .arg(m_overheatSampleCount).arg(OVERHEAT_REQUIRED_SAMPLES));
+                }
+            } else if (m_overheatSampleCount > 0) {
+                m_overheatSampleCount = 0;
+            }
+
+            if (overheat) {
+                m_overheatSampleCount = 0;
+                QString error = QString("OVERHEAT (%1) - emergency power off (RJ1=%2°C, DA9272=%3°C)")
+                                    .arg(reason)
+                                    .arg(rj1, 0, 'f', 1)
+                                    .arg(da9272, 0, 'f', 1);
                 emit logMessage(panelLabel(), QString("EMERGENCY: %1").arg(error));
                 m_controller->powerOff();
                 return ApiResult::fail(error);

@@ -27,6 +27,12 @@ class DeviceControlPanel : public QWidget
 
 public:
     static constexpr double TEMPERATURE_LIMIT = 65.0;
+    // Tiered overheat protection (above TEMPERATURE_LIMIT).
+    // 65–75°C: warning zone, 2 consecutive samples required to shut down — filters
+    //          single SPI glitches without sacrificing safety margin.
+    // >75°C : hard fail, single sample triggers instant shutdown — panel damage
+    //         threshold is ~85°C per FATP, so the 10°C buffer keeps us safe.
+    static constexpr double OVERHEAT_HARD_LIMIT = 75.0;
 
     explicit DeviceControlPanel(int panelId, PythonBridge *bridge, QWidget *parent = nullptr);
     ~DeviceControlPanel();
@@ -146,6 +152,13 @@ private:
     // Temperature monitoring
     QTimer *m_temperatureTimer;
     static constexpr int TEMPERATURE_CHECK_INTERVAL_MS = 5000;
+
+    // Overheat shutdown requires N consecutive samples above TEMPERATURE_LIMIT to trigger.
+    // Filters out one-off spurious readings (SPI glitches, transient transients during
+    // bias rail settling) so a single bad sample doesn't kill an in-progress test.
+    // Real thermal events ramp continuously over multiple polls and still trip on time.
+    static constexpr int OVERHEAT_REQUIRED_SAMPLES = 2;
+    int m_overheatSampleCount = 0;
 
     // Brightness protection (check temp every 1s for 5s after brightness change)
     QTimer *m_brightnessProtectionTimer;

@@ -555,6 +555,13 @@ ApiResult CorneaWidget::setBrightnessBySerialEx(const QString &serial, double le
     }
 
     if (waitProtection) {
+        // Tiered overheat protection (matches DeviceControlPanel logic):
+        //   - Single sample > OVERHEAT_HARD_LIMIT (75°C) → instant emergency off.
+        //   - 65–75°C "warning zone" requires 2 consecutive samples to filter
+        //     spurious SPI glitches. Polling is 1s here so the extra confirmation
+        //     adds at most 1s before shutdown — well under the 85°C panel-damage
+        //     margin.
+        int warnCount = 0;
         for (int i = 0; i < 5; ++i) {
             QThread::msleep(1000);
             if (!ctrl->isConnected()) return ApiResult::fail("Device disconnected during protection check");
@@ -563,10 +570,27 @@ ApiResult CorneaWidget::setBrightnessBySerialEx(const QString &serial, double le
             double da9272 = ctrl->getDa9272Temperature();
             double maxTemp = qMax(rj1, da9272);
 
-            if (maxTemp > DeviceControlPanel::TEMPERATURE_LIMIT) {
+            bool overheat = false;
+            QString reason;
+            if (maxTemp > DeviceControlPanel::OVERHEAT_HARD_LIMIT) {
+                overheat = true;
+                reason = QString(">%1°C hard limit").arg(DeviceControlPanel::OVERHEAT_HARD_LIMIT, 0, 'f', 1);
+            } else if (maxTemp > DeviceControlPanel::TEMPERATURE_LIMIT) {
+                warnCount++;
+                if (warnCount >= 2) {
+                    overheat = true;
+                    reason = QString("2 consecutive samples > %1°C")
+                                 .arg(DeviceControlPanel::TEMPERATURE_LIMIT, 0, 'f', 1);
+                }
+            } else {
+                warnCount = 0;
+            }
+
+            if (overheat) {
                 ctrl->powerOff();
-                return ApiResult::fail(QString("OVERHEAT: Temp %1°C > %2°C limit")
-                    .arg(maxTemp, 0, 'f', 1).arg(DeviceControlPanel::TEMPERATURE_LIMIT, 0, 'f', 1));
+                return ApiResult::fail(QString("OVERHEAT (%1): RJ1=%2°C, DA9272=%3°C")
+                    .arg(reason)
+                    .arg(rj1, 0, 'f', 1).arg(da9272, 0, 'f', 1));
             }
         }
     }
