@@ -402,6 +402,20 @@ void DeviceControlPanel::setupConnections()
                     // count from the previous panel doesn't carry into this one.
                     m_overheatSampleCount = 0;
                     updatePanelInfo();
+                } else {
+                    // Power-off without USB disconnect (PowerOff button, TCP
+                    // powerOff, or overheat-triggered shutdown). Clear the panel
+                    // info labels so a stale temperature reading doesn't linger
+                    // on screen across the off-period and confuse the operator
+                    // during the next power-on while updatePanelInfo() is still
+                    // resolving. Without this, the UI shows the last-known temp
+                    // (often the 65 C overheat trip value) for the entire init
+                    // sequence, making it look like the freshly-powered panel
+                    // is reading 65 C immediately.
+                    m_lblPanelId->setText("-");
+                    m_lblRj1Temp->setText("-");
+                    m_lblDa9272Temp->setText("-");
+                    m_lblActualBrightness->setText("-");
                 }
             },
             Qt::QueuedConnection);
