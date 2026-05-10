@@ -39,6 +39,8 @@ public:
                     bool allowDefaultHdf5 = false);
     void setSpiClkFreq(double freq) { m_spiClkFreq = freq; }
     double spiClkFreq() const { return m_spiClkFreq; }
+    void setLogApl(bool on) { m_logApl = on; }
+    bool logApl() const { return m_logApl; }
     void shutdown();
     bool isInitialized() const { return m_initialized; }
 
@@ -131,6 +133,7 @@ private:
     QString m_calPath;
     bool m_allowDefaultHdf5;
     double m_spiClkFreq = 15e6;
+    bool m_logApl = false;
 
     // Multi-instance management
     QMap<int, PyObject*> m_deviceInstances;  // instanceId -> CorneaRax720

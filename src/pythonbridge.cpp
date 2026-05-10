@@ -25,6 +25,7 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QMetaObject>
 #include <QSemaphore>
@@ -1123,12 +1124,28 @@ bool PythonBridge::systemPowerOn(int instanceId)
 #endif
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_on");
-        if (result) {
-            Py_DECREF(result);
+        if (!result) {
+            emit logMessage(QString("[Instance %1] System power ON threw exception: %2")
+                                .arg(instanceId).arg(m_lastError));
+            flushPythonOutput();
+            return false;
+        }
+        // rax_lib's system_power_on returns init_ok (bool): True only if the
+        // init sequence completed successfully. When the panel isn't physically
+        // connected (Pogo not engaged), init_cornea NACKs internally but the
+        // call returns False rather than throwing — so checking only "did it
+        // throw?" is not enough. Without this PyObject_IsTrue check we'd
+        // misreport "Power ON" with m_poweredOn=true and the UI would light up
+        // green even though no panel was connected. Surfaced 2026-05-10 on a
+        // station where right-eye Pogo was unseated; v1.1.12 reported "lit".
+        const bool initOk = PyObject_IsTrue(result) == 1;
+        Py_DECREF(result);
+        if (initOk) {
             emit logMessage(QString("[Instance %1] System power ON").arg(instanceId));
             return true;
         }
-        emit logMessage(QString("[Instance %1] System power ON FAILED: %2").arg(instanceId).arg(m_lastError));
+        emit logMessage(QString("[Instance %1] System power ON returned init_ok=False (panel not responding — check Pogo connection / hardware)")
+                            .arg(instanceId));
         flushPythonOutput();
         return false;
     });
@@ -1313,9 +1330,25 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image)
 
         PyObject *kwargs = PyDict_New();
         PyDict_SetItemString(kwargs, "opencv_frame", Py_True);
+        // rax_lib's write_rj1_frame logs an APL line on every frame by default.
+        // Configurable via cornea_config.json's python.log_apl (default false).
+        // Default off = quieter logs + less per-frame overhead. Flip on when
+        // debugging APL / brightness issues. Recommended by Google FW team
+        // when chasing throughput (e.g. validating 30 Mbps SPI clock).
+        PyDict_SetItemString(kwargs, "log_apl", m_logApl ? Py_True : Py_False);
 
         PyObject *args = PyTuple_Pack(1, pyArray);
+
+        // Time the actual rax_lib call in isolation. Google FW team's spec is
+        // <1 s for write_rj1_frame on a healthy panel; if our integrated path
+        // logs longer than that, the extra time is upstream of this call
+        // (image conversion, kwargs build, GIL contention, dispatch hop —
+        // already measured outside this bracket). qimageToPyArray runs above;
+        // that's the suspect for any C++→Python conversion overhead.
+        QElapsedTimer rax_call_timer;
+        rax_call_timer.start();
         PyObject *result = PyObject_Call(method, args, kwargs);
+        const qint64 rax_call_ms = rax_call_timer.elapsed();
 
         Py_DECREF(method);
         Py_DECREF(args);
@@ -1326,11 +1359,17 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image)
             bool success = PyObject_IsTrue(result);
             Py_DECREF(result);
             if (success) {
-                emit logMessage(QString("[Instance %1] Frame written successfully").arg(instanceId));
+                emit logMessage(QString("[Instance %1] Frame written successfully (rax write_rj1_frame: %2 ms)")
+                                    .arg(instanceId).arg(rax_call_ms));
+            } else {
+                emit logMessage(QString("[Instance %1] Frame write returned False (rax write_rj1_frame: %2 ms)")
+                                    .arg(instanceId).arg(rax_call_ms));
             }
             return success;
         }
 
+        emit logMessage(QString("[Instance %1] Frame write threw (rax write_rj1_frame: %2 ms before throw)")
+                            .arg(instanceId).arg(rax_call_ms));
         PyErr_Print();
         return false;
     });

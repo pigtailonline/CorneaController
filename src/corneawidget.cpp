@@ -133,6 +133,8 @@ bool CorneaWidget::initializePythonBridge()
     // Initialize with config values
     m_pythonBridge->setSpiClkFreq(py.spiClkFreq);
     appendLog(QString("SPI clock freq: %1 MHz (from config)").arg(py.spiClkFreq / 1e6, 0, 'f', 1));
+    m_pythonBridge->setLogApl(py.logApl);
+    appendLog(QString("write_rj1_frame log_apl: %1 (from config)").arg(py.logApl ? "true" : "false"));
     if (!m_pythonBridge->initialize(py.venvPath, py.pythonHome, py.dllPaths, py.calPath, py.allowDefaultHdf5)) {
         appendLog("Warning: Failed to initialize Python bridge. Check config paths.");
         QMessageBox::warning(this, "Initialization Warning",
@@ -555,13 +557,11 @@ ApiResult CorneaWidget::setBrightnessBySerialEx(const QString &serial, double le
     }
 
     if (waitProtection) {
-        // Tiered overheat protection (matches DeviceControlPanel logic):
-        //   - Single sample > OVERHEAT_HARD_LIMIT (75°C) → instant emergency off.
-        //   - 65–75°C "warning zone" requires 2 consecutive samples to filter
-        //     spurious SPI glitches. Polling is 1s here so the extra confirmation
-        //     adds at most 1s before shutdown — well under the 85°C panel-damage
-        //     margin.
-        int warnCount = 0;
+        // Single-sample trigger at TEMPERATURE_LIMIT (65 °C). Tiered logic was
+        // tried in v1.1.8/9 to filter SPI glitches but the 2026-04-29 customer
+        // event showed panel heats 24 °C/s at GL255 + brightness 0.06; the
+        // confirmation delay let temperature climb 9.5 °C past 65 before
+        // triggering. Reverted to v1.1.7 behavior: any sample over 65 ⇒ off.
         for (int i = 0; i < 5; ++i) {
             QThread::msleep(1000);
             if (!ctrl->isConnected()) return ApiResult::fail("Device disconnected during protection check");
@@ -570,26 +570,10 @@ ApiResult CorneaWidget::setBrightnessBySerialEx(const QString &serial, double le
             double da9272 = ctrl->getDa9272Temperature();
             double maxTemp = qMax(rj1, da9272);
 
-            bool overheat = false;
-            QString reason;
-            if (maxTemp > DeviceControlPanel::OVERHEAT_HARD_LIMIT) {
-                overheat = true;
-                reason = QString(">%1°C hard limit").arg(DeviceControlPanel::OVERHEAT_HARD_LIMIT, 0, 'f', 1);
-            } else if (maxTemp > DeviceControlPanel::TEMPERATURE_LIMIT) {
-                warnCount++;
-                if (warnCount >= 2) {
-                    overheat = true;
-                    reason = QString("2 consecutive samples > %1°C")
-                                 .arg(DeviceControlPanel::TEMPERATURE_LIMIT, 0, 'f', 1);
-                }
-            } else {
-                warnCount = 0;
-            }
-
-            if (overheat) {
+            if (maxTemp > DeviceControlPanel::TEMPERATURE_LIMIT) {
                 ctrl->powerOff();
-                return ApiResult::fail(QString("OVERHEAT (%1): RJ1=%2°C, DA9272=%3°C")
-                    .arg(reason)
+                return ApiResult::fail(QString("OVERHEAT (>%1°C): RJ1=%2°C, DA9272=%3°C")
+                    .arg(DeviceControlPanel::TEMPERATURE_LIMIT, 0, 'f', 1)
                     .arg(rj1, 0, 'f', 1).arg(da9272, 0, 'f', 1));
             }
         }
@@ -759,6 +743,40 @@ void CorneaWidget::refreshDeviceList()
     }
 
     QList<DeviceInfo> devices = m_pythonBridge->getAvailableDevicesInfo();
+
+    // Fast path: if the USB enumeration returned the same serials in the same
+    // order as our current panel set, every panel tab is already correct.
+    // Skip the destroy/rebuild dance — that's the slow part (each idle panel's
+    // powerOffDirect() takes ~1-2 s, 6 idle panels stack to ~9 s for an
+    // otherwise no-op refresh).
+    //
+    // Customer-reported (Panel tester, 2026-04-29 ~ 05-04): qiutaiController's
+    // auto-refreshDevices on TCP reconnect was taking ~9 s and the operator's
+    // first sendImage right after the refresh was misapplying brightness
+    // (the powerOff sweep destroyed pending state). With this fast path, the
+    // no-change refresh returns in <100 ms and downstream operations are
+    // never disrupted.
+    bool sameDevices = (devices.size() == m_devicePanels.size());
+    if (sameDevices) {
+        for (int i = 0; i < devices.size(); ++i) {
+            if (!m_devicePanels[i] ||
+                m_devicePanels[i]->deviceSerial() != devices[i].serial) {
+                sameDevices = false;
+                break;
+            }
+        }
+    }
+    if (sameDevices) {
+        // Update lightweight info on each panel (display name, etc.) without
+        // tearing down. setDeviceInfo() is safe to call on a connected panel.
+        for (int i = 0; i < devices.size(); ++i) {
+            m_devicePanels[i]->setDeviceInfo(devices[i]);
+        }
+        ui->lblDeviceCount->setText(QString("Devices: %1").arg(devices.size()));
+        appendLog(QString("Refresh: %1 device(s) unchanged, skipping tab rebuild")
+                      .arg(devices.size()));
+        return;
+    }
 
     appendLog(QString("Found %1 device(s)").arg(devices.size()));
     for (const DeviceInfo &info : devices) {

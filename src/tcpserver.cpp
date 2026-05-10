@@ -449,7 +449,14 @@ QJsonObject TcpServer::handleRefreshDevices(const QJsonObject &params)
 {
     Q_UNUSED(params);
 
-    m_corneaWidget->refreshDevices();
+    // Don't actually re-enumerate when called over TCP. Operator stations
+    // (qiutaiController flows etc.) call refreshDevices between tests, but
+    // refreshDevices() destroys all instances and re-pre-inits — that
+    // destroys live full-init instances created by my powerOnDirect path
+    // (variant: F33L cycles) and leaves pyftdi handles in a state where
+    // every subsequent pre-init fails. Operators were left with a station
+    // that "powered on once" and then nothing worked. UI button still
+    // does the real refresh; TCP cmd just reports current count.
     int count = m_corneaWidget->getDeviceSerials().size();
 
     QJsonObject data;

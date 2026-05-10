@@ -12,6 +12,10 @@ struct PythonConfig {
     QString calPath;
     bool allowDefaultHdf5 = false;
     double spiClkFreq = 15e6;       // SPI clock frequency in Hz (default 15MHz)
+    // rax_lib's write_rj1_frame logs an APL line on every frame by default.
+    // Default false here = quieter logs + higher throughput. Flip to true
+    // when debugging APL / brightness behavior.
+    bool logApl = false;
 };
 
 struct DeviceConfig {

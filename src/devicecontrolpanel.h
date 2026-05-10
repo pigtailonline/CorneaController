@@ -26,13 +26,15 @@ class DeviceControlPanel : public QWidget
     Q_OBJECT
 
 public:
+    // Customer-spec hard limit. Any single sample ≥ this triggers immediate
+    // shutdown. The earlier tiered protection (require 2 consecutive samples
+    // before shutting down to filter SPI glitches) lost ~10 °C of safety
+    // margin in the 2026-04-29 customer event: panel heated 24 °C/s after
+    // GL255_Red, the "awaiting confirmation" sample landed at 74.8 °C
+    // (vs 65.3 °C the previous tick) before triggering. The glitch-filtering
+    // benefit is dwarfed by the per-second heating rate, so single-sample
+    // matches the spec strictly.
     static constexpr double TEMPERATURE_LIMIT = 65.0;
-    // Tiered overheat protection (above TEMPERATURE_LIMIT).
-    // 65–75°C: warning zone, 2 consecutive samples required to shut down — filters
-    //          single SPI glitches without sacrificing safety margin.
-    // >75°C : hard fail, single sample triggers instant shutdown — panel damage
-    //         threshold is ~85°C per FATP, so the 10°C buffer keeps us safe.
-    static constexpr double OVERHEAT_HARD_LIMIT = 75.0;
 
     explicit DeviceControlPanel(int panelId, PythonBridge *bridge, QWidget *parent = nullptr);
     ~DeviceControlPanel();
@@ -153,13 +155,6 @@ private:
     QTimer *m_temperatureTimer;
     static constexpr int TEMPERATURE_CHECK_INTERVAL_MS = 5000;
 
-    // Overheat shutdown requires N consecutive samples above TEMPERATURE_LIMIT to trigger.
-    // Filters out one-off spurious readings (SPI glitches, transient transients during
-    // bias rail settling) so a single bad sample doesn't kill an in-progress test.
-    // Real thermal events ramp continuously over multiple polls and still trip on time.
-    static constexpr int OVERHEAT_REQUIRED_SAMPLES = 2;
-    int m_overheatSampleCount = 0;
-
     // Brightness protection (check temp every 1s for 5s after brightness change)
     QTimer *m_brightnessProtectionTimer;
     int m_brightnessProtectionCount = 0;
@@ -176,6 +171,13 @@ private:
     // Async operation management
     bool m_asyncTempBusy = false;
     std::shared_ptr<std::atomic<bool>> m_asyncGuard;
+
+    // True while a powerOn / powerOff click is mid-flight (the long full-init
+    // path can take 5+ s; during that window we mustn't let the disconnect
+    // signal's updateUIState() re-enable the PowerOn button — operators saw
+    // the button "come back" and clicked again, racing pyftdi resources
+    // between two CorneaRax720 instances. updateUIState() respects this flag.
+    bool m_powerOpInProgress = false;
 
 public:
     // APL calculation with gamma LUT (fast, same result as std::pow)

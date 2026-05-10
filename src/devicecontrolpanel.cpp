@@ -124,12 +124,24 @@ bool DeviceControlPanel::powerOnDirect()
     int deviceIndex = m_deviceInfo.index;
 
     bool success;
-    if (m_controller->isConnected() && !m_controller->isPoweredOn()) {
-        // Instance exists (from preInit or previous powerOff) — just re-power
+    if (m_controller->isConnected() && m_controller->isInitOk() && !m_controller->isPoweredOn()) {
+        // Full instance from a previous successful connect — instance has
+        // RJ1 i2c/spi interfaces built (init_rj1=True at construction). A
+        // simple system_power_on suffices to bring the panel back up.
         emit logMessage(panelLabel(), QString("Re-powering existing instance (variant: %1)...").arg(variant));
         success = m_controller->powerOn();
     } else {
-        // No instance — full connect
+        // No instance, OR pre-init shell only (init_rj1 was False at
+        // construction so RJ1 interfaces were never built). Calling
+        // system_power_on on a pre-init shell triggers NACK @ 0x28 because
+        // rax_lib has no way to talk to RJ1 — confirmed against operator
+        // station logs 2026-05-10 (v13 NACKs, v7 works because v7 always
+        // takes this branch). Discard any pre-init shell and full-connect
+        // so the new CorneaRax720 is built with init_rj1=True.
+        if (m_controller->isConnected() && !m_controller->isInitOk()) {
+            emit logMessage(panelLabel(), "Discarding pre-init shell, doing full connect...");
+            m_controller->disconnect();
+        }
         emit logMessage(panelLabel(), QString("Powering on device %1 (variant: %2)...")
                             .arg(deviceIndex).arg(variant));
         success = m_controller->connect(deviceIndex, variant);
@@ -198,7 +210,16 @@ bool DeviceControlPanel::sendImageDirect(const QImage &image)
     }
 
     emit logMessage(panelLabel(), QString("Sending image via API..."));
-    return m_controller->sendImage(image);
+    bool ok = m_controller->sendImage(image);
+    if (ok) {
+        // Image change is when heat ramps fastest (panel chip drives all sub-pixels
+        // up at once). Customer event 2026-04-29: panel went 25 °C → 76.6 °C in 7 s
+        // after a single image send because the 5 s monitor missed the ramp window.
+        // Hooking the brightness-protection fast-polling cycle here gives 5 s of
+        // 1 s polling after every send, so the overheat guard catches the ramp.
+        startBrightnessProtection();
+    }
+    return ok;
 }
 
 bool DeviceControlPanel::setBrightnessDirect(double level)
@@ -398,10 +419,23 @@ void DeviceControlPanel::setupConnections()
             this, [this](bool poweredOn){
                 updateUIState();
                 if (poweredOn) {
-                    // Reset overheat counter on every fresh power-on so a stale
-                    // count from the previous panel doesn't carry into this one.
-                    m_overheatSampleCount = 0;
                     updatePanelInfo();
+                    // Re-apply brightness after power-on. With the pre-init
+                    // optimization (keep instance alive across PowerOff), a
+                    // re-power does NOT trigger onControllerConnected, so the
+                    // saved brightness was never re-asserted on the panel
+                    // hardware. rax_lib resets panel brightness to its default
+                    // (full) on each power-up, so without this re-apply the
+                    // next sendImage runs at 100 % brightness even though the
+                    // UI still shows 0.06 — directly causing overheat at the
+                    // first red frame after PowerOff/PowerOn.
+                    auto guard = m_asyncGuard;
+                    auto controller = m_controller.get();
+                    double savedBrightness = m_currentBrightness;
+                    QtConcurrent::run([guard, controller, savedBrightness]() {
+                        if (!guard->load()) return;
+                        controller->setBrightness(savedBrightness);
+                    });
                 } else {
                     // Power-off without USB disconnect (PowerOff button, TCP
                     // powerOff, or overheat-triggered shutdown). Clear the panel
@@ -432,8 +466,13 @@ void DeviceControlPanel::updateUIState()
     bool hasDevice = m_deviceInfo.index >= 0;
 
     // Power buttons - mutually exclusive
-    m_btnPowerOn->setEnabled(!poweredOn && hasDevice);
-    m_btnPowerOff->setEnabled(poweredOn);
+    // Suppress while a power op is mid-flight: discarding a pre-init shell
+    // emits 'disconnected', which routes through updateUIState() and would
+    // otherwise re-enable PowerOn during the 5+ s full-init window, letting
+    // a quick second click spawn a duplicate CorneaRax720 that races on
+    // pyftdi resources.
+    m_btnPowerOn->setEnabled(!poweredOn && hasDevice && !m_powerOpInProgress);
+    m_btnPowerOff->setEnabled(poweredOn && !m_powerOpInProgress);
 
     // Variant can only be changed when powered off
     m_cmbVariant->setEnabled(!poweredOn);
@@ -446,8 +485,16 @@ void DeviceControlPanel::updateUIState()
     m_btnRefreshInfo->setEnabled(poweredOn);
     m_btnSendImage->setEnabled(poweredOn);
 
-    // Update status label
-    if (poweredOn) {
+    // Update status label.
+    // While a power op is in flight, leave whatever transient text the
+    // op's start handler set (e.g. "Powering on...") — without this guard,
+    // the disconnect() inside the powerOn worker emits 'disconnected',
+    // which queues an updateUIState() that overwrites "Powering on..."
+    // with "Off" until the connect() finishes 5 s later, producing a
+    // user-visible "Connecting → Off → On" oscillation.
+    if (m_powerOpInProgress) {
+        // status label preserved by the on-click handler
+    } else if (poweredOn) {
         m_lblStatus->setText("On");
         m_lblStatus->setStyleSheet("color: green; font-weight: bold;");
     } else {
@@ -494,6 +541,12 @@ void DeviceControlPanel::onPowerOnClicked()
         QMessageBox::warning(this, "No Device", "No device assigned to this panel.");
         return;
     }
+    if (m_powerOpInProgress) {
+        // Already powering on/off — operator double-click guard. Don't queue
+        // a second op; let the in-flight one finish.
+        return;
+    }
+    m_powerOpInProgress = true;
 
     // Show powering on state
     m_btnPowerOn->setEnabled(false);
@@ -513,18 +566,25 @@ void DeviceControlPanel::onPowerOnClicked()
     QtConcurrent::run([this, guard, controller, deviceIndex, variant]() {
         if (!guard->load()) return;
         bool success;
-        if (controller->isConnected() && !controller->isPoweredOn()) {
-            // Instance exists (from preInit or previous powerOff) — just re-power
-            // Note: if variant changed, need full reconnect
+        if (controller->isConnected() && controller->isInitOk() && !controller->isPoweredOn()) {
+            // Full instance, was powered off — re-power via system_power_on works.
+            // Note: if variant changed, need full reconnect (not handled here).
             success = controller->powerOn();
         } else if (controller->isConnected() && controller->isPoweredOn()) {
             success = true;
         } else {
+            // No instance OR pre-init shell only — full connect path. See
+            // powerOnDirect() for the why; pre-init shell calling
+            // system_power_on hits NACK @ 0x28 (RJ1 interfaces never built).
+            if (controller->isConnected() && !controller->isInitOk()) {
+                controller->disconnect();
+            }
             success = controller->connect(deviceIndex, variant);
         }
 
         QMetaObject::invokeMethod(this, [this, guard, success]() {
             if (!guard->load()) return;
+            m_powerOpInProgress = false;
             updateUIState();
         }, Qt::QueuedConnection);
     });
@@ -532,6 +592,11 @@ void DeviceControlPanel::onPowerOnClicked()
 
 void DeviceControlPanel::onPowerOffClicked()
 {
+    if (m_powerOpInProgress) {
+        return; // double-click guard, mirror of onPowerOnClicked
+    }
+    m_powerOpInProgress = true;
+
     // Show powering off state
     m_btnPowerOn->setEnabled(false);
     m_btnPowerOff->setEnabled(false);
@@ -550,6 +615,7 @@ void DeviceControlPanel::onPowerOffClicked()
 
         QMetaObject::invokeMethod(this, [this, guard]() {
             if (!guard->load()) return;
+            m_powerOpInProgress = false;
             updateUIState();
         }, Qt::QueuedConnection);
     });
@@ -605,18 +671,34 @@ void DeviceControlPanel::applyBrightness(double brightness)
 
 void DeviceControlPanel::startBrightnessProtection()
 {
+    // Always hop to the GUI thread before touching m_brightnessProtectionTimer.
+    // Several callers (setBrightnessDirectEx and sendImageDirectEx via the TCP
+    // server, plus sendImageDirect from the TCP-side ApiResult helpers) run on
+    // the TCP server's worker thread, not the GUI thread. Calling
+    // QTimer::start() from a different thread than the timer's owning thread
+    // is undefined behavior in Qt — under load it corrupts QString internal
+    // state and surfaces as a Q_UNREACHABLE in qtextengine.cpp the next time a
+    // QLabel is repainted.
+    //
+    // 2026-04-30 customer event reproduced locally via Debug build + the
+    // multi-panel stress test: 3 simulated panels hammering setBrightness +
+    // sendImage triggered the assert within seconds. After this wrap the same
+    // stress test runs clean.
+    //
     // Reset remaining checks to the full count. If the timer is already
     // running (e.g. another setBrightness came in mid-protection), this
     // EXTENDS the protection window rather than stacking multiple runs.
     // The CorneaController cache ensures redundant reads within 1 s are
     // deduplicated, so extending never creates extra I2C traffic.
-    m_brightnessProtectionCount = 0;
-    if (!m_brightnessProtectionTimer->isActive()) {
-        m_brightnessProtectionTimer->start(BRIGHTNESS_PROTECTION_INTERVAL_MS);
-        emit logMessage(panelLabel(), "Brightness protection: monitoring temp for 5 seconds...");
-    } else {
-        emit logMessage(panelLabel(), "Brightness protection: extended (5 more seconds)");
-    }
+    QMetaObject::invokeMethod(this, [this]() {
+        m_brightnessProtectionCount = 0;
+        if (!m_brightnessProtectionTimer->isActive()) {
+            m_brightnessProtectionTimer->start(BRIGHTNESS_PROTECTION_INTERVAL_MS);
+            emit logMessage(panelLabel(), "Brightness protection: monitoring temp for 5 seconds...");
+        } else {
+            emit logMessage(panelLabel(), "Brightness protection: extended (5 more seconds)");
+        }
+    }, Qt::QueuedConnection);
 }
 
 void DeviceControlPanel::onBrightnessProtectionTimeout()
@@ -655,38 +737,15 @@ void DeviceControlPanel::onBrightnessProtectionTimeout()
                                 .arg(rj1, 0, 'f', 1)
                                 .arg(da9272, 0, 'f', 1));
 
-            // Same tiered protection as the main monitor. Brightness-protection
-            // polls every 1s for 5s after a brightness change, so the
-            // 2-consecutive-sample requirement adds at most 1s extra delay before
-            // shutting down — well within the 85°C panel-damage margin.
-            bool overheat = false;
-            QString reason;
-            if (maxTemp > OVERHEAT_HARD_LIMIT) {
-                overheat = true;
-                reason = QString(">%1°C hard limit").arg(OVERHEAT_HARD_LIMIT, 0, 'f', 1);
-            } else if (maxTemp > TEMPERATURE_LIMIT) {
-                m_overheatSampleCount++;
-                if (m_overheatSampleCount >= OVERHEAT_REQUIRED_SAMPLES) {
-                    overheat = true;
-                    reason = QString("%1 consecutive samples > %2°C")
-                                 .arg(OVERHEAT_REQUIRED_SAMPLES)
-                                 .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
-                } else {
-                    emit logMessage(panelLabel(),
-                        QString("Brightness check %1: temp %2°C above %3°C (sample %4/%5, awaiting confirmation)")
-                            .arg(checkNum).arg(maxTemp, 0, 'f', 1).arg(TEMPERATURE_LIMIT, 0, 'f', 1)
-                            .arg(m_overheatSampleCount).arg(OVERHEAT_REQUIRED_SAMPLES));
-                }
-            } else if (m_overheatSampleCount > 0) {
-                m_overheatSampleCount = 0;
-            }
-
-            if (overheat) {
+            // Single-sample trigger at TEMPERATURE_LIMIT. Stop BOTH timers
+            // FIRST so a still-pending main monitor poll can't double-fire
+            // while powerOff is in progress.
+            if (maxTemp > TEMPERATURE_LIMIT) {
                 m_brightnessProtectionTimer->stop();
-                m_overheatSampleCount = 0;
+                m_temperatureTimer->stop();
 
-                QString warning = QString("OVERHEAT during brightness change (%1)\nRJ1: %2°C, DA9272: %3°C\nEmergency power off!")
-                                      .arg(reason)
+                QString warning = QString("OVERHEAT during brightness change (>%1°C)\nRJ1: %2°C, DA9272: %3°C\nEmergency power off!")
+                                      .arg(TEMPERATURE_LIMIT, 0, 'f', 1)
                                       .arg(rj1, 0, 'f', 1)
                                       .arg(da9272, 0, 'f', 1);
                 emit logMessage(panelLabel(), QString("EMERGENCY: %1").arg(warning));
@@ -775,11 +834,17 @@ void DeviceControlPanel::onSendImageClicked()
 
     QtConcurrent::run([this, guard, controller, image]() {
         if (!guard->load()) return;
-        controller->sendImage(image);
+        bool ok = controller->sendImage(image);
 
-        QMetaObject::invokeMethod(this, [this, guard]() {
+        QMetaObject::invokeMethod(this, [this, guard, ok]() {
             if (!guard->load()) return;
             m_btnSendImage->setEnabled(isConnected());
+            if (ok) {
+                // Image change ramps temp fastest — start fast-polling
+                // protection cycle so the overheat guard catches the ramp
+                // window (panel can heat 25 °C → 76 °C in 7 s).
+                startBrightnessProtection();
+            }
         }, Qt::QueuedConnection);
     });
 }
@@ -1000,42 +1065,16 @@ void DeviceControlPanel::onTemperatureMonitorTimeout()
             onControllerTemperatureUpdated(rj1, da9272);
             m_lblActualBrightness->setText(QString::number(m_currentBrightness, 'f', 2));
 
-            // Tiered overheat protection — see TEMPERATURE_LIMIT / OVERHEAT_HARD_LIMIT
-            // in the header for rationale.
+            // Single-sample trigger at TEMPERATURE_LIMIT (65 °C). Stop the
+            // timer FIRST so a still-pending poll can't fire a duplicate
+            // overheat popup while powerOff() is still executing.
             double maxTemp = qMax(rj1, da9272);
-            bool overheat = false;
-            QString reason;
-            if (maxTemp > OVERHEAT_HARD_LIMIT) {
-                overheat = true;
-                reason = QString(">%1°C hard limit").arg(OVERHEAT_HARD_LIMIT, 0, 'f', 1);
-            } else if (maxTemp > TEMPERATURE_LIMIT) {
-                m_overheatSampleCount++;
-                if (m_overheatSampleCount >= OVERHEAT_REQUIRED_SAMPLES) {
-                    overheat = true;
-                    reason = QString("%1 consecutive samples > %2°C")
-                                 .arg(OVERHEAT_REQUIRED_SAMPLES)
-                                 .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
-                } else {
-                    emit logMessage(panelLabel(),
-                        QString("Temp %1°C above %2°C limit (sample %3/%4, awaiting confirmation)")
-                            .arg(maxTemp, 0, 'f', 1).arg(TEMPERATURE_LIMIT, 0, 'f', 1)
-                            .arg(m_overheatSampleCount).arg(OVERHEAT_REQUIRED_SAMPLES));
-                }
-            } else {
-                // Cool sample resets the counter so transient spikes don't accumulate.
-                if (m_overheatSampleCount > 0) {
-                    emit logMessage(panelLabel(),
-                        QString("Temp recovered to %1°C, overheat counter reset").arg(maxTemp, 0, 'f', 1));
-                }
-                m_overheatSampleCount = 0;
-            }
-
-            if (overheat) {
+            if (maxTemp > TEMPERATURE_LIMIT) {
                 m_temperatureTimer->stop();
-                m_overheatSampleCount = 0;
+                m_brightnessProtectionTimer->stop();
 
-                QString warning = QString("Temperature exceeded safe limit (%1)\nRJ1: %2°C, DA9272: %3°C\nDevice will be powered off.")
-                                      .arg(reason)
+                QString warning = QString("Temperature exceeded %1°C limit\nRJ1: %2°C, DA9272: %3°C\nDevice will be powered off.")
+                                      .arg(TEMPERATURE_LIMIT, 0, 'f', 1)
                                       .arg(rj1, 0, 'f', 1)
                                       .arg(da9272, 0, 'f', 1);
                 emit logMessage(panelLabel(), QString("OVERHEAT WARNING: %1").arg(warning));
@@ -1109,6 +1148,9 @@ ApiResult DeviceControlPanel::sendImageDirectEx(const QImage &image)
 
     emit logMessage(panelLabel(), "Sending image via API...");
     if (m_controller->sendImage(image)) {
+        // Image change ramps temp fastest — start the same fast-polling
+        // protection cycle a brightness change uses (1 s polling for 5 s).
+        startBrightnessProtection();
         return ApiResult::ok();
     } else {
         return ApiResult::fail("Failed to send image to device");
@@ -1158,34 +1200,10 @@ ApiResult DeviceControlPanel::setBrightnessDirectEx(double level, bool waitProte
                                 .arg(rj1, 0, 'f', 1)
                                 .arg(da9272, 0, 'f', 1));
 
-            // Same tiered protection as the async monitor — sync polling here is at
-            // 1s intervals so 2-consecutive adds at most 1s extra delay.
-            bool overheat = false;
-            QString reason;
-            if (maxTemp > OVERHEAT_HARD_LIMIT) {
-                overheat = true;
-                reason = QString(">%1°C hard limit").arg(OVERHEAT_HARD_LIMIT, 0, 'f', 1);
-            } else if (maxTemp > TEMPERATURE_LIMIT) {
-                m_overheatSampleCount++;
-                if (m_overheatSampleCount >= OVERHEAT_REQUIRED_SAMPLES) {
-                    overheat = true;
-                    reason = QString("%1 consecutive samples > %2°C")
-                                 .arg(OVERHEAT_REQUIRED_SAMPLES)
-                                 .arg(TEMPERATURE_LIMIT, 0, 'f', 1);
-                } else {
-                    emit logMessage(panelLabel(),
-                        QString("Sync brightness check %1: temp %2°C above limit (sample %3/%4, awaiting confirmation)")
-                            .arg(i + 1).arg(maxTemp, 0, 'f', 1)
-                            .arg(m_overheatSampleCount).arg(OVERHEAT_REQUIRED_SAMPLES));
-                }
-            } else if (m_overheatSampleCount > 0) {
-                m_overheatSampleCount = 0;
-            }
-
-            if (overheat) {
-                m_overheatSampleCount = 0;
-                QString error = QString("OVERHEAT (%1) - emergency power off (RJ1=%2°C, DA9272=%3°C)")
-                                    .arg(reason)
+            // Single-sample trigger at TEMPERATURE_LIMIT.
+            if (maxTemp > TEMPERATURE_LIMIT) {
+                QString error = QString("OVERHEAT (>%1°C) - emergency power off (RJ1=%2°C, DA9272=%3°C)")
+                                    .arg(TEMPERATURE_LIMIT, 0, 'f', 1)
                                     .arg(rj1, 0, 'f', 1)
                                     .arg(da9272, 0, 'f', 1);
                 emit logMessage(panelLabel(), QString("EMERGENCY: %1").arg(error));

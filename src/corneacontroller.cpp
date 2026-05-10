@@ -45,7 +45,13 @@ bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant)
         m_poweredOn = true;
 
         emit connected();
-        emit powerStateChanged(true);
+        // Do NOT emit powerStateChanged(true) here. onControllerConnected
+        // already pushes a setBrightness() on the 'connected' signal; emitting
+        // powerStateChanged(true) too queues a SECOND back-to-back
+        // setBrightness on the per-device worker, which races with rax_lib's
+        // post-connect settling and leaves the Bx panel stuck displaying
+        // black. powerStateChanged is reserved for pure power transitions
+        // (powerOn / powerOff on an already-existing instance).
         emit logMessage(QString("Connected to device: %1").arg(getDeviceLabel()));
         return true;
     }
