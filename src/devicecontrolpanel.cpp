@@ -111,44 +111,63 @@ void DeviceControlPanel::setInitialBrightness(double brightness)
     m_sliderBrightness->setValue(static_cast<int>(brightness * 100));
 }
 
-bool DeviceControlPanel::powerOnDirect()
+// Power-on state machine — runs sync on caller thread, no UI / no event-loop
+// hops. Both UI button and TCP API call this; the wrappers add their own
+// UI feedback (transient "Powering on..." text, MessageBox for UCID error).
+//
+// Rules (from operator station logs 2026-05-10):
+//  - Full instance (isInitOk) + powered off → system_power_on
+//  - Already powered on → no-op
+//  - Pre-init shell only (no RJ1 interface) → discard + full connect
+//  - Disconnected → full connect
+DeviceControlPanel::OpResult DeviceControlPanel::powerOnCore()
 {
-    if (isConnected() && m_controller->isPoweredOn()) {
-        return true;
-    }
+    OpResult r{};
     if (m_deviceInfo.index < 0) {
-        return false;
+        r.error = QStringLiteral("No device assigned");
+        return r;
     }
+    if (m_controller->isConnected() && m_controller->isPoweredOn()) {
+        r.ok = true;
+        return r;
+    }
+    const QString variant = m_currentVariant;
+    const int deviceIndex = m_deviceInfo.index;
 
-    QString variant = m_currentVariant;
-    int deviceIndex = m_deviceInfo.index;
-
-    bool success;
     if (m_controller->isConnected() && m_controller->isInitOk() && !m_controller->isPoweredOn()) {
-        // Full instance from a previous successful connect — instance has
-        // RJ1 i2c/spi interfaces built (init_rj1=True at construction). A
-        // simple system_power_on suffices to bring the panel back up.
         emit logMessage(panelLabel(), QString("Re-powering existing instance (variant: %1)...").arg(variant));
-        success = m_controller->powerOn();
+        r.ok = m_controller->powerOn();
     } else {
-        // No instance, OR pre-init shell only (init_rj1 was False at
-        // construction so RJ1 interfaces were never built). Calling
-        // system_power_on on a pre-init shell triggers NACK @ 0x28 because
-        // rax_lib has no way to talk to RJ1 — confirmed against operator
-        // station logs 2026-05-10 (v13 NACKs, v7 works because v7 always
-        // takes this branch). Discard any pre-init shell and full-connect
-        // so the new CorneaRax720 is built with init_rj1=True.
         if (m_controller->isConnected() && !m_controller->isInitOk()) {
-            emit logMessage(panelLabel(), "Discarding pre-init shell, doing full connect...");
+            emit logMessage(panelLabel(), QStringLiteral("Discarding pre-init shell, doing full connect..."));
             m_controller->disconnect();
         }
         emit logMessage(panelLabel(), QString("Powering on device %1 (variant: %2)...")
                             .arg(deviceIndex).arg(variant));
-        success = m_controller->connect(deviceIndex, variant);
+        r.ok = m_controller->connect(deviceIndex, variant);
     }
+    if (!r.ok) r.error = m_controller->lastError();
+    return r;
+}
 
-    // Update UI from main thread
-    QString lastErr = success ? QString() : m_controller->lastError();
+DeviceControlPanel::OpResult DeviceControlPanel::powerOffCore()
+{
+    OpResult r{};
+    if (!isConnected()) {
+        r.ok = true;   // already off — idempotent success
+        return r;
+    }
+    m_controller->disconnect();
+    r.ok = !isConnected();
+    if (!r.ok) r.error = QStringLiteral("Failed to disconnect");
+    return r;
+}
+
+bool DeviceControlPanel::powerOnDirect()
+{
+    OpResult r = powerOnCore();
+    QString lastErr = r.error;
+    bool success = r.ok;
     QMetaObject::invokeMethod(this, [this, success, lastErr]() {
         updateUIState();
         if (success) {
@@ -158,41 +177,50 @@ bool DeviceControlPanel::powerOnDirect()
             QMessageBox::warning(this, "缺少校准文件", lastErr);
         }
     }, Qt::QueuedConnection);
-
     return success;
 }
 
 bool DeviceControlPanel::powerOffDirect()
 {
-    if (!isConnected()) {
-        return true;
-    }
-
-    // Thread-safe: only use m_controller, no UI widgets.
-    emit logMessage(panelLabel(), "API: Powering off...");
-    m_controller->disconnect();
-
+    emit logMessage(panelLabel(), QStringLiteral("API: Powering off..."));
+    OpResult r = powerOffCore();
     QMetaObject::invokeMethod(this, [this]() {
         updateUIState();
     }, Qt::QueuedConnection);
-
-    return !isConnected();
+    return r.ok;
 }
 
-bool DeviceControlPanel::sendImageDirect(const QImage &image)
+// Single source of truth for "send image to panel". TCP and UI both go
+// through here so the safety / logging / protection trigger logic exists in
+// exactly one place — preventing the TCP-vs-UI drift bugs we saw before.
+//
+// Returns enough information for callers to format their own response
+// (bool / ApiResult / MessageBox). Does NOT block on a thread it shouldn't:
+// the actual sendImage call is synchronous on the calling thread, so UI
+// callers MUST wrap in QtConcurrent::run themselves.
+//
+// Protection trigger rules (2026-05-16):
+//  - 1Hz × 5s temperature polling fires ONLY when the image's intrinsic APL
+//    (independent of current brightness) is ≥ 0.06. Low-APL images cannot
+//    drive the panel above the safe envelope at any brightness ≤ 1.0, so
+//    polling is skipped — drops libusb-win32 pressure ~78% across the
+//    18-image test sequence (only ~4/18 patterns hit the threshold).
+DeviceControlPanel::SendImageResult DeviceControlPanel::sendImageCore(const QImage &image)
 {
+    SendImageResult r{};
     if (!isConnected()) {
-        return false;
+        r.error = QStringLiteral("Device not connected");
+        return r;
     }
 
-    double patternApl = calculatePatternApl(image);
-    double currentBrightness = m_currentBrightness;
-    double totalApl = patternApl * currentBrightness;
+    r.patternApl       = calculatePatternApl(image);
+    r.currentBrightness = m_currentBrightness;
+    r.totalApl         = r.patternApl * r.currentBrightness;
 
     emit logMessage(panelLabel(), QString("Pattern APL: %1, Brightness: %2, Total APL: %3")
-                        .arg(patternApl, 0, 'f', 4)
-                        .arg(currentBrightness, 0, 'f', 2)
-                        .arg(totalApl, 0, 'f', 4));
+                        .arg(r.patternApl, 0, 'f', 4)
+                        .arg(r.currentBrightness, 0, 'f', 2)
+                        .arg(r.totalApl, 0, 'f', 4));
 
     // Check if Total APL > 0.06 (with epsilon tolerance).
     // 1.5M-pixel accumulation in calculatePatternApl plus QDoubleSpinBox's
@@ -200,33 +228,63 @@ bool DeviceControlPanel::sendImageDirect(const QImage &image)
     // (100% white × 0.06) just above 0.06 in MSVC's math, even though it
     // mathematically equals the limit exactly. Customers explicitly want
     // 0.06 × 255-white to send; treat 0.0600 → 0.0601 as on-limit.
-    const double APL_BRIGHTNESS_LIMIT = 0.06;
-    const double APL_LIMIT_EPSILON   = 1e-4;
-    if (totalApl > APL_BRIGHTNESS_LIMIT + APL_LIMIT_EPSILON) {
-        emit logMessage(panelLabel(), QString("BLOCKED: Total APL(%1) > %2")
-                            .arg(totalApl, 0, 'f', 4)
-                            .arg(APL_BRIGHTNESS_LIMIT, 0, 'f', 2));
-        return false;
+    const double APL_LIMIT_EPSILON = 1e-4;
+    if (r.totalApl > r.aplLimit + APL_LIMIT_EPSILON) {
+        r.blockedByApl = true;
+        r.error = QString("APL_EXCEEDED: Total APL %1 > limit %2 (pattern=%3, brightness=%4)")
+                      .arg(r.totalApl, 0, 'f', 4)
+                      .arg(r.aplLimit, 0, 'f', 2)
+                      .arg(r.patternApl, 0, 'f', 4)
+                      .arg(r.currentBrightness, 0, 'f', 2);
+        emit logMessage(panelLabel(), QString("BLOCKED: %1").arg(r.error));
+        return r;
     }
 
-    emit logMessage(panelLabel(), QString("Sending image via API..."));
-    bool ok = m_controller->sendImage(image);
-    if (ok) {
-        // Image change is when heat ramps fastest (panel chip drives all sub-pixels
-        // up at once). Customer event 2026-04-29: panel went 25 °C → 76.6 °C in 7 s
-        // after a single image send because the 5 s monitor missed the ramp window.
-        // Hooking the brightness-protection fast-polling cycle here gives 5 s of
-        // 1 s polling after every send, so the overheat guard catches the ramp.
+    emit logMessage(panelLabel(), QStringLiteral("Sending image via API..."));
+    r.sent = m_controller->sendImage(image);
+    if (r.sent && r.patternApl >= r.aplLimit) {
+        // Image change is when heat ramps fastest (panel chip drives all
+        // sub-pixels up at once). Customer event 2026-04-29: panel went
+        // 25°C → 76.6°C in 7s after a single image send because the 5s
+        // background monitor missed the ramp window. The 1Hz × 5s fast-
+        // polling cycle catches a ramp within ≤1s of crossing the 65°C
+        // limit. Only fired for ramp-risk images (apl ≥ 0.06) per the
+        // 2026-05-16 conditional-trigger change.
         startBrightnessProtection();
     }
-    return ok;
+    if (!r.sent && r.error.isEmpty()) {
+        r.error = QStringLiteral("Failed to send image to device");
+    }
+    return r;
 }
 
-bool DeviceControlPanel::setBrightnessDirect(double level)
+bool DeviceControlPanel::sendImageDirect(const QImage &image)
 {
+    SendImageResult r = sendImageCore(image);
+    return r.sent;
+}
+
+// Single source of truth for "set panel brightness". TCP and UI both go
+// through here. setBrightness ALWAYS triggers protection (regardless of
+// level) — a brightness ramp itself can drive heat. The conditional
+// protection logic is on the sendImage side only (see sendImageCore).
+//
+// waitProtection=true performs a SYNCHRONOUS 1Hz × 5s protection loop in-
+// line (caller blocks ~5s, gets fail if overheat); waitProtection=false
+// starts the async timer-driven version and returns immediately. Note: the
+// sync loop calls QApplication::processEvents() — same pre-refactor
+// behavior, even when invoked from a TCP worker thread.
+DeviceControlPanel::SetBrightnessResult DeviceControlPanel::setBrightnessCore(double level, bool waitProtection)
+{
+    SetBrightnessResult r{};
     if (!isConnected()) {
-        return false;
+        r.error = QStringLiteral("Device not connected");
+        return r;
     }
+
+    // Cache + reflect on UI widgets. Widget setValue from a non-GUI thread is
+    // technically UB but blockSignals + no repaint trigger has been stable in
+    // production — preserving pre-refactor behavior.
     m_currentBrightness = level;
     m_spinBrightness->blockSignals(true);
     m_sliderBrightness->blockSignals(true);
@@ -235,11 +293,57 @@ bool DeviceControlPanel::setBrightnessDirect(double level)
     m_spinBrightness->blockSignals(false);
     m_sliderBrightness->blockSignals(false);
 
-    bool result = m_controller->setBrightness(level);
-    if (result) {
+    emit logMessage(panelLabel(), QString("Setting brightness to %1").arg(level, 0, 'f', 2));
+
+    if (!m_controller->setBrightness(level)) {
+        r.error = QStringLiteral("Failed to set brightness");
+        return r;
+    }
+    r.ok = true;
+
+    if (waitProtection) {
+        emit logMessage(panelLabel(), QStringLiteral("Brightness protection: checking temp for 5 seconds..."));
+        for (int i = 0; i < BRIGHTNESS_PROTECTION_CHECKS; ++i) {
+            QThread::msleep(BRIGHTNESS_PROTECTION_INTERVAL_MS);
+            QApplication::processEvents();
+            if (!isConnected()) {
+                r.ok = false;
+                r.error = QStringLiteral("Device disconnected during protection check");
+                return r;
+            }
+            r.rj1Temp    = m_controller->getRj1Temperature();
+            r.da9272Temp = m_controller->getDa9272Temperature();
+            onControllerTemperatureUpdated(r.rj1Temp, r.da9272Temp);
+
+            double maxTemp = qMax(r.rj1Temp, r.da9272Temp);
+            emit logMessage(panelLabel(), QString("Protection check %1/%2: RJ1=%3°C, DA9272=%4°C")
+                                .arg(i + 1)
+                                .arg(BRIGHTNESS_PROTECTION_CHECKS)
+                                .arg(r.rj1Temp, 0, 'f', 1)
+                                .arg(r.da9272Temp, 0, 'f', 1));
+            if (maxTemp > TEMPERATURE_LIMIT) {
+                r.ok = false;
+                r.overheated = true;
+                r.error = QString("OVERHEAT (>%1°C) - emergency power off (RJ1=%2°C, DA9272=%3°C)")
+                              .arg(TEMPERATURE_LIMIT, 0, 'f', 1)
+                              .arg(r.rj1Temp, 0, 'f', 1)
+                              .arg(r.da9272Temp, 0, 'f', 1);
+                emit logMessage(panelLabel(), QString("EMERGENCY: %1").arg(r.error));
+                m_controller->powerOff();
+                return r;
+            }
+        }
+        emit logMessage(panelLabel(), QStringLiteral("Brightness protection: completed, temp OK"));
+    } else {
+        // Async — 1Hz × 5s timer-driven protection. Hops to GUI thread inside.
         startBrightnessProtection();
     }
-    return result;
+    return r;
+}
+
+bool DeviceControlPanel::setBrightnessDirect(double level)
+{
+    return setBrightnessCore(level, /*waitProtection=*/false).ok;
 }
 
 void DeviceControlPanel::sendCurrentImage()
@@ -267,13 +371,22 @@ void DeviceControlPanel::setupUI()
     m_lblDeviceName->setMinimumWidth(150);
     m_lblDeviceName->setStyleSheet("font-weight: bold;");
 
-    // Hardware Variant selection
+    // Hardware Variant selection. Each variant string maps to an entry in
+    // ar_display_lab_lib's HARDWARE_VARIANTS dict (cornea_rax720.py:263).
+    // standard/F33RP share one I2C config (PMIC=0x6A, IMU=0x6B, VLED=0x20/0x30);
+    // F33R/F43V2 share another (PMIC=0x7A); F33L, F33LP, F33RV2, F33LV2 are
+    // each distinct. Picking the wrong variant for a given driver board fails
+    // init with NACK at the expected-but-empty I2C address.
     m_cmbVariant = new QComboBox();
-    m_cmbVariant->addItem("standard");
-    m_cmbVariant->addItem("F33R");
-    m_cmbVariant->addItem("F33L");
-    m_cmbVariant->addItem("F33LP");
-    m_cmbVariant->setCurrentIndex(0);  // Default: standard
+    m_cmbVariant->addItem("standard");   // alias of F33RP — R74, F43 V1.0, SS, V53, H79
+    m_cmbVariant->addItem("F33RP");      // alias of standard — Pilot run-LBU (IMU DNP)
+    m_cmbVariant->addItem("F33R");       // alias of F43V2 — PMIC=0x7A
+    m_cmbVariant->addItem("F43V2");      // alias of F33R — F43 V2.0
+    m_cmbVariant->addItem("F33L");       // PMIC=0x7B, VLED_r=0x32
+    m_cmbVariant->addItem("F33LP");      // Pilot run-LBU — PMIC=0x6A, VLED_r=0x32
+    m_cmbVariant->addItem("F33RV2");     // F33R V2.0 — Max77675@0x44 + Max77713@0x65
+    m_cmbVariant->addItem("F33LV2");     // F33L V2.0 — Max77675@0x52 + Max77713@0x6D
+    m_cmbVariant->setCurrentIndex(0);    // Default: standard
     m_cmbVariant->setMinimumWidth(80);
 
     m_btnPowerOn = new QPushButton("On");
@@ -542,47 +655,25 @@ void DeviceControlPanel::onPowerOnClicked()
         return;
     }
     if (m_powerOpInProgress) {
-        // Already powering on/off — operator double-click guard. Don't queue
-        // a second op; let the in-flight one finish.
+        // Double-click guard — let in-flight op finish.
         return;
     }
     m_powerOpInProgress = true;
 
-    // Show powering on state
+    // Transient UI feedback
     m_btnPowerOn->setEnabled(false);
     m_btnPowerOff->setEnabled(false);
     m_cmbVariant->setEnabled(false);
     m_lblStatus->setText("Powering on...");
     m_lblStatus->setStyleSheet("color: orange; font-weight: bold;");
-
-    QString variant = m_cmbVariant->currentText();
-    int deviceIndex = m_deviceInfo.index;
-    QString deviceName = m_deviceInfo.displayName;
-    emit logMessage(panelLabel(), QString("Powering on %1 (variant: %2)...").arg(deviceName, variant));
+    emit logMessage(panelLabel(), QString("Powering on %1 (variant: %2)...")
+                        .arg(m_deviceInfo.displayName, m_currentVariant));
 
     auto guard = m_asyncGuard;
-    auto controller = m_controller.get();
-
-    QtConcurrent::run([this, guard, controller, deviceIndex, variant]() {
+    QtConcurrent::run([this, guard]() {
         if (!guard->load()) return;
-        bool success;
-        if (controller->isConnected() && controller->isInitOk() && !controller->isPoweredOn()) {
-            // Full instance, was powered off — re-power via system_power_on works.
-            // Note: if variant changed, need full reconnect (not handled here).
-            success = controller->powerOn();
-        } else if (controller->isConnected() && controller->isPoweredOn()) {
-            success = true;
-        } else {
-            // No instance OR pre-init shell only — full connect path. See
-            // powerOnDirect() for the why; pre-init shell calling
-            // system_power_on hits NACK @ 0x28 (RJ1 interfaces never built).
-            if (controller->isConnected() && !controller->isInitOk()) {
-                controller->disconnect();
-            }
-            success = controller->connect(deviceIndex, variant);
-        }
-
-        QMetaObject::invokeMethod(this, [this, guard, success]() {
+        powerOnCore();   // logs success/fail internally
+        QMetaObject::invokeMethod(this, [this, guard]() {
             if (!guard->load()) return;
             m_powerOpInProgress = false;
             updateUIState();
@@ -593,26 +684,19 @@ void DeviceControlPanel::onPowerOnClicked()
 void DeviceControlPanel::onPowerOffClicked()
 {
     if (m_powerOpInProgress) {
-        return; // double-click guard, mirror of onPowerOnClicked
+        return;
     }
     m_powerOpInProgress = true;
-
-    // Show powering off state
     m_btnPowerOn->setEnabled(false);
     m_btnPowerOff->setEnabled(false);
     m_lblStatus->setText("Powering off...");
     m_lblStatus->setStyleSheet("color: orange; font-weight: bold;");
-
-    emit logMessage(panelLabel(), "Powering off...");
+    emit logMessage(panelLabel(), QStringLiteral("Powering off..."));
 
     auto guard = m_asyncGuard;
-    auto controller = m_controller.get();
-
-    QtConcurrent::run([this, guard, controller]() {
+    QtConcurrent::run([this, guard]() {
         if (!guard->load()) return;
-        // Software power-off only — keep instance alive for fast re-power
-        controller->powerOff();
-
+        powerOffCore();
         QMetaObject::invokeMethod(this, [this, guard]() {
             if (!guard->load()) return;
             m_powerOpInProgress = false;
@@ -650,22 +734,13 @@ void DeviceControlPanel::applyBrightness(double brightness)
     if (!isConnected()) {
         return;
     }
-
-    m_currentBrightness = brightness;
-    emit logMessage(panelLabel(), QString("Setting brightness to %1").arg(brightness, 0, 'f', 2));
-
+    // Dispatch via setBrightnessCore on a background thread so the UI stays
+    // responsive. waitProtection=false because the UI doesn't want a 5s
+    // synchronous block — the async timer-driven protection handles overheat.
     auto guard = m_asyncGuard;
-    auto controller = m_controller.get();
-
-    QtConcurrent::run([this, guard, controller, brightness]() {
+    QtConcurrent::run([this, guard, brightness]() {
         if (!guard->load()) return;
-        controller->setBrightness(brightness);
-
-        QMetaObject::invokeMethod(this, [this, guard]() {
-            if (!guard->load()) return;
-            // Start brightness protection monitoring after brightness is set
-            startBrightnessProtection();
-        }, Qt::QueuedConnection);
+        setBrightnessCore(brightness, /*waitProtection=*/false);
     });
 }
 
@@ -784,45 +859,9 @@ void DeviceControlPanel::onSendImageClicked()
         QMessageBox::warning(this, "No Image Loader", "Image loader not set.");
         return;
     }
-
     QImage image = m_imageLoader->getCurrentImage();
     if (image.isNull()) {
         QMessageBox::warning(this, "No Image", "Please load an image first.");
-        return;
-    }
-
-    double patternApl = calculatePatternApl(image);
-    double currentBrightness = m_currentBrightness;
-    double totalApl = patternApl * currentBrightness;
-
-    emit logMessage(panelLabel(), QString("Pattern APL: %1, Brightness: %2, Total APL: %3")
-                        .arg(patternApl, 0, 'f', 4)
-                        .arg(currentBrightness, 0, 'f', 2)
-                        .arg(totalApl, 0, 'f', 4));
-
-    // Check if Total APL > 0.06 (with epsilon tolerance).
-    // 1.5M-pixel accumulation in calculatePatternApl plus QDoubleSpinBox's
-    // floating-point representation of 0.06 push the boundary case
-    // (100% white × 0.06) just above 0.06 in MSVC's math, even though it
-    // mathematically equals the limit exactly. Customers explicitly want
-    // 0.06 × 255-white to send; treat 0.0600 → 0.0601 as on-limit.
-    const double APL_BRIGHTNESS_LIMIT = 0.06;
-    const double APL_LIMIT_EPSILON   = 1e-4;
-    if (totalApl > APL_BRIGHTNESS_LIMIT + APL_LIMIT_EPSILON) {
-        QString warning = QString("Total APL exceeds limit!\n\n"
-                                  "Pattern APL: %1\n"
-                                  "Brightness: %2\n"
-                                  "Total APL: %3\n"
-                                  "Limit: %4\n\n"
-                                  "Image will NOT be sent.")
-                              .arg(patternApl, 0, 'f', 4)
-                              .arg(currentBrightness, 0, 'f', 2)
-                              .arg(totalApl, 0, 'f', 4)
-                              .arg(APL_BRIGHTNESS_LIMIT, 0, 'f', 2);
-        emit logMessage(panelLabel(), QString("BLOCKED: Total APL(%1) > %2")
-                            .arg(totalApl, 0, 'f', 4)
-                            .arg(APL_BRIGHTNESS_LIMIT, 0, 'f', 2));
-        QMessageBox::warning(this, "APL Limit Exceeded", warning);
         return;
     }
 
@@ -830,20 +869,30 @@ void DeviceControlPanel::onSendImageClicked()
 
     m_btnSendImage->setEnabled(false);
     auto guard = m_asyncGuard;
-    auto controller = m_controller.get();
 
-    QtConcurrent::run([this, guard, controller, image]() {
+    // Dispatch to background thread. sendImageCore does APL check + send +
+    // conditional protection trigger — same path as TCP, so any drift bug
+    // would surface in both. UI MessageBox is shown on completion, ~50ms
+    // later than the pre-refactor synchronous check (calculatePatternApl
+    // cost), which is acceptable for click feedback.
+    QtConcurrent::run([this, guard, image]() {
         if (!guard->load()) return;
-        bool ok = controller->sendImage(image);
-
-        QMetaObject::invokeMethod(this, [this, guard, ok]() {
+        SendImageResult r = sendImageCore(image);
+        QMetaObject::invokeMethod(this, [this, guard, r]() {
             if (!guard->load()) return;
             m_btnSendImage->setEnabled(isConnected());
-            if (ok) {
-                // Image change ramps temp fastest — start fast-polling
-                // protection cycle so the overheat guard catches the ramp
-                // window (panel can heat 25 °C → 76 °C in 7 s).
-                startBrightnessProtection();
+            if (r.blockedByApl) {
+                QString warning = QString("Total APL exceeds limit!\n\n"
+                                          "Pattern APL: %1\n"
+                                          "Brightness: %2\n"
+                                          "Total APL: %3\n"
+                                          "Limit: %4\n\n"
+                                          "Image was NOT sent.")
+                                      .arg(r.patternApl, 0, 'f', 4)
+                                      .arg(r.currentBrightness, 0, 'f', 2)
+                                      .arg(r.totalApl, 0, 'f', 4)
+                                      .arg(r.aplLimit, 0, 'f', 2);
+                QMessageBox::warning(this, "APL Limit Exceeded", warning);
             }
         }, Qt::QueuedConnection);
     });
@@ -962,27 +1011,21 @@ void DeviceControlPanel::onControllerBrightnessChanged(double level)
 
 void DeviceControlPanel::onXFlipChanged(bool checked)
 {
-    if (!isConnected()) {
-        return;
-    }
+    if (!isConnected()) return;
     auto guard = m_asyncGuard;
-    auto controller = m_controller.get();
-    QtConcurrent::run([guard, controller, checked]() {
+    QtConcurrent::run([this, guard, checked]() {
         if (!guard->load()) return;
-        controller->setXFlip(checked);
+        setXFlipCore(checked);
     });
 }
 
 void DeviceControlPanel::onYFlipChanged(bool checked)
 {
-    if (!isConnected()) {
-        return;
-    }
+    if (!isConnected()) return;
     auto guard = m_asyncGuard;
-    auto controller = m_controller.get();
-    QtConcurrent::run([guard, controller, checked]() {
+    QtConcurrent::run([this, guard, checked]() {
         if (!guard->load()) return;
-        controller->setYFlip(checked);
+        setYFlipCore(checked);
     });
 }
 
@@ -1000,33 +1043,52 @@ void DeviceControlPanel::onControllerYFlipChanged(bool flip)
     m_chkYFlip->blockSignals(false);
 }
 
-bool DeviceControlPanel::setXFlipDirect(bool flip)
+DeviceControlPanel::OpResult DeviceControlPanel::setXFlipCore(bool flip)
 {
+    OpResult r{};
     if (!isConnected()) {
-        return false;
+        r.error = QStringLiteral("Device not connected");
+        return r;
     }
+    // Reflect the new state on the UI checkbox. blockSignals avoids the
+    // change emitting onXFlipChanged in a loop. (Pre-refactor sync path
+    // wrote to m_chkXFlip without blockSignals — UI slot path could re-fire.)
+    m_chkXFlip->blockSignals(true);
     m_chkXFlip->setChecked(flip);
-    return m_controller->setXFlip(flip);
+    m_chkXFlip->blockSignals(false);
+    r.ok = m_controller->setXFlip(flip);
+    if (!r.ok) r.error = QStringLiteral("Failed to set X flip");
+    return r;
 }
 
-bool DeviceControlPanel::setYFlipDirect(bool flip)
+DeviceControlPanel::OpResult DeviceControlPanel::setYFlipCore(bool flip)
 {
+    OpResult r{};
     if (!isConnected()) {
-        return false;
+        r.error = QStringLiteral("Device not connected");
+        return r;
     }
+    m_chkYFlip->blockSignals(true);
     m_chkYFlip->setChecked(flip);
-    return m_controller->setYFlip(flip);
+    m_chkYFlip->blockSignals(false);
+    r.ok = m_controller->setYFlip(flip);
+    if (!r.ok) r.error = QStringLiteral("Failed to set Y flip");
+    return r;
 }
 
-bool DeviceControlPanel::setFlipDirect(bool xFlip, bool yFlip)
+DeviceControlPanel::OpResult DeviceControlPanel::setFlipCore(bool xFlip, bool yFlip)
 {
-    if (!isConnected()) {
-        return false;
-    }
-    bool resultX = setXFlipDirect(xFlip);
-    bool resultY = setYFlipDirect(yFlip);
-    return resultX && resultY;
+    OpResult rx = setXFlipCore(xFlip);
+    OpResult ry = setYFlipCore(yFlip);
+    OpResult r{};
+    r.ok = rx.ok && ry.ok;
+    if (!r.ok) r.error = rx.ok ? ry.error : rx.error;
+    return r;
 }
+
+bool DeviceControlPanel::setXFlipDirect(bool flip)  { return setXFlipCore(flip).ok; }
+bool DeviceControlPanel::setYFlipDirect(bool flip)  { return setYFlipCore(flip).ok; }
+bool DeviceControlPanel::setFlipDirect(bool xFlip, bool yFlip) { return setFlipCore(xFlip, yFlip).ok; }
 
 QString DeviceControlPanel::getVariant() const
 {
@@ -1115,109 +1177,15 @@ void DeviceControlPanel::onVariantChanged(const QString &variant)
 
 ApiResult DeviceControlPanel::sendImageDirectEx(const QImage &image)
 {
-    if (!isConnected()) {
-        return ApiResult::fail("Device not connected");
-    }
-
-    double patternApl = calculatePatternApl(image);
-    double currentBrightness = m_currentBrightness;
-    double totalApl = patternApl * currentBrightness;
-
-    emit logMessage(panelLabel(), QString("Pattern APL: %1, Brightness: %2, Total APL: %3")
-                        .arg(patternApl, 0, 'f', 4)
-                        .arg(currentBrightness, 0, 'f', 2)
-                        .arg(totalApl, 0, 'f', 4));
-
-    // Check if Total APL > 0.06 (with epsilon tolerance).
-    // 1.5M-pixel accumulation in calculatePatternApl plus QDoubleSpinBox's
-    // floating-point representation of 0.06 push the boundary case
-    // (100% white × 0.06) just above 0.06 in MSVC's math, even though it
-    // mathematically equals the limit exactly. Customers explicitly want
-    // 0.06 × 255-white to send; treat 0.0600 → 0.0601 as on-limit.
-    const double APL_BRIGHTNESS_LIMIT = 0.06;
-    const double APL_LIMIT_EPSILON   = 1e-4;
-    if (totalApl > APL_BRIGHTNESS_LIMIT + APL_LIMIT_EPSILON) {
-        QString error = QString("APL_EXCEEDED: Total APL %1 > limit %2 (pattern=%3, brightness=%4)")
-                            .arg(totalApl, 0, 'f', 4)
-                            .arg(APL_BRIGHTNESS_LIMIT, 0, 'f', 2)
-                            .arg(patternApl, 0, 'f', 4)
-                            .arg(currentBrightness, 0, 'f', 2);
-        emit logMessage(panelLabel(), QString("BLOCKED: %1").arg(error));
-        return ApiResult::fail(error);
-    }
-
-    emit logMessage(panelLabel(), "Sending image via API...");
-    if (m_controller->sendImage(image)) {
-        // Image change ramps temp fastest — start the same fast-polling
-        // protection cycle a brightness change uses (1 s polling for 5 s).
-        startBrightnessProtection();
-        return ApiResult::ok();
-    } else {
-        return ApiResult::fail("Failed to send image to device");
-    }
+    SendImageResult r = sendImageCore(image);
+    if (r.sent) return ApiResult::ok();
+    return ApiResult::fail(r.error);
 }
 
 ApiResult DeviceControlPanel::setBrightnessDirectEx(double level, bool waitProtection)
 {
-    if (!isConnected()) {
-        return ApiResult::fail("Device not connected");
-    }
-
-    m_currentBrightness = level;
-    m_spinBrightness->blockSignals(true);
-    m_sliderBrightness->blockSignals(true);
-    m_spinBrightness->setValue(level);
-    m_sliderBrightness->setValue(static_cast<int>(level * 100));
-    m_spinBrightness->blockSignals(false);
-    m_sliderBrightness->blockSignals(false);
-
-    emit logMessage(panelLabel(), QString("Setting brightness to %1").arg(level, 0, 'f', 2));
-
-    if (!m_controller->setBrightness(level)) {
-        return ApiResult::fail("Failed to set brightness");
-    }
-
-    if (waitProtection) {
-        // Synchronously check temperature for 5 seconds
-        emit logMessage(panelLabel(), "Brightness protection: checking temp for 5 seconds...");
-
-        for (int i = 0; i < BRIGHTNESS_PROTECTION_CHECKS; ++i) {
-            QThread::msleep(BRIGHTNESS_PROTECTION_INTERVAL_MS);
-            QApplication::processEvents();
-
-            if (!isConnected()) {
-                return ApiResult::fail("Device disconnected during protection check");
-            }
-
-            double rj1 = m_controller->getRj1Temperature();
-            double da9272 = m_controller->getDa9272Temperature();
-            onControllerTemperatureUpdated(rj1, da9272);
-
-            double maxTemp = qMax(rj1, da9272);
-            emit logMessage(panelLabel(), QString("Protection check %1/%2: RJ1=%3°C, DA9272=%4°C")
-                                .arg(i + 1)
-                                .arg(BRIGHTNESS_PROTECTION_CHECKS)
-                                .arg(rj1, 0, 'f', 1)
-                                .arg(da9272, 0, 'f', 1));
-
-            // Single-sample trigger at TEMPERATURE_LIMIT.
-            if (maxTemp > TEMPERATURE_LIMIT) {
-                QString error = QString("OVERHEAT (>%1°C) - emergency power off (RJ1=%2°C, DA9272=%3°C)")
-                                    .arg(TEMPERATURE_LIMIT, 0, 'f', 1)
-                                    .arg(rj1, 0, 'f', 1)
-                                    .arg(da9272, 0, 'f', 1);
-                emit logMessage(panelLabel(), QString("EMERGENCY: %1").arg(error));
-                m_controller->powerOff();
-                return ApiResult::fail(error);
-            }
-        }
-        emit logMessage(panelLabel(), "Brightness protection: completed, temp OK");
-    } else {
-        // Start async protection monitoring
-        startBrightnessProtection();
-    }
-
-    return ApiResult::ok();
+    auto r = setBrightnessCore(level, waitProtection);
+    return r.ok ? ApiResult::ok() : ApiResult::fail(r.error);
 }
 
 double DeviceControlPanel::calculatePatternApl(const QImage &image)

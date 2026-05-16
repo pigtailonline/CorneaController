@@ -140,8 +140,10 @@ void TcpServer::onReadyRead()
         QJsonObject cmd = doc.object();
         QString cmdName = cmd["cmd"].toString().toLower();
 
-        // Log received command (skip high-frequency getTemperature)
-        if (cmdName != "gettemperature") {
+        // Log received command. Filter removed 2026-05-16 for libusb stress
+        // diagnosis — we need to see every cmd including getTemperature so the
+        // [FREQ/1s] op-frequency log lines can be correlated with TCP traffic.
+        {
             QString cmdStr = QJsonDocument(cmd).toJson(QJsonDocument::Compact);
             qInfo() << "[TCP] RX <<" << cmdStr;
         }
@@ -533,11 +535,8 @@ void TcpServer::sendResponse(QTcpSocket *client, const QJsonObject &response)
     QJsonDocument doc(response);
     QByteArray data = doc.toJson(QJsonDocument::Compact) + "\n";
 
-    // Log sent response (skip high-frequency getTemperature)
-    QString cmd = response.value("cmd").toString();
-    if (cmd != "getTemperature") {
-        qInfo() << "[TCP] TX >>" << data.trimmed();
-    }
+    // Log sent response. Filter removed 2026-05-16 for libusb stress diagnosis.
+    qInfo() << "[TCP] TX >>" << data.trimmed();
 
     client->write(data);
     client->flush();

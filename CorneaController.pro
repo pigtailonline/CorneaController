@@ -2,6 +2,12 @@ QT += core gui widgets network concurrent
 
 CONFIG += c++17
 
+# Disable the QT_DEBUG SIM path inside pythonbridge.cpp so Debug builds exercise
+# real Python + FTDI even with hardware attached. Comment out this line if you
+# want a SIM build (e.g. CI on a machine without driver boards).
+DEFINES += DISABLE_SIM
+
+
 # Emit .pdb in Release builds so Windows Error Reporting / Visual Studio can
 # resolve crash offsets to function + line number. `force_debug_info` adds
 # debug info without disabling optimizations. Without this, the exe ships

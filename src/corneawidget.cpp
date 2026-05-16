@@ -434,14 +434,25 @@ bool CorneaWidget::powerOnBySerial(const QString &serial)
     // Already connected and powered on — nothing to do
     if (ctrl->isConnected() && ctrl->isPoweredOn()) return true;
 
-    // Connected but powered off — re-power without creating new instance
-    // This avoids pyftdi resetting all SPI/I2C controllers on the USB hub
-    if (ctrl->isConnected() && !ctrl->isPoweredOn()) {
+    // Re-power path is ONLY valid for a fully-initialized instance (RJ1
+    // i2c/spi interfaces built at construction). A pre-init shell
+    // (init_rj1=False at preInitDeviceInstance) satisfies isConnected but
+    // has no RJ1 interface — system_power_on on it NACKs at 0x28 and the
+    // panel never actually drives a frame even though SW reports OK.
+    // Discovered via TCP-driven flow 2026-05-11 (operator: panel連得上、
+    // 有 panel_id,但投圖不亮). UI path already routes this in
+    // devicecontrolpanel.cpp::powerOnDirect; TCP path was missed.
+    if (ctrl->isConnected() && ctrl->isInitOk() && !ctrl->isPoweredOn()) {
         appendLog(QString("[PowerOn] %1 — re-powering existing instance").arg(serial));
         return ctrl->powerOn();
     }
 
-    // Not connected — first time, full connect (creates Python SDK instance)
+    // Pre-init shell or fully disconnected — full connect rebuilds the
+    // CorneaRax720 with init_rj1=True so RJ1 interface is wired up.
+    if (ctrl->isConnected() && !ctrl->isInitOk()) {
+        appendLog(QString("[PowerOn] %1 — discarding pre-init shell, full connect").arg(serial));
+        ctrl->disconnect();
+    }
     return ctrl->connect(panel->deviceIndex(), panel->currentVariant());
 }
 
@@ -460,11 +471,15 @@ bool CorneaWidget::powerOnBySerial(const QString &serial, const QString &variant
 
     if (ctrl->isConnected() && ctrl->isPoweredOn()) return true;
 
-    if (ctrl->isConnected() && !ctrl->isPoweredOn()) {
+    // See single-arg overload for pre-init shell rationale.
+    if (ctrl->isConnected() && ctrl->isInitOk() && !ctrl->isPoweredOn()) {
         appendLog(QString("[PowerOn] %1 — re-powering existing instance").arg(serial));
         return ctrl->powerOn();
     }
-
+    if (ctrl->isConnected() && !ctrl->isInitOk()) {
+        appendLog(QString("[PowerOn] %1 — discarding pre-init shell, full connect").arg(serial));
+        ctrl->disconnect();
+    }
     return ctrl->connect(panel->deviceIndex(), variant);
 }
 
@@ -1022,6 +1037,18 @@ void CorneaWidget::onBridgeError(const QString &error)
 
 void CorneaWidget::appendLog(const QString &message)
 {
+    // TCP-driven paths (powerOnBySerial etc.) call us from QtConcurrent worker
+    // threads. ui->txtLog is a QPlainTextEdit whose internal QTextLayout uses
+    // QVector — not thread-safe. Touching it off-GUI corrupts QVector heap
+    // metadata; in Debug Qt asserts at qvector.h:454 ("index out of range"),
+    // in Release the heap manager later trips STATUS_HEAP_CORRUPTION
+    // (0xC0000374) somewhere unrelated. Hop to the owning thread first.
+    if (QThread::currentThread() != this->thread()) {
+        QMetaObject::invokeMethod(this, [this, message]() {
+            appendLog(message);
+        }, Qt::QueuedConnection);
+        return;
+    }
     QDateTime now = QDateTime::currentDateTime();
     QString timestamp = now.toString("yyyy-MM-dd hh:mm:ss");
     int msec = now.time().msec();
@@ -1033,6 +1060,15 @@ void CorneaWidget::appendLog(const QString &message)
 
 void CorneaWidget::appendLog(const QString &panelLabel, const QString &message)
 {
+    // Same off-thread protection as the single-arg overload — TCP paths call
+    // appendLog(panelLabel, ...) from worker threads, which crashes Qt's
+    // internal QVector if it touches ui->txtLog directly.
+    if (QThread::currentThread() != this->thread()) {
+        QMetaObject::invokeMethod(this, [this, panelLabel, message]() {
+            appendLog(panelLabel, message);
+        }, Qt::QueuedConnection);
+        return;
+    }
     QDateTime now = QDateTime::currentDateTime();
     QString timestamp = now.toString("yyyy-MM-dd hh:mm:ss");
     int msec = now.time().msec();

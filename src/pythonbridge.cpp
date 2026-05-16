@@ -23,12 +23,18 @@
 #define slots Q_SLOTS
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QMap>
 #include <QMetaObject>
+#include <QMutex>
 #include <QSemaphore>
+#include <QSet>
+#include <QThread>
+#include <QTimer>
 #include <functional>
 
 // ---------------------------------------------------------------------------
@@ -40,12 +46,231 @@
 // releases the GIL internally, letting other threads make progress).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Watchdog: tracks every in-flight dispatchToDevice / dispatch lambda so a
+// dedicated timer thread can detect "stuck" ops (>5s) and log the entire
+// in-flight set — gives us a snapshot of what was queued when the
+// 14-second stall occurred, even when Python is unresponsive.
+// ---------------------------------------------------------------------------
+struct InFlightOp {
+    qint64  start_ms;
+    QString tag;
+    int     instanceId;   // -1 for non-device dispatch
+    quintptr tid;
+};
+static QMutex            g_watchdogMutex;
+static QMap<quint64, InFlightOp> g_inFlightOps;  // op_id → details
+static QAtomicInteger<quint64>   g_nextOpId{1};
+
+// Per-second op-frequency counter. Reset and logged once per watchdog tick.
+// Used to answer "is a burst of cmds causing the stuck?" — if a stuck event is
+// preceded by an [FREQ/1s] line showing e.g. inst=2 fielding 30 ops in a second,
+// the libusb queue is being saturated. Tagged by invokeOnWorker tag so we can
+// see per-instance breakdown.
+static QMutex             g_freqMutex;
+static QMap<QString, int> g_freqCounter;
+
+// Forward decl
+static void watchdogEnsureStarted();
+
+static quint64 watchdogRegister(const QString &tag, int instanceId) {
+    watchdogEnsureStarted();
+    const quint64 id = g_nextOpId.fetchAndAddRelaxed(1);
+    InFlightOp op;
+    op.start_ms = QDateTime::currentMSecsSinceEpoch();
+    op.tag = tag;
+    op.instanceId = instanceId;
+    op.tid = reinterpret_cast<quintptr>(QThread::currentThreadId());
+    QMutexLocker lock(&g_watchdogMutex);
+    g_inFlightOps.insert(id, op);
+    return id;
+}
+static void watchdogDeregister(quint64 id) {
+    QMutexLocker lock(&g_watchdogMutex);
+    g_inFlightOps.remove(id);
+}
+
+// Tracks which ops have already been warned to avoid re-printing every 1s.
+static QSet<quint64> g_watchdogWarned;
+
+// Dump all Python thread stacks via sys._current_frames() + traceback.format_stack().
+// Called from watchdog thread when a stuck op is detected. Acquires GIL — which
+// can take a moment if the stuck op is currently inside a Python-with-GIL section,
+// but during the 2026-05-15 release stuck events we observed 0 gil_wait>30ms,
+// meaning the stuck Python ops release GIL during USB I/O — so the watchdog
+// CAN grab GIL during those release windows and inspect frames.
+//
+// Without this dump we know fn_duration but not which Python source line —
+// this fills that gap, pointing directly at pyftdi/ar_display_lab_lib row.
+static void watchdogDumpPythonStacks(const QString &context) {
+    if (!Py_IsInitialized()) return;   // SIM-build / pre-init — no Python to inspect
+
+    PyGILState_STATE g = PyGILState_Ensure();
+
+    QString out = QString("[WATCHDOG] === Python thread stacks (%1) ===\n").arg(context);
+    bool ok = true;
+
+    PyObject *sys = PyImport_ImportModule("sys");
+    PyObject *getCurFrames = sys ? PyObject_GetAttrString(sys, "_current_frames") : nullptr;
+    PyObject *frames = getCurFrames ? PyObject_CallObject(getCurFrames, nullptr) : nullptr;
+    PyObject *tb = PyImport_ImportModule("traceback");
+    PyObject *formatStack = tb ? PyObject_GetAttrString(tb, "format_stack") : nullptr;
+
+    if (frames && PyDict_Check(frames) && formatStack) {
+        PyObject *key, *value;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(frames, &pos, &key, &value)) {
+            unsigned long tid = PyLong_AsUnsignedLong(key);
+            out += QString("Thread 0x%1:\n").arg(tid, 0, 16);
+
+            PyObject *args = PyTuple_Pack(1, value);
+            PyObject *stackList = PyObject_CallObject(formatStack, args);
+            Py_DECREF(args);
+            if (stackList && PyList_Check(stackList)) {
+                Py_ssize_t n = PyList_Size(stackList);
+                for (Py_ssize_t i = 0; i < n; ++i) {
+                    PyObject *item = PyList_GetItem(stackList, i);  // borrowed
+                    if (item && PyUnicode_Check(item)) {
+                        out += "  " + QString::fromUtf8(PyUnicode_AsUTF8(item));
+                    }
+                }
+            }
+            Py_XDECREF(stackList);
+            if (PyErr_Occurred()) PyErr_Clear();
+        }
+    } else {
+        ok = false;
+    }
+    out += "[WATCHDOG] === end Python stacks ===";
+
+    Py_XDECREF(formatStack);
+    Py_XDECREF(tb);
+    Py_XDECREF(frames);
+    Py_XDECREF(getCurFrames);
+    Py_XDECREF(sys);
+    if (PyErr_Occurred()) PyErr_Clear();
+
+    PyGILState_Release(g);
+
+    if (ok) {
+        qWarning().noquote() << out;
+    } else {
+        qWarning() << "[WATCHDOG] Python stack dump unavailable (sys/traceback import failed)";
+    }
+}
+// Periodic check fired every 1s on a dedicated watchdog thread. Independent
+// of GIL, Qt event loop, or any per-instance worker — so it keeps running
+// even when Python is fully wedged.
+static void watchdogTick() {
+    // First, snapshot+reset the per-second freq counter and emit one line.
+    // Always log (even when empty) so the cadence is obvious in the log file
+    // and we can correlate to STUCK events by timestamp.
+    QString freqLine;
+    {
+        QMutexLocker fl(&g_freqMutex);
+        if (!g_freqCounter.isEmpty()) {
+            QStringList parts;
+            int total = 0;
+            for (auto it = g_freqCounter.begin(); it != g_freqCounter.end(); ++it) {
+                parts.append(QString("%1=%2").arg(it.key()).arg(it.value()));
+                total += it.value();
+            }
+            freqLine = QString("[FREQ/1s] total=%1 %2").arg(total).arg(parts.join(" "));
+            g_freqCounter.clear();
+        }
+    }
+    if (!freqLine.isEmpty()) qDebug().noquote() << freqLine;
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    QList<QPair<quint64, InFlightOp>> stuck;
+    QMutexLocker lock(&g_watchdogMutex);
+    for (auto it = g_inFlightOps.begin(); it != g_inFlightOps.end(); ++it) {
+        if ((now - it.value().start_ms) > 5000 && !g_watchdogWarned.contains(it.key())) {
+            stuck.append(qMakePair(it.key(), it.value()));
+            g_watchdogWarned.insert(it.key());
+        }
+    }
+    // Clean warned set: remove ids no longer in-flight
+    QSet<quint64> live_ids = QSet<quint64>(g_inFlightOps.keyBegin(), g_inFlightOps.keyEnd());
+    g_watchdogWarned.intersect(live_ids);
+    // List ALL in-flight ops for context (not just newly-stuck)
+    QList<QPair<quint64, InFlightOp>> all_in_flight;
+    for (auto it = g_inFlightOps.begin(); it != g_inFlightOps.end(); ++it) {
+        all_in_flight.append(qMakePair(it.key(), it.value()));
+    }
+    lock.unlock();
+    if (stuck.isEmpty()) return;
+    qWarning() << "==================== [WATCHDOG] STUCK OPS DETECTED ====================";
+    for (const auto &p : stuck) {
+        qWarning().noquote() << QString("  STUCK op_id=%1 elapsed=%2ms tag=%3 tid=0x%4 — Python call hasn't returned!")
+                                .arg(p.first)
+                                .arg(now - p.second.start_ms)
+                                .arg(p.second.tag)
+                                .arg(p.second.tid, 0, 16);
+    }
+    qWarning() << "[WATCHDOG] Full in-flight snapshot (" << all_in_flight.size() << " ops):";
+    for (const auto &p : all_in_flight) {
+        qWarning().noquote() << QString("    op_id=%1 elapsed=%2ms tag=%3 tid=0x%4")
+                                .arg(p.first)
+                                .arg(now - p.second.start_ms)
+                                .arg(p.second.tag)
+                                .arg(p.second.tid, 0, 16);
+    }
+    qWarning() << "=======================================================================";
+
+    // Dump Python stacks of ALL threads. This is the key new instrumentation
+    // for the 2026-05-15 release stuck investigation: fn_duration tells us
+    // HOW long the Python call took, but not WHICH source line it's stuck on.
+    // sys._current_frames() returns the frame of each running Python thread;
+    // we format and log so the next stuck event self-identifies the culprit.
+    QString context;
+    for (const auto &p : stuck) {
+        context += QString("op_id=%1 elapsed=%2ms; ").arg(p.first).arg(now - p.second.start_ms);
+    }
+    watchdogDumpPythonStacks(context.trimmed());
+}
+
+// Dedicated watchdog thread. Started lazily on first registerOp.
+static QThread *g_watchdogThread = nullptr;
+static QTimer  *g_watchdogTimer  = nullptr;
+static QMutex   g_watchdogStartMutex;
+static void watchdogEnsureStarted() {
+    QMutexLocker lock(&g_watchdogStartMutex);
+    if (g_watchdogThread) return;
+    g_watchdogThread = new QThread();
+    g_watchdogThread->setObjectName("CCWatchdog");
+    g_watchdogThread->start();
+    // Create the timer on the watchdog thread and start it via QueuedConnection
+    // so timer events fire on the watchdog thread's event loop.
+    g_watchdogTimer = new QTimer();
+    g_watchdogTimer->moveToThread(g_watchdogThread);
+    QObject::connect(g_watchdogTimer, &QTimer::timeout, []() { watchdogTick(); });
+    QMetaObject::invokeMethod(g_watchdogTimer, [](){ g_watchdogTimer->start(1000); },
+                              Qt::QueuedConnection);
+}
+
 // Invokes f() on `worker` and blocks the caller until it completes.
 // When `acquireGil` is true, the GIL is wrapped around f()'s invocation so
 // the lambda can freely use the Python C API.
+//
+// Shared-state lifetime contract: the queued lambda captures `state` and `fn`
+// BY VALUE, so once invokeOnWorker has posted the lambda it can safely return
+// (whether the lambda finished or hit the 15s timeout). Earlier versions
+// captured `&f / &result / &done` by REFERENCE on the caller's stack — when
+// dispatchToDevice timed out the caller returned and those stack slots died,
+// but the lambda remained queued in the worker's event loop. As soon as the
+// worker thread unblocked (e.g. pyftdi USB hub conflict cleared), the queued
+// lambda fired and wrote to the dead stack frame → access violation, process
+// died. Observed 2026-05-12 15:07: three simultaneous dispatchToDevice
+// timeouts on inst=6/7/8 followed by process crash.
+template<typename Result>
+struct InvokeState {
+    Result result{};
+    QSemaphore done;
+};
 template<typename F>
 static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
-                           bool acquireGil, const char *timeoutTag,
+                           bool acquireGil, const QString &timeoutTag,
                            std::function<void(const QString&)> logFn)
     -> decltype(f())
 {
@@ -58,30 +283,93 @@ static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
         }
         return f();
     }
-    decltype(f()) result{};
-    QSemaphore done;
-    QMetaObject::invokeMethod(worker, [&f, &result, &done, acquireGil]() {
+    using Result = decltype(f());
+    auto state = std::make_shared<InvokeState<Result>>();
+    const qint64 t_dispatched = QDateTime::currentMSecsSinceEpoch();
+    const QString tag = timeoutTag;
+
+    // Diagnostic timing: log the three gaps that explain a 14s stall —
+    //  (a) queue_wait    = invokeMethod → lambda start (worker event-loop
+    //                      delivery delay; should be < 5ms when worker idle)
+    //  (b) gil_wait      = lambda start → PyGILState_Ensure returns (Python
+    //                      GIL contention; large value means another thread
+    //                      held the GIL — prime suspect for cross-worker stall)
+    //  (c) fn_duration   = inside fn() (actual Python work; large value means
+    //                      this op itself is slow and likely held GIL too)
+    // Only log when above thresholds to keep release builds quiet.
+    QMetaObject::invokeMethod(worker, [state, fn = std::forward<F>(f), acquireGil,
+                                       t_dispatched, tag, logFn]() mutable {
+        const qint64 t_lambda = QDateTime::currentMSecsSinceEpoch();
+        const qint64 queue_wait = t_lambda - t_dispatched;
+        if (queue_wait > 30 && logFn) {
+            logFn(QString("[invokeOnWorker] %1 queue_wait=%2ms tid=0x%3")
+                  .arg(tag).arg(queue_wait)
+                  .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16));
+        }
+        // Register with watchdog before doing any Python work — watchdog can
+        // then list this op as "in-flight" if the lambda gets stuck below.
+        // Instance id is encoded in the tag for dispatchToDevice (logFn prefix
+        // adds it on the caller side), so we extract via a sentinel here.
+        const quint64 op_id = watchdogRegister(tag, /*instanceId=*/ -1);
+        {
+            QMutexLocker fl(&g_freqMutex);
+            g_freqCounter[tag]++;
+        }
         if (acquireGil) {
             PyGILState_STATE g = PyGILState_Ensure();
-            result = f();
+            const qint64 t_gil = QDateTime::currentMSecsSinceEpoch();
+            const qint64 gil_wait = t_gil - t_lambda;
+            if (gil_wait > 30 && logFn) {
+                logFn(QString("[invokeOnWorker] %1 gil_wait=%2ms tid=0x%3 — GIL held by another thread")
+                      .arg(tag).arg(gil_wait)
+                      .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16));
+            }
+            state->result = fn();
+            const qint64 fn_ms = QDateTime::currentMSecsSinceEpoch() - t_gil;
+            if (fn_ms > 300 && logFn) {
+                logFn(QString("[invokeOnWorker] %1 fn_duration=%2ms tid=0x%3 — long Python call (held GIL %2ms)")
+                      .arg(tag).arg(fn_ms)
+                      .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16));
+            }
             PyGILState_Release(g);
         } else {
-            result = f();
+            state->result = fn();
         }
-        done.release();
+        watchdogDeregister(op_id);
+        state->done.release();
     }, Qt::QueuedConnection);
-    if (!done.tryAcquire(1, 15000)) {
-        if (logFn) logFn(QString("[PythonBridge] %1 TIMEOUT (15s) — thread may be stuck").arg(timeoutTag));
-        return result;
+    if (!state->done.tryAcquire(1, 15000)) {
+        if (logFn) logFn(QString("[PythonBridge] %1 TIMEOUT (15s) — thread may be stuck").arg(tag));
+        // Snapshot in-flight ops at timeout — tells us what else was queued
+        // and when each op started, which is the actual smoking gun for
+        // identifying which Python call is blocking everyone else.
+        QMap<quint64, InFlightOp> snapshot;
+        {
+            QMutexLocker lock(&g_watchdogMutex);
+            snapshot = g_inFlightOps;
+        }
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (logFn) {
+            logFn(QString("[Watchdog] %1 in-flight ops at TIMEOUT moment:").arg(snapshot.size()));
+            for (auto it = snapshot.begin(); it != snapshot.end(); ++it) {
+                const auto &op = it.value();
+                logFn(QString("  op_id=%1 elapsed=%2ms tag=%3 tid=0x%4")
+                      .arg(it.key())
+                      .arg(now - op.start_ms)
+                      .arg(op.tag)
+                      .arg(op.tid, 0, 16));
+            }
+        }
+        return state->result;
     }
-    return result;
+    return state->result;
 }
 
 template<typename F>
 auto PythonBridge::dispatch(F &&f) -> decltype(f()) {
     auto log = [this](const QString &msg){ emit logMessage(msg); };
     return invokeOnWorker(m_pythonWorker, &m_pythonThread, std::forward<F>(f),
-                          /*acquireGil*/ true, "dispatch", log);
+                          /*acquireGil*/ true, QStringLiteral("dispatch"), log);
 }
 
 void PythonBridge::dispatchVoid(std::function<void()> f) {
@@ -91,15 +379,19 @@ void PythonBridge::dispatchVoid(std::function<void()> f) {
         PyGILState_Release(g);
         return;
     }
-    QSemaphore done;
-    auto wrapped = [fn = std::move(f), &done]() {
+    // Heap-allocated semaphore so the lambda is safe even if the caller hits
+    // the 15s timeout and returns — without this, a delayed lambda fires
+    // against a destroyed stack-allocated QSemaphore. See invokeOnWorker
+    // comment for the full root-cause analysis.
+    auto done = std::make_shared<QSemaphore>();
+    auto wrapped = [fn = std::move(f), done]() {
         PyGILState_STATE g = PyGILState_Ensure();
         fn();
         PyGILState_Release(g);
-        done.release();
+        done->release();
     };
     QMetaObject::invokeMethod(m_pythonWorker, std::move(wrapped), Qt::QueuedConnection);
-    if (!done.tryAcquire(1, 15000)) {
+    if (!done->tryAcquire(1, 15000)) {
         emit logMessage("[PythonBridge] dispatchVoid TIMEOUT (15s) — Python thread may be stuck");
     }
 }
@@ -122,8 +414,9 @@ auto PythonBridge::dispatchToDevice(int instanceId, F &&f) -> decltype(f()) {
     auto log = [this, instanceId](const QString &msg) {
         emit logMessage(QString("[PythonBridge/inst=%1] %2").arg(instanceId).arg(msg));
     };
+    const QString tag = QString("dispatchToDevice[inst=%1]").arg(instanceId);
     return invokeOnWorker(worker, thread, std::forward<F>(f),
-                          /*acquireGil*/ true, "dispatchToDevice", log);
+                          /*acquireGil*/ true, tag, log);
 }
 
 void PythonBridge::dispatchVoidToDevice(int instanceId, std::function<void()> f) {
@@ -144,15 +437,17 @@ void PythonBridge::dispatchVoidToDevice(int instanceId, std::function<void()> f)
         PyGILState_Release(g);
         return;
     }
-    QSemaphore done;
-    auto wrapped = [fn = std::move(f), &done]() {
+    // Heap-allocated semaphore so a delayed lambda (after timeout) doesn't
+    // write to dead caller stack. Same root-cause as invokeOnWorker.
+    auto done = std::make_shared<QSemaphore>();
+    auto wrapped = [fn = std::move(f), done]() {
         PyGILState_STATE g = PyGILState_Ensure();
         fn();
         PyGILState_Release(g);
-        done.release();
+        done->release();
     };
     QMetaObject::invokeMethod(worker, std::move(wrapped), Qt::QueuedConnection);
-    if (!done.tryAcquire(1, 15000)) {
+    if (!done->tryAcquire(1, 15000)) {
         emit logMessage(QString("[PythonBridge/inst=%1] dispatchVoidToDevice TIMEOUT (15s)").arg(instanceId));
     }
 }
@@ -225,9 +520,44 @@ PythonBridge::~PythonBridge()
 // Initialization
 // ---------------------------------------------------------------------------
 
-#ifdef QT_DEBUG
-// Simulation sleep helper (debug builds only)
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+// Simulation sleep helpers (debug builds only).
+//   simSleep(ms)       — used by init paths (createDeviceInstance, preInit).
+//                        Always sleeps the given ms, never overridden.
+//   simStallSleep(ms)  — used by runtime ops (setBrightness, sendImage,
+//                        getPanelId, getLeaTemperature, systemPowerOn/Off).
+//                        CC_SIM_STALL_MS env var, when set > 0, overrides ms.
+//                        Acquires g_simSharedLock for the duration to MIMIC
+//                        the Python GIL: a long-running call on one worker
+//                        blocks all other workers' Python entries — the
+//                        prime suspect for the 2026-05-12 22:23 cross-worker
+//                        14s stall. The lock is debug-only and exits with the
+//                        function, so production code path is unchanged.
+//                        Init paths intentionally use simSleep (no shared
+//                        lock) so launch isn't blocked for minutes.
+static QMutex g_simSharedLock;
 static void simSleep(int ms) { QThread::msleep(ms); }
+static void simStallSleep(int ms) {
+    const int stallMs = qEnvironmentVariableIntValue("CC_SIM_STALL_MS");
+    const int actual = stallMs > 0 ? stallMs : ms;
+    const bool useSharedLock = !qEnvironmentVariableIsSet("CC_SIM_NO_SHARED_LOCK");
+
+    if (!useSharedLock) {
+        // Control arm: no shared lock — true per-device parallelism.
+        QThread::msleep(actual);
+        return;
+    }
+    const qint64 t_arrive = QDateTime::currentMSecsSinceEpoch();
+    const auto tid = reinterpret_cast<quintptr>(QThread::currentThreadId());
+    g_simSharedLock.lock();
+    const qint64 wait_ms = QDateTime::currentMSecsSinceEpoch() - t_arrive;
+    if (wait_ms > 5) {
+        qDebug().noquote() << QString("[SIM-lock] tid=0x%1 acquired after %2ms wait")
+                              .arg(tid, 0, 16).arg(wait_ms);
+    }
+    QThread::msleep(actual);
+    g_simSharedLock.unlock();
+}
 #endif
 
 bool PythonBridge::initialize(const QString &venvPath)
@@ -241,7 +571,7 @@ bool PythonBridge::initialize(const QString &venvPath, const QString &pythonHome
                                const QStringList &dllPaths, const QString &calPath,
                                bool allowDefaultHdf5)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     emit logMessage("[SIM] Debug simulation mode — skipping Python initialization");
     m_initialized = true;
     return true;
@@ -461,7 +791,7 @@ bool PythonBridge::initialize(const QString &venvPath, const QString &pythonHome
 
 void PythonBridge::shutdown()
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     m_simDevices.clear();
     m_serialMap.clear();
     m_initOkMap.clear();
@@ -735,7 +1065,7 @@ void PythonBridge::clearError()
 
 QList<DeviceInfo> PythonBridge::getAvailableDevicesInfo()
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     QList<DeviceInfo> result;
     for (int i = 0; i < SIM_DEVICE_COUNT; ++i) {
         DeviceInfo info;
@@ -798,12 +1128,12 @@ QList<DeviceInfo> PythonBridge::getAvailableDevicesInfo()
 
 int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareVariant)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     int instanceId = m_nextInstanceId++;
     QString serial = QString("SIM%1").arg(deviceIndex, 4, 10, QChar('0'));
     emit logMessage(QString("[SIM] Creating device instance %1 for device %2 (%3)...")
                         .arg(instanceId).arg(deviceIndex).arg(serial));
-    simSleep(SIM_DELAY_MS);
+    simSleep(SIM_DELAY_MS);  // init path — never stalled by CC_SIM_STALL_MS
 
     SimDevice sim;
     sim.serial = serial;
@@ -978,7 +1308,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
 
 int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return createDeviceInstance(deviceIndex, hardwareVariant);
 #endif
     return dispatch([this, deviceIndex, hardwareVariant]() -> int {
@@ -1043,7 +1373,7 @@ int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardware
 
 void PythonBridge::destroyDeviceInstance(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     m_simDevices.remove(instanceId);
     m_initOkMap.remove(instanceId);
     m_serialMap.remove(instanceId);
@@ -1090,7 +1420,7 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
 
 bool PythonBridge::isDeviceConnected(int instanceId) const
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return m_simDevices.contains(instanceId) && m_simDevices[instanceId].connected;
 #endif
     // Map is only modified on Python thread, reads from main thread are safe
@@ -1117,10 +1447,15 @@ QString PythonBridge::getDeviceSerial(int instanceId) const
 
 bool PythonBridge::systemPowerOn(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     emit logMessage(QString("[SIM] systemPowerOn(%1)").arg(instanceId));
-    simSleep(SIM_DELAY_MS);
-    return m_simDevices.contains(instanceId);
+    simStallSleep(SIM_DELAY_MS);
+    if (!m_simDevices.contains(instanceId)) return false;
+    // Restore connected=true so subsequent setBrightness / sendImage /
+    // getPanelId hit their simStallSleep instead of fail-fast at the
+    // isConnected() gate in CorneaWidget::setBrightnessBySerial / etc.
+    m_simDevices[instanceId].connected = true;
+    return true;
 #endif
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_on");
@@ -1153,9 +1488,9 @@ bool PythonBridge::systemPowerOn(int instanceId)
 
 bool PythonBridge::systemPowerOff(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     emit logMessage(QString("[SIM] systemPowerOff(%1)").arg(instanceId));
-    simSleep(SIM_DELAY_MS);
+    simStallSleep(SIM_DELAY_MS);
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].connected = false;
     return true;
 #endif
@@ -1174,7 +1509,7 @@ bool PythonBridge::systemPowerOff(int instanceId)
 
 bool PythonBridge::enableVsys(int instanceId, bool enable)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(enable);
     return m_simDevices.contains(instanceId);
 #endif
@@ -1193,7 +1528,8 @@ bool PythonBridge::enableVsys(int instanceId, bool enable)
 
 bool PythonBridge::setBrightness(int instanceId, double level)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+    simStallSleep(SIM_DELAY_MS);
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].brightness = level;
     return m_simDevices.contains(instanceId);
 #endif
@@ -1212,7 +1548,7 @@ bool PythonBridge::setBrightness(int instanceId, double level)
 
 double PythonBridge::getBrightness(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return m_simDevices.contains(instanceId) ? m_simDevices[instanceId].brightness : -1.0;
 #endif
     return dispatchToDevice(instanceId, [this, instanceId]() -> double {
@@ -1228,7 +1564,7 @@ double PythonBridge::getBrightness(int instanceId)
 
 bool PythonBridge::setXFlip(int instanceId, bool flip)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].xFlip = flip;
     return m_simDevices.contains(instanceId);
 #endif
@@ -1247,7 +1583,7 @@ bool PythonBridge::setXFlip(int instanceId, bool flip)
 
 bool PythonBridge::setYFlip(int instanceId, bool flip)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].yFlip = flip;
     return m_simDevices.contains(instanceId);
 #endif
@@ -1266,7 +1602,7 @@ bool PythonBridge::setYFlip(int instanceId, bool flip)
 
 bool PythonBridge::getXFlip(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return m_simDevices.contains(instanceId) ? m_simDevices[instanceId].xFlip : false;
 #endif
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
@@ -1284,7 +1620,7 @@ bool PythonBridge::getXFlip(int instanceId)
 
 bool PythonBridge::getYFlip(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return m_simDevices.contains(instanceId) ? m_simDevices[instanceId].yFlip : false;
 #endif
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
@@ -1302,10 +1638,10 @@ bool PythonBridge::getYFlip(int instanceId)
 
 bool PythonBridge::writeFrame(int instanceId, const QImage &image)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(image);
     emit logMessage(QString("[SIM] writeFrame(%1) %2x%3").arg(instanceId).arg(image.width()).arg(image.height()));
-    simSleep(SIM_DELAY_MS);
+    simStallSleep(SIM_DELAY_MS);
     return m_simDevices.contains(instanceId);
 #endif
     return dispatchToDevice(instanceId, [this, instanceId, image]() -> bool {
@@ -1387,7 +1723,7 @@ bool PythonBridge::writeFrameFromPath(int instanceId, const QString &imagePath)
 
 QVariantMap PythonBridge::getChipInfo(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     QVariantMap info;
     info["chip"] = "SIM_RJ1B1";
     info["revision"] = "B1";
@@ -1407,7 +1743,7 @@ QVariantMap PythonBridge::getChipInfo(int instanceId)
 
 QVariantMap PythonBridge::getChipInfoDecoded(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return getChipInfo(instanceId);
 #endif
     return dispatchToDevice(instanceId, [this, instanceId]() -> QVariantMap {
@@ -1423,7 +1759,7 @@ QVariantMap PythonBridge::getChipInfoDecoded(int instanceId)
 
 QString PythonBridge::getChipRevision(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId);
     return "B1";
 #endif
@@ -1453,8 +1789,9 @@ QString PythonBridge::getChipRevision(int instanceId)
 
 double PythonBridge::getLeaTemperature(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId);
+    simStallSleep(SIM_DELAY_MS);
     return 25.0 + QRandomGenerator::global()->bounded(5.0);
 #endif
     return dispatchToDevice(instanceId, [this, instanceId]() -> double {
@@ -1497,7 +1834,7 @@ double PythonBridge::getLeaTemperature(int instanceId)
 
 double PythonBridge::getDa9272Temperature(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId);
     return 24.0 + QRandomGenerator::global()->bounded(4.0);
 #endif
@@ -1521,7 +1858,7 @@ double PythonBridge::getDa9272Temperature(int instanceId)
 
 QVariantMap PythonBridge::getPowerMeasurements(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId);
     QVariantMap v;
     v["vsys_power_mw"] = 500.0 + QRandomGenerator::global()->bounded(100.0);
@@ -1565,7 +1902,7 @@ QVariantMap PythonBridge::getPowerMeasurements(int instanceId)
 
 QVariantMap PythonBridge::getPackageVersions(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId);
     QVariantMap v;
     v["rj1lib"] = "1.0.0-sim";
@@ -1585,7 +1922,8 @@ QVariantMap PythonBridge::getPackageVersions(int instanceId)
 
 QString PythonBridge::getPanelId(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+    simStallSleep(SIM_DELAY_MS);
     return QString("SIM-PANEL-%1").arg(instanceId);
 #endif
     return dispatchToDevice(instanceId, [this, instanceId]() -> QString {
@@ -1607,7 +1945,7 @@ QString PythonBridge::getPanelId(int instanceId)
 
 int PythonBridge::readRj1Register(int instanceId, int address)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId); Q_UNUSED(address);
     return 0;
 #endif
@@ -1626,7 +1964,7 @@ int PythonBridge::readRj1Register(int instanceId, int address)
 
 bool PythonBridge::writeRj1Register(int instanceId, int address, int data)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId); Q_UNUSED(address); Q_UNUSED(data);
     return true;
 #endif
@@ -1644,7 +1982,7 @@ bool PythonBridge::writeRj1Register(int instanceId, int address, int data)
 
 QVariantMap PythonBridge::getRj1Dacs(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId);
     return QVariantMap();
 #endif
@@ -1661,7 +1999,7 @@ QVariantMap PythonBridge::getRj1Dacs(int instanceId)
 
 bool PythonBridge::setRj1Dacs(int instanceId, const QVariantMap &dacValues)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId); Q_UNUSED(dacValues);
     return true;
 #endif
@@ -1690,7 +2028,7 @@ bool PythonBridge::setRj1Dacs(int instanceId, const QVariantMap &dacValues)
 
 bool PythonBridge::setDemuraEnable(int instanceId, bool enable)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId); Q_UNUSED(enable);
     return true;
 #endif
@@ -1708,7 +2046,7 @@ bool PythonBridge::setDemuraEnable(int instanceId, bool enable)
 
 bool PythonBridge::setRlutEnable(int instanceId, bool enable)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId); Q_UNUSED(enable);
     return true;
 #endif
@@ -1726,7 +2064,7 @@ bool PythonBridge::setRlutEnable(int instanceId, bool enable)
 
 QVariantMap PythonBridge::getDemuraRlutState(int instanceId)
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(instanceId);
     QVariantMap state;
     state["demura"] = true;
@@ -1746,7 +2084,7 @@ QVariantMap PythonBridge::getDemuraRlutState(int instanceId)
 
 void PythonBridge::flushPythonOutput()
 {
-#ifdef QT_DEBUG
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return;
 #endif
     // Use QueuedConnection (non-blocking) so this never blocks the main thread.

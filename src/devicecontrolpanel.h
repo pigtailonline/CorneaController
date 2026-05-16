@@ -36,6 +36,15 @@ public:
     // matches the spec strictly.
     static constexpr double TEMPERATURE_LIMIT = 65.0;
 
+    // sendImage only triggers 1Hz temperature polling when the image's intrinsic
+    // APL is ≥ this threshold (== brightness=1 with this image hits the
+    // thermal danger zone). Images below this APL cannot ramp the panel above
+    // the safe envelope at any brightness ≤ 1.0, so polling is skipped to
+    // reduce libusb-win32 pressure (root cause of the 2026-05-15 production
+    // sendImage stuck events). setBrightness ALWAYS triggers protection
+    // regardless of level — brightness ramp itself can drive heat.
+    static constexpr double APL_PROTECTION_THRESHOLD = 0.06;
+
     explicit DeviceControlPanel(int panelId, PythonBridge *bridge, QWidget *parent = nullptr);
     ~DeviceControlPanel();
 
@@ -114,6 +123,41 @@ private slots:
     void onBrightnessProtectionTimeout();
 
 private:
+    // Unified operation results. All TCP/UI/programmatic callers go through
+    // the *Core() methods below; the public Direct/DirectEx and UI slots are
+    // thin wrappers that translate these results into their respective return
+    // shapes (bool, ApiResult, or UI feedback). This removes the prior
+    // 3-way copy-paste of APL checks, sendImage calls, and protection
+    // triggers across TCP and UI paths (root cause of multiple drift bugs).
+    struct OpResult {
+        bool ok = false;
+        QString error;
+    };
+    struct SendImageResult {
+        bool sent = false;            // m_controller->sendImage() success
+        bool blockedByApl = false;    // pre-check rejected before sending
+        double patternApl = 0.0;
+        double currentBrightness = 0.0;
+        double totalApl = 0.0;
+        double aplLimit = 0.06;
+        QString error;
+    };
+    struct SetBrightnessResult {
+        bool ok = false;
+        bool overheated = false;      // waitProtection saw temp > limit
+        double rj1Temp = -999.0;
+        double da9272Temp = -999.0;
+        QString error;
+    };
+
+    SendImageResult     sendImageCore(const QImage &image);
+    SetBrightnessResult setBrightnessCore(double level, bool waitProtection);
+    OpResult            powerOnCore();
+    OpResult            powerOffCore();
+    OpResult            setXFlipCore(bool flip);
+    OpResult            setYFlipCore(bool flip);
+    OpResult            setFlipCore(bool xFlip, bool yFlip);
+
     void setupUI();
     void setupConnections();
     void updateUIState();
