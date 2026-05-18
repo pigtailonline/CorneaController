@@ -70,6 +70,20 @@ static QAtomicInteger<quint64>   g_nextOpId{1};
 static QMutex             g_freqMutex;
 static QMap<QString, int> g_freqCounter;
 
+// Global libusb serialization (Method 1, v1.1.17):
+// Across ALL per-instance worker threads, only ONE fn() runs at a time. This
+// trades parallelism for stability — eliminates the libusb-win32 kernel
+// driver race condition observed in production 2026-05-18, where multiple
+// concurrent libusb_bulk_transfer / control_transfer calls into different
+// FT4232 boards triggered IRP-level stucks of 30-105 seconds and a 6-instance
+// cascade. With serialization the worst case becomes "queue-and-wait" not
+// "all-stuck-together"; throughput drops modestly but predictably.
+//
+// Mutex is acquired BEFORE the GIL so a thread waiting on the mutex does
+// not also hold the GIL — keeps unrelated Python work in other threads
+// (e.g. logging, background timers) responsive.
+static QMutex g_libusbGlobalMutex;
+
 // Forward decl
 static void watchdogEnsureStarted();
 
@@ -315,10 +329,20 @@ static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
             QMutexLocker fl(&g_freqMutex);
             g_freqCounter[tag]++;
         }
+        // Global libusb serialization — see g_libusbGlobalMutex docstring.
+        // Acquired BEFORE GIL so blocked threads don't hold the GIL.
+        const qint64 t_lock_start = QDateTime::currentMSecsSinceEpoch();
+        QMutexLocker libusbLock(&g_libusbGlobalMutex);
+        const qint64 lock_wait = QDateTime::currentMSecsSinceEpoch() - t_lock_start;
+        if (lock_wait > 50 && logFn) {
+            logFn(QString("[invokeOnWorker] %1 libusb_lock_wait=%2ms tid=0x%3 — another instance was using USB")
+                  .arg(tag).arg(lock_wait)
+                  .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16));
+        }
         if (acquireGil) {
             PyGILState_STATE g = PyGILState_Ensure();
             const qint64 t_gil = QDateTime::currentMSecsSinceEpoch();
-            const qint64 gil_wait = t_gil - t_lambda;
+            const qint64 gil_wait = t_gil - t_lambda - lock_wait;
             if (gil_wait > 30 && logFn) {
                 logFn(QString("[invokeOnWorker] %1 gil_wait=%2ms tid=0x%3 — GIL held by another thread")
                       .arg(tag).arg(gil_wait)
