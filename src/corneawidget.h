@@ -62,6 +62,12 @@ public:
     QString getPanelId(int index) const;
     double getRj1Temperature(int index) const;
 
+    // Application-level cleanup hook. Called from main.cpp's aboutToQuit
+    // connect so embedded Python is finalized and USB interfaces released
+    // BEFORE the QApplication event loop returns. Safe to call multiple
+    // times — second call is a no-op.
+    void shutdown();
+
     // === Public API (by serial) ===
     bool powerOnBySerial(const QString &serial);
     bool powerOnBySerial(const QString &serial, const QString &variant);

@@ -58,8 +58,15 @@ public:
     QVariantMap getChipInfoDecoded();
 
     // Temperature
-    double getRj1Temperature();     // RJ1-RAX internal temp sensor
+    double getRj1Temperature();     // RJ1-RAX internal temp sensor — may hit HW
     double getDa9272Temperature();
+
+    // Cache-only temperature read for hot TCP paths (getTemperature command).
+    // Returns the last value written by the background polling timer; NEVER
+    // touches FTDI/SPI. Restores the original design where TCP callers do not
+    // contend with sendImage/setBrightness for the SPI bus. Returns -999.0 if
+    // the cache has never been populated (timer hasn't fired since powerOn).
+    double getCachedRj1Temperature() const;
 
     // Power (for Harriet Panel Tester report)
     QVariantMap getPowerMeasurements();  // {vsys_power_mw, vddio_power_mw}

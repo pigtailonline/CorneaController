@@ -94,7 +94,7 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
 
     app.setApplicationName("Cornea Controller");
-    app.setApplicationVersion("1.1.17");
+    app.setApplicationVersion("1.1.20");
     app.setOrganizationName("Google AR Display Lab");
 
     // Setup file logging: <app_dir>/log/
@@ -132,6 +132,17 @@ int main(int argc, char *argv[])
     }
 
     mainWindow.show();
+
+    // Force a clean shutdown when the user closes the window or hits Ctrl-Q.
+    // Without this, the embedded Python interpreter's per-panel temperature
+    // poll threads keep the process alive (non-daemon) and pyftdi holds the
+    // FT4232 USB interface claim — the next CC launch then fails with
+    // libusb's "could not claim interface". The aboutToQuit signal fires
+    // BEFORE the QApplication event loop returns, giving us a controlled
+    // chance to call Py_Finalize on the right thread.
+    QObject::connect(&app, &QApplication::aboutToQuit, corneaWidget, [corneaWidget]() {
+        corneaWidget->shutdown();
+    });
 
     return app.exec();
 }

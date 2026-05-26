@@ -53,6 +53,13 @@ bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant)
         // black. powerStateChanged is reserved for pure power transitions
         // (powerOn / powerOff on an already-existing instance).
         emit logMessage(QString("Connected to device: %1").arg(getDeviceLabel()));
+
+        // Pre-warm temperature cache: one synchronous HW read so the first
+        // TCP getTemperature after powerOn returns a real value instead of
+        // the -999 sentinel that would otherwise persist until the 5 s
+        // background timer fires. Failure is non-fatal — cache stays -999,
+        // same as previously. Cost: ~50–200 ms on the powerOn path.
+        getRj1Temperature();
         return true;
     }
 
@@ -132,6 +139,8 @@ bool CorneaController::powerOn()
         m_poweredOn = true;
         emit powerStateChanged(true);
         emit logMessage("Power ON");
+        // Pre-warm temperature cache on the reuse path too — see connect().
+        getRj1Temperature();
         return true;
     }
 
@@ -314,6 +323,16 @@ double CorneaController::getRj1Temperature()
         m_lastRj1ReadMs = now;
     }
     return temp;
+}
+
+double CorneaController::getCachedRj1Temperature() const
+{
+    // Pure cache read — never touches HW. Background timer
+    // (DeviceControlPanel::onTemperatureMonitorTimeout) is the sole writer
+    // via getRj1Temperature() above. TCP `getTemperature` calls land here so
+    // they never queue I2C transactions behind sendImage/setBrightness.
+    QMutexLocker lock(&m_tempCacheMutex);
+    return m_cachedRj1Temp;
 }
 
 double CorneaController::getDa9272Temperature()

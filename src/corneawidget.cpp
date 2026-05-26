@@ -15,6 +15,8 @@
 #include <QCoreApplication>
 #include <QResizeEvent>
 #include <QThread>
+#include <QProgressDialog>
+#include <QApplication>
 
 CorneaWidget::CorneaWidget(QWidget *parent)
     : QWidget(parent)
@@ -47,7 +49,37 @@ CorneaWidget::~CorneaWidget()
     m_devicePanels.clear();
     m_indexToPanelMap.clear();
 
+    // Force-shutdown the embedded Python interpreter now, while we still
+    // have a controlled scope. Without this, ~PythonBridge runs at member-
+    // destruction time and Py_Finalize() blocks waiting for the per-panel
+    // 5 s temperature poll threads — they live forever in the lib, so the
+    // process never actually exits and FT4232 USB interfaces stay claimed.
+    // shutdown() is idempotent and safe to call before ~PythonBridge.
+    if (m_pythonBridge) {
+        m_pythonBridge->shutdown();
+    }
+
     delete ui;
+}
+
+void CorneaWidget::shutdown()
+{
+    // External hook for application-level cleanup (main.cpp's aboutToQuit).
+    // Idempotent — if called twice, the second is a no-op. We mirror the
+    // destructor's tear-down order so a Ctrl-Q or window-X both exit cleanly:
+    // stop the poll/TCP first (no more inbound work), tear down panels (so
+    // Python instance references go away), then ask Python to finalize.
+    m_pythonOutputTimer->stop();
+    if (m_tcpServer) {
+        m_tcpServer->disconnect(this);
+        m_tcpServer.reset();
+    }
+    qDeleteAll(m_devicePanels);
+    m_devicePanels.clear();
+    m_indexToPanelMap.clear();
+    if (m_pythonBridge) {
+        m_pythonBridge->shutdown();
+    }
 }
 
 bool CorneaWidget::loadConfig(const QString &configPath)
@@ -71,20 +103,56 @@ bool CorneaWidget::loadConfig(const QString &configPath)
     // Uses init_rj1=False so no panel/光機 is needed — only driver board.
     // This ensures pyftdi SPI/I2C controllers are created once for all devices.
     // Subsequent powerOn uses system_power_on() on existing instances.
+    //
+    // Each preInit blocks the GUI thread for 5–15 s (FTDI USB enum + lib
+    // bring-up); with 6 devices that's up to 90 s of frozen UI on first
+    // launch. A QProgressDialog covers the wait so operators don't assume
+    // the app has hung. The dialog uses processEvents() between panels so
+    // it actually repaints; the per-preInit blocking call still freezes
+    // the GUI briefly, but at least the "X/N" + current serial label keeps
+    // moving and the operator sees progress.
+    QList<DeviceControlPanel*> toPreInit;
     for (DeviceControlPanel *panel : m_devicePanels) {
         CorneaController *ctrl = panel->controller();
-        if (ctrl && !ctrl->isConnected()) {
-            QString variant = panel->currentVariant();
-            appendLog(QString("Pre-init: %1 (variant=%2, FTDI only)...")
-                      .arg(panel->deviceSerial(), variant));
-            if (ctrl->preInit(panel->deviceIndex(), variant)) {
-                appendLog(QString("Pre-init: %1 OK").arg(panel->deviceSerial()));
-            } else {
-                appendLog(QString("Pre-init: %1 FAILED (will retry on powerOn)")
-                          .arg(panel->deviceSerial()));
-            }
-        }
+        if (ctrl && !ctrl->isConnected()) toPreInit.append(panel);
     }
+    QProgressDialog progress(QString(), QString(), 0, toPreInit.size(), this);
+    progress.setWindowTitle(QStringLiteral("Cornea Controller"));
+    // Chinese strings via fromUtf8: this project's .pro has no /utf-8
+    // compiler flag, so MSVC reinterprets narrow string literals as the
+    // system code page (GBK on zh-CN Windows). The source file is UTF-8;
+    // fromUtf8 ensures the bytes are decoded correctly regardless of the
+    // compiler's source-encoding assumption.
+    progress.setLabelText(QString::fromUtf8("初始化驅動板 (FTDI 連線)..."));
+    progress.setMinimumDuration(0);   // show immediately even if total time is short
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.setCancelButton(nullptr);
+    progress.setValue(0);
+    QApplication::processEvents();
+
+    int done = 0;
+    for (DeviceControlPanel *panel : toPreInit) {
+        CorneaController *ctrl = panel->controller();
+        QString variant = panel->currentVariant();
+        progress.setLabelText(
+            QString::fromUtf8("初始化 %1 / %2: %3 (variant=%4)")
+                .arg(done + 1).arg(toPreInit.size())
+                .arg(panel->deviceSerial(), variant));
+        QApplication::processEvents();
+
+        appendLog(QString("Pre-init: %1 (variant=%2, FTDI only)...")
+                  .arg(panel->deviceSerial(), variant));
+        if (ctrl->preInit(panel->deviceIndex(), variant)) {
+            appendLog(QString("Pre-init: %1 OK").arg(panel->deviceSerial()));
+        } else {
+            appendLog(QString("Pre-init: %1 FAILED (will retry on powerOn)")
+                      .arg(panel->deviceSerial()));
+        }
+        ++done;
+        progress.setValue(done);
+        QApplication::processEvents();
+    }
+    progress.close();
 
     // Save config to persist any newly discovered devices
     saveConfig();
@@ -434,23 +502,10 @@ bool CorneaWidget::powerOnBySerial(const QString &serial)
     // Already connected and powered on — nothing to do
     if (ctrl->isConnected() && ctrl->isPoweredOn()) return true;
 
-    // Re-power path is ONLY valid for a fully-initialized instance (RJ1
-    // i2c/spi interfaces built at construction). A pre-init shell
-    // (init_rj1=False at preInitDeviceInstance) satisfies isConnected but
-    // has no RJ1 interface — system_power_on on it NACKs at 0x28 and the
-    // panel never actually drives a frame even though SW reports OK.
-    // Discovered via TCP-driven flow 2026-05-11 (operator: panel連得上、
-    // 有 panel_id,但投圖不亮). UI path already routes this in
-    // devicecontrolpanel.cpp::powerOnDirect; TCP path was missed.
-    if (ctrl->isConnected() && ctrl->isInitOk() && !ctrl->isPoweredOn()) {
-        appendLog(QString("[PowerOn] %1 — re-powering existing instance").arg(serial));
-        return ctrl->powerOn();
-    }
-
-    // Pre-init shell or fully disconnected — full connect rebuilds the
-    // CorneaRax720 with init_rj1=True so RJ1 interface is wired up.
-    if (ctrl->isConnected() && !ctrl->isInitOk()) {
-        appendLog(QString("[PowerOn] %1 — discarding pre-init shell, full connect").arg(serial));
+    // v1.1.19: always rebuild on powerOn (see devicecontrolpanel.cpp::powerOnCore
+    // for full rationale). Reverts v1.1.13 reuse path.
+    if (ctrl->isConnected()) {
+        appendLog(QString("[PowerOn] %1 — destroying previous instance, fresh connect").arg(serial));
         ctrl->disconnect();
     }
     return ctrl->connect(panel->deviceIndex(), panel->currentVariant());
@@ -460,6 +515,17 @@ bool CorneaWidget::powerOnBySerial(const QString &serial, const QString &variant
 {
     DeviceControlPanel *panel = getPanelBySerial(serial);
     if (!panel) return false;
+
+    // Compare BEFORE updating the cache so we can decide whether a
+    // destroy+rebuild is actually warranted. Same-variant repeat calls
+    // (LEA flow re-sends powerOn with the JSON-baked variant on every
+    // test cycle) used to force a full disconnect/reconnect — that path
+    // is 5–30 s of FTDI re-enumeration AND triggers cornea_rax720's
+    // module-level instance teardown, which has historically been the
+    // source of multi-panel cascade fails. Skipping the rebuild when the
+    // variant hasn't changed cuts the slow path out entirely.
+    const QString previousVariant = panel->currentVariant();
+    const bool variantChanged = (previousVariant != variant);
 
     // Thread-safe: update cached variant, schedule UI update on main thread
     panel->setCurrentVariant(variant);
@@ -471,14 +537,21 @@ bool CorneaWidget::powerOnBySerial(const QString &serial, const QString &variant
 
     if (ctrl->isConnected() && ctrl->isPoweredOn()) return true;
 
-    // See single-arg overload for pre-init shell rationale.
-    if (ctrl->isConnected() && ctrl->isInitOk() && !ctrl->isPoweredOn()) {
-        appendLog(QString("[PowerOn] %1 — re-powering existing instance").arg(serial));
-        return ctrl->powerOn();
-    }
-    if (ctrl->isConnected() && !ctrl->isInitOk()) {
-        appendLog(QString("[PowerOn] %1 — discarding pre-init shell, full connect").arg(serial));
+    // Only destroy if the variant actually changed (different I2C address
+    // table / different chip set → must reinitialize). Otherwise reuse the
+    // existing instance and just toggle the power rails via system_power_on.
+    // v1.1.19's "always rebuild" rationale (avoid stale rj1lib/pyftdi
+    // globals across power cycles) still applies on a true variant switch
+    // — that's the rare case worth the cost.
+    if (ctrl->isConnected() && variantChanged) {
+        appendLog(QString("[PowerOn] %1 — variant changed (%2 -> %3), destroying previous instance, fresh connect")
+                  .arg(serial, previousVariant, variant));
         ctrl->disconnect();
+    } else if (ctrl->isConnected()) {
+        // Same variant + already connected (pre-init kept FTDI alive) =>
+        // fast path: just bring rails up via system_power_on. No destroy.
+        appendLog(QString("[PowerOn] %1 — reusing instance (variant=%2)").arg(serial, variant));
+        return ctrl->powerOn();
     }
     return ctrl->connect(panel->deviceIndex(), variant);
 }
@@ -488,10 +561,13 @@ bool CorneaWidget::powerOffBySerial(const QString &serial)
     CorneaController *ctrl = getControllerBySerial(serial);
     if (!ctrl || !ctrl->isConnected()) return true;
 
-    // Software power-off only — keep the Python SDK instance alive.
-    // This avoids pyftdi resetting all SPI/I2C controllers when the
-    // next powerOn creates a new instance.
-    return ctrl->powerOff();
+    // v1.1.19: full disconnect on powerOff (destroy Python instance).
+    // Pairs with always-rebuild on powerOn — guarantees no stale rj1lib /
+    // pyftdi globals carry across power cycles. The previous behavior
+    // ("keep SDK alive, software-off only") was the v1.1.13+ optimization
+    // that we suspect causes production half-dead state.
+    ctrl->disconnect();
+    return !ctrl->isConnected();
 }
 
 bool CorneaWidget::sendImageBySerial(const QString &serial, const QString &imagePath)
@@ -613,7 +689,11 @@ double CorneaWidget::getTemperatureBySerial(const QString &serial) const
 {
     CorneaController *ctrl = getControllerBySerial(serial);
     if (!ctrl || !ctrl->isConnected()) return -999.0;
-    return ctrl->getRj1Temperature();
+    // v1.1.20: cache-only read. Background timer is the sole HW reader.
+    // Restores original design — TCP callers do not contend with
+    // sendImage/setBrightness on the SPI bus, fixing the 0.8% getTemperature
+    // success rate observed in 2026-05-21 stress test.
+    return ctrl->getCachedRj1Temperature();
 }
 
 QVariantMap CorneaWidget::getPowerBySerial(const QString &serial) const

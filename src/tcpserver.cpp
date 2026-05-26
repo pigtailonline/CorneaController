@@ -267,11 +267,27 @@ QJsonObject TcpServer::handlePowerOn(const QJsonObject &params)
     bool result = variant.isEmpty()
         ? m_corneaWidget->powerOnBySerial(serial)
         : m_corneaWidget->powerOnBySerial(serial, variant);
-    if (result) {
-        return makeSuccess();
-    } else {
+    if (!result) {
         return makeError(QString("Failed to power on device: %1").arg(serial));
     }
+
+    // Apply a safe default brightness synchronously before returning. RJ1
+    // hardware powers up at ~0.5 (full default) on every fresh connect; the
+    // GUI path masks that by hooking the `connected` signal and calling
+    // setBrightness from onControllerConnected — but that slot fires on the
+    // GUI thread via QueuedConnection, so a TCP client that immediately
+    // chains powerOn → sendImage races ahead with the hardware default
+    // still in effect and trips the APL_EXCEEDED guard (0.5 brightness × any
+    // non-trivial pattern > 0.06 limit). Call setBrightness directly on the
+    // worker thread so the brightness is settled before this response goes
+    // back. Optional "brightness" param lets the client override.
+    constexpr double kDefaultBrightness = 0.03;
+    double level = params.contains("brightness")
+        ? params["brightness"].toDouble(kDefaultBrightness)
+        : kDefaultBrightness;
+    m_corneaWidget->setBrightnessBySerial(serial, level);
+
+    return makeSuccess();
 }
 
 QJsonObject TcpServer::handlePowerOff(const QJsonObject &params)

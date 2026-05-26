@@ -746,26 +746,46 @@ bool PythonBridge::initialize(const QString &venvPath, const QString &pythonHome
             return false;
         }
 
-        // Monkey-patch CorneaRax720.__init__ to serialize construction.
-        // rj1lib_external.config has shared module-level state (CHIP, CFGBits,
-        // OPTBits, regs, subregs) that select_chip() modifies during init.
-        // Concurrent constructors cause race conditions on this shared state.
-        // The lock serializes constructors only; other operations (setBrightness,
-        // writeFrame, etc.) are unaffected.
+        // Monkey-patch CorneaRax720 init paths to serialize construction.
+        // rj1lib_external.config exposes CHIP / CHIPSEL / CFGBits / OPTBits /
+        // regs / subregs as MODULE-LEVEL globals; select_chip() mutates them.
+        // Concurrent invocations from different panel threads observed 52%
+        // race rate in pure-Python bench (verify_chip_race.py 2026-05-20)
+        // and produce the production NACK / "No answer from FTDI" cascades.
+        //
+        // v1.1.18 fix scope: wrap BOTH __init__ AND system_power_on. v1.1.13
+        // wrapped only __init__, but per the rax_lib docs system_power_on
+        // is equivalent to running init_cornea(...) again when hardware has
+        // no VSYS rail enable — that path was unprotected, so a powerOn on
+        // a previously-constructed instance still raced. system_power_off
+        // not wrapped (no init_cornea inside; only PMIC writes).
+        //
+        // Print on apply success too so we can grep production startup log
+        // to confirm the patch fired (previously only logged on failure).
         PyRun_SimpleString(
-            "def _patch_cornea_init():\n"
+            "def _patch_cornea_init_lock():\n"
             "    try:\n"
-            "        import threading\n"
+            "        import threading, functools\n"
             "        import ar_display_lab_lib.control_boards.cornea_rax720 as _mod\n"
             "        _init_lock = threading.Lock()\n"
-            "        _orig_init = _mod.CorneaRax720.__init__\n"
-            "        def _locked_init(self, *args, **kwargs):\n"
-            "            with _init_lock:\n"
-            "                _orig_init(self, *args, **kwargs)\n"
-            "        _mod.CorneaRax720.__init__ = _locked_init\n"
+            "        _mod._init_lock = _init_lock  # exposed for diagnostics\n"
+            "        wrapped = []\n"
+            "        for name in ('__init__', 'system_power_on'):\n"
+            "            orig = getattr(_mod.CorneaRax720, name, None)\n"
+            "            if orig is None:\n"
+            "                continue\n"
+            "            def _make_wrapper(orig_fn):\n"
+            "                @functools.wraps(orig_fn)\n"
+            "                def _wrapper(self, *args, **kwargs):\n"
+            "                    with _init_lock:\n"
+            "                        return orig_fn(self, *args, **kwargs)\n"
+            "                return _wrapper\n"
+            "            setattr(_mod.CorneaRax720, name, _make_wrapper(orig))\n"
+            "            wrapped.append(name)\n"
+            "        print(f'CorneaRax720 _init_lock applied to {wrapped}')\n"
             "    except Exception as e:\n"
-            "        print(f'Warning: failed to patch CorneaRax720 init: {e}')\n"
-            "_patch_cornea_init()\n"
+            "        print(f'Warning: failed to apply CorneaRax720 _init_lock: {e}')\n"
+            "_patch_cornea_init_lock()\n"
         );
 
         // Create a ThreadPoolExecutor for parallel device creation.
