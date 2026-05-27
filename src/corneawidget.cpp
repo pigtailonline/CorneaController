@@ -111,10 +111,22 @@ bool CorneaWidget::loadConfig(const QString &configPath)
     // it actually repaints; the per-preInit blocking call still freezes
     // the GUI briefly, but at least the "X/N" + current serial label keeps
     // moving and the operator sees progress.
+    // Subprocess mode skips pre-init entirely. Each panel's python.exe
+    // child does its own cornea_rax720 ctor on the first createDeviceInstance
+    // (triggered by the user clicking PowerOn or by TCP powerOn). Running
+    // pre-init in the embedded interpreter would claim the FT4232 USB
+    // interface here and force the subprocess into libusb's "could not
+    // claim interface" failure mode — same root cause as the 2026-05-27
+    // 07:41 cascade we just diagnosed.
     QList<DeviceControlPanel*> toPreInit;
-    for (DeviceControlPanel *panel : m_devicePanels) {
-        CorneaController *ctrl = panel->controller();
-        if (ctrl && !ctrl->isConnected()) toPreInit.append(panel);
+    if (!m_pythonBridge || !m_pythonBridge->useSubprocess()) {
+        for (DeviceControlPanel *panel : m_devicePanels) {
+            CorneaController *ctrl = panel->controller();
+            if (ctrl && !ctrl->isConnected()) toPreInit.append(panel);
+        }
+    } else {
+        appendLog("Subprocess mode: skipping embedded pre-init "
+                  "(each panel will init in its own python.exe on powerOn).");
     }
     QProgressDialog progress(QString(), QString(), 0, toPreInit.size(), this);
     progress.setWindowTitle(QStringLiteral("Cornea Controller"));
@@ -203,6 +215,23 @@ bool CorneaWidget::initializePythonBridge()
     appendLog(QString("SPI clock freq: %1 MHz (from config)").arg(py.spiClkFreq / 1e6, 0, 'f', 1));
     m_pythonBridge->setLogApl(py.logApl);
     appendLog(QString("write_rj1_frame log_apl: %1 (from config)").arg(py.logApl ? "true" : "false"));
+    // Phase 2 subprocess mode. When enabled, each panel runs in its own
+    // python.exe via panel_worker.py — sidesteps the GIL cascade. Worker
+    // script defaults to <appdir>/python/panel_worker.py beside the exe;
+    // python.exe defaults to <venv>/Scripts/python.exe. Operators can
+    // override both via the python.use_subprocess / python.worker_script
+    // config keys.
+    if (py.useSubprocess) {
+        m_pythonBridge->setUseSubprocess(true);
+        QString workerScript = py.workerScriptPath;
+        if (workerScript.isEmpty()) {
+            workerScript = QCoreApplication::applicationDirPath() + "/python/panel_worker.py";
+        }
+        m_pythonBridge->setWorkerScript(workerScript);
+        const QString pyExe = py.venvPath + "/Scripts/python.exe";
+        m_pythonBridge->setSubprocessPythonExe(pyExe);
+        appendLog(QString("Subprocess mode ENABLED: python.exe=%1, worker=%2").arg(pyExe, workerScript));
+    }
     if (!m_pythonBridge->initialize(py.venvPath, py.pythonHome, py.dllPaths, py.calPath, py.allowDefaultHdf5)) {
         appendLog("Warning: Failed to initialize Python bridge. Check config paths.");
         QMessageBox::warning(this, "Initialization Warning",

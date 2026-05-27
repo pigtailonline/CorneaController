@@ -28,6 +28,10 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QBuffer>
+#include "panelsubprocess.h"
 #include <QMap>
 #include <QMetaObject>
 #include <QMutex>
@@ -1189,6 +1193,78 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
     emit logMessage(QString("[SIM] Device instance %1 created: %2").arg(instanceId).arg(serial));
     return instanceId;
 #endif
+
+    // Phase 2 subprocess mode: each panel gets its own python.exe child
+    // running panel_worker.py. The child's CorneaRax720 ctor (init_cornea
+    // + init_rj1 sequence) runs in a fresh interpreter and CANNOT contend
+    // with other panels' GIL — see bench_concurrent_cascade.py 2026-05-27
+    // for the embedded-Python failure mode this replaces.
+    if (m_useSubprocess) {
+        const int instanceId = m_nextInstanceId++;
+        emit logMessage(QString("[Instance %1] Spawning subprocess for device index %2 (variant: %3)...")
+                            .arg(instanceId).arg(deviceIndex).arg(hardwareVariant));
+
+        // No parent: PanelSubprocess moves itself to its own QThread in its
+        // ctor, and we'd otherwise hit Qt's "Cannot create children for a
+        // parent that is in a different thread" when createDeviceInstance
+        // is called from a TCP worker thread (which is most of them).
+        // Lifetime is manually managed via m_panelProcs + delete in
+        // destroyDeviceInstance.
+        auto *proc = new PanelSubprocess(nullptr);
+        proc->setPythonExe(m_subprocessPythonExe);
+        proc->setWorkerScript(m_workerScript);
+        // Qt::QueuedConnection because the signal fires on PanelSubprocess's
+        // worker thread; the slot mutates state owned by PythonBridge (logs)
+        // so it must hop over to PythonBridge's thread.
+        connect(proc, &PanelSubprocess::logMessage, this,
+                [this, instanceId](const QString &line) {
+                    emit logMessage(QString("[Instance %1] %2").arg(instanceId).arg(line));
+                },
+                Qt::QueuedConnection);
+
+        if (!proc->spawn(10000)) {
+            emit logMessage(QString("[Instance %1] subprocess spawn failed").arg(instanceId));
+            delete proc;
+            m_nextInstanceId--;
+            return -1;
+        }
+
+        QJsonObject initArgs{
+            {"cornea_index",       deviceIndex},
+            {"hardware_variant",   hardwareVariant},
+            {"cal_path",           m_calPath},
+            {"init_cornea",        true},
+            {"init_rj1",           true},
+            {"allow_default_hdf5", m_allowDefaultHdf5},
+            {"spi_clk_freq",       m_spiClkFreq},
+        };
+        // 60 s is generous for a cold cornea_rax720 ctor (typical 5–30 s
+        // including FTDI enum + RJ1 init + cal file load).
+        const QJsonObject reply = proc->sendBlocking("init", initArgs, 60000);
+        if (!reply.value("success").toBool()) {
+            emit logMessage(QString("[Instance %1] init failed: %2")
+                                .arg(instanceId).arg(reply.value("error").toString()));
+            proc->stop(3000);
+            delete proc;
+            m_nextInstanceId--;
+            return -1;
+        }
+
+        const QJsonObject data = reply.value("data").toObject();
+        const bool initOk = data.value("init_ok").toBool();
+        const QString serial = data.value("cornea_serial").toString();
+        {
+            QMutexLocker lock(&m_panelProcsMutex);
+            m_panelProcs.insert(instanceId, proc);
+        }
+        m_initOkMap[instanceId] = initOk;
+        m_serialMap[instanceId] = serial;
+        emit logMessage(QString("[Instance %1] subprocess ready (pid=%2, serial=%3, init_ok=%4, %5 ms)")
+                            .arg(instanceId).arg(proc->processId()).arg(serial)
+                            .arg(initOk).arg(data.value("duration_ms").toInt()));
+        return instanceId;
+    }
+
     return dispatch([this, deviceIndex, hardwareVariant]() -> int {
         if (!m_initialized) {
             setError("Python bridge not initialized");
@@ -1424,6 +1500,35 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
     emit logMessage(QString("[SIM] Device instance %1 destroyed").arg(instanceId));
     return;
 #endif
+
+    // Subprocess path: send shutdown, wait, kill on hang. Python's
+    // process exit handles cornea_rax720 instance teardown (rax_lib's
+    // __del__ runs on python.exe shutdown), and the OS releases the
+    // FT4232 USB claim when the process dies. Much simpler than the
+    // embedded-Python teardown below.
+    if (m_useSubprocess) {
+        PanelSubprocess *proc = nullptr;
+        {
+            QMutexLocker lock(&m_panelProcsMutex);
+            proc = m_panelProcs.take(instanceId);
+        }
+        m_initOkMap.remove(instanceId);
+        const QString serial = m_serialMap.take(instanceId);
+        if (proc) {
+            proc->stop(5000);
+            // Plain delete (NOT deleteLater): deleteLater posts the deletion
+            // event to proc's home thread (its own worker thread). The
+            // destructor then calls m_workerThread.wait() — which would
+            // deadlock waiting for itself to exit. Synchronous delete on
+            // the caller's thread avoids that; the ~PanelSubprocess runs
+            // here and its m_workerThread is a foreign thread it can wait on.
+            delete proc;
+            emit logMessage(QString("[Instance %1] subprocess stopped (serial=%2)")
+                                .arg(instanceId).arg(serial));
+        }
+        return;
+    }
+
     // Run the Python teardown on the device's own worker thread if it has
     // one (ensures no other call is mid-flight on this instance). Falls
     // back to the main worker via dispatchVoid if no device worker exists.
@@ -1467,6 +1572,11 @@ bool PythonBridge::isDeviceConnected(int instanceId) const
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return m_simDevices.contains(instanceId) && m_simDevices[instanceId].connected;
 #endif
+    if (m_useSubprocess) {
+        QMutexLocker lock(&m_panelProcsMutex);
+        PanelSubprocess *proc = m_panelProcs.value(instanceId, nullptr);
+        return proc != nullptr && proc->isRunning();
+    }
     // Map is only modified on Python thread, reads from main thread are safe
     // for QMap (non-concurrent reads are OK if no concurrent write).
     // Since callers typically check this before dispatching Python work,
@@ -1501,6 +1611,11 @@ bool PythonBridge::systemPowerOn(int instanceId)
     m_simDevices[instanceId].connected = true;
     return true;
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "powerOn", {}, 60000);
+        return reply.value("success").toBool()
+               && reply.value("data").toObject().value("init_ok").toBool();
+    }
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_on");
         if (!result) {
@@ -1538,6 +1653,10 @@ bool PythonBridge::systemPowerOff(int instanceId)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].connected = false;
     return true;
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "powerOff", {}, 30000);
+        return reply.value("success").toBool();
+    }
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_off");
         if (result) {
@@ -1577,6 +1696,11 @@ bool PythonBridge::setBrightness(int instanceId, double level)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].brightness = level;
     return m_simDevices.contains(instanceId);
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "setBrightness",
+                                                  QJsonObject{{"level", level}}, 10000);
+        return reply.value("success").toBool();
+    }
     return dispatchToDevice(instanceId, [this, instanceId, level]() -> bool {
         PyObject *args = PyTuple_Pack(1, PyFloat_FromDouble(level));
         PyObject *result = callInstanceMethod(instanceId, "set_brightness", args);
@@ -1595,6 +1719,11 @@ double PythonBridge::getBrightness(int instanceId)
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return m_simDevices.contains(instanceId) ? m_simDevices[instanceId].brightness : -1.0;
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "getBrightness", {}, 10000);
+        if (!reply.value("success").toBool()) return -1.0;
+        return reply.value("data").toObject().value("level").toDouble(-1.0);
+    }
     return dispatchToDevice(instanceId, [this, instanceId]() -> double {
         PyObject *result = callInstanceMethod(instanceId, "get_brightness");
         if (result) {
@@ -1612,6 +1741,11 @@ bool PythonBridge::setXFlip(int instanceId, bool flip)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].xFlip = flip;
     return m_simDevices.contains(instanceId);
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "setXFlip",
+                                                  QJsonObject{{"flip", flip}}, 10000);
+        return reply.value("success").toBool();
+    }
     return dispatchToDevice(instanceId, [this, instanceId, flip]() -> bool {
         PyObject *args = PyTuple_Pack(2, flip ? Py_True : Py_False, Py_None);
         PyObject *result = callInstanceMethod(instanceId, "rj1_set_x_flip_offset", args);
@@ -1631,6 +1765,11 @@ bool PythonBridge::setYFlip(int instanceId, bool flip)
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].yFlip = flip;
     return m_simDevices.contains(instanceId);
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "setYFlip",
+                                                  QJsonObject{{"flip", flip}}, 10000);
+        return reply.value("success").toBool();
+    }
     return dispatchToDevice(instanceId, [this, instanceId, flip]() -> bool {
         PyObject *args = PyTuple_Pack(2, flip ? Py_True : Py_False, Py_None);
         PyObject *result = callInstanceMethod(instanceId, "rj1_set_y_flip_offset", args);
@@ -1649,6 +1788,11 @@ bool PythonBridge::getXFlip(int instanceId)
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return m_simDevices.contains(instanceId) ? m_simDevices[instanceId].xFlip : false;
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "getXFlip", {}, 10000);
+        if (!reply.value("success").toBool()) return false;
+        return reply.value("data").toObject().value("flip").toBool();
+    }
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "rj1_get_x_flip_offset");
         if (result && PyTuple_Check(result) && PyTuple_Size(result) >= 1) {
@@ -1667,6 +1811,11 @@ bool PythonBridge::getYFlip(int instanceId)
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return m_simDevices.contains(instanceId) ? m_simDevices[instanceId].yFlip : false;
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "getYFlip", {}, 10000);
+        if (!reply.value("success").toBool()) return false;
+        return reply.value("data").toObject().value("flip").toBool();
+    }
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "rj1_get_y_flip_offset");
         if (result && PyTuple_Check(result) && PyTuple_Size(result) >= 1) {
@@ -1688,6 +1837,21 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image)
     simStallSleep(SIM_DELAY_MS);
     return m_simDevices.contains(instanceId);
 #endif
+    if (m_useSubprocess) {
+        // Save the image to a temp PNG and pass the path. Phase 2 keeps
+        // this file-based to avoid encoding raw RGB bytes into JSON;
+        // Phase 3 can add a stdin binary side-channel for higher
+        // throughput if needed.
+        const QString tmpPath = QDir::tempPath()
+            + QString("/cc_frame_inst%1.png").arg(instanceId);
+        if (!image.save(tmpPath, "PNG")) {
+            setError(QString("writeFrame: failed to save temp image to %1").arg(tmpPath));
+            return false;
+        }
+        const QJsonObject reply = subprocessCall(
+            instanceId, "sendImage", QJsonObject{{"path", tmpPath}}, 30000);
+        return reply.value("success").toBool();
+    }
     return dispatchToDevice(instanceId, [this, instanceId, image]() -> bool {
         PyObject *instance = getDeviceInstance(instanceId);
         if (!instance) {
@@ -1790,6 +1954,16 @@ QVariantMap PythonBridge::getChipInfoDecoded(int instanceId)
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     return getChipInfo(instanceId);
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "getChipInfoDecoded", {}, 10000);
+        QVariantMap out;
+        if (!reply.value("success").toBool()) return out;
+        const QJsonObject info = reply.value("data").toObject().value("info").toObject();
+        for (auto it = info.begin(); it != info.end(); ++it) {
+            out.insert(it.key(), it.value().toVariant());
+        }
+        return out;
+    }
     return dispatchToDevice(instanceId, [this, instanceId]() -> QVariantMap {
         QVariantMap result;
         PyObject *pyResult = callInstanceMethod(instanceId, "get_rj1_chip_info_decoded");
@@ -1838,6 +2012,11 @@ double PythonBridge::getLeaTemperature(int instanceId)
     simStallSleep(SIM_DELAY_MS);
     return 25.0 + QRandomGenerator::global()->bounded(5.0);
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "getTemperature", {}, 10000);
+        if (!reply.value("success").toBool()) return -999.0;
+        return reply.value("data").toObject().value("temperature").toDouble(-999.0);
+    }
     return dispatchToDevice(instanceId, [this, instanceId]() -> double {
         PyObject *instance = getDeviceInstance(instanceId);
         if (!instance) {
@@ -1882,6 +2061,11 @@ double PythonBridge::getDa9272Temperature(int instanceId)
     Q_UNUSED(instanceId);
     return 24.0 + QRandomGenerator::global()->bounded(4.0);
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "getDa9272Temperature", {}, 10000);
+        if (!reply.value("success").toBool()) return -999.0;
+        return reply.value("data").toObject().value("temperature").toDouble(-999.0);
+    }
     return dispatchToDevice(instanceId, [this, instanceId]() -> double {
         PyObject *result = callInstanceMethod(instanceId, "get_da9272_temperature");
         if (result && result != Py_None) {
@@ -1970,6 +2154,11 @@ QString PythonBridge::getPanelId(int instanceId)
     simStallSleep(SIM_DELAY_MS);
     return QString("SIM-PANEL-%1").arg(instanceId);
 #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCall(instanceId, "getPanelId", {}, 10000);
+        if (!reply.value("success").toBool()) return QString();
+        return reply.value("data").toObject().value("panel_id").toString();
+    }
     return dispatchToDevice(instanceId, [this, instanceId]() -> QString {
         PyObject *result = callInstanceMethod(instanceId, "get_rj1_chip_info_decoded");
         if (result && PyDict_Check(result)) {
@@ -2124,6 +2313,27 @@ QVariantMap PythonBridge::getDemuraRlutState(int instanceId)
         }
         return result;
     });
+}
+
+QJsonObject PythonBridge::subprocessCall(int instanceId, const QString &cmd,
+                                          const QJsonObject &args, int timeoutMs)
+{
+    // Per-instance route. The per-device worker thread serializes calls
+    // for one panel; PanelSubprocess itself isn't internally locked, but
+    // the single-thread-per-panel guarantee from caller side is enough.
+    PanelSubprocess *proc = nullptr;
+    {
+        QMutexLocker lock(&m_panelProcsMutex);
+        proc = m_panelProcs.value(instanceId, nullptr);
+    }
+    if (!proc || !proc->isRunning()) {
+        QJsonObject err{
+            {"success", false},
+            {"error", QString("subprocess for instance %1 not running").arg(instanceId)}
+        };
+        return err;
+    }
+    return proc->sendBlocking(cmd, args, timeoutMs);
 }
 
 void PythonBridge::flushPythonOutput()

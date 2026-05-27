@@ -37,7 +37,8 @@ SOURCES += \
     src/corneacontroller.cpp \
     src/imageloader.cpp \
     src/devicecontrolpanel.cpp \
-    src/tcpserver.cpp
+    src/tcpserver.cpp \
+    src/panelsubprocess.cpp
 
 HEADERS += \
     src/corneawidget.h \
@@ -46,7 +47,8 @@ HEADERS += \
     src/corneacontroller.h \
     src/imageloader.h \
     src/devicecontrolpanel.h \
-    src/tcpserver.h
+    src/tcpserver.h \
+    src/panelsubprocess.h
 
 FORMS += \
     src/corneawidget.ui
@@ -54,9 +56,24 @@ FORMS += \
 RESOURCES += \
     resources/resources.qrc
 
-# Copy Python DLL
+# Copy Python DLL + panel_worker.py to the build output. panel_worker.py
+# lives in <exe>/python/ so CorneaWidget's default workerScriptPath resolver
+# (QCoreApplication::applicationDirPath() + "/python/panel_worker.py") finds
+# it without any operator setup. Same idea for the Phase 1 smoke test.
+#
+# qmake places release/debug exes in $$OUT_PWD/release or $$OUT_PWD/debug
+# (Windows convention with the default win32-msvc spec). Mirror that.
 win32 {
-    QMAKE_POST_LINK += $$quote(cmd /c copy /Y \"$$PYTHON_PATH\\python312.dll\" \"$$OUT_PWD\")
+    CONFIG(release, debug|release):  EXE_DIR = $$OUT_PWD/release
+    CONFIG(debug, debug|release):    EXE_DIR = $$OUT_PWD/debug
+    PANEL_WORKER_SRC = $$shell_path($$PWD/python/panel_worker.py)
+    SMOKE_TEST_SRC   = $$shell_path($$PWD/python/smoke_test_worker.py)
+    PANEL_WORKER_DST = $$shell_path($$EXE_DIR/python)
+    EXE_DIR_NATIVE   = $$shell_path($$EXE_DIR)
+    QMAKE_POST_LINK += $$quote(cmd /c copy /Y \"$$PYTHON_PATH\\python312.dll\" \"$$EXE_DIR_NATIVE\")
+    QMAKE_POST_LINK += $$escape_expand(\\n\\t)$$quote(cmd /c if not exist \"$$PANEL_WORKER_DST\" mkdir \"$$PANEL_WORKER_DST\")
+    QMAKE_POST_LINK += $$escape_expand(\\n\\t)$$quote(cmd /c copy /Y \"$$PANEL_WORKER_SRC\" \"$$PANEL_WORKER_DST\")
+    QMAKE_POST_LINK += $$escape_expand(\\n\\t)$$quote(cmd /c copy /Y \"$$SMOKE_TEST_SRC\" \"$$PANEL_WORKER_DST\")
 }
 
 # Default rules for deployment

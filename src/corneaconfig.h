@@ -16,6 +16,18 @@ struct PythonConfig {
     // Default false here = quieter logs + higher throughput. Flip to true
     // when debugging APL / brightness behavior.
     bool logApl = false;
+    // Phase 2 (v1.1.20): each panel routes through its own python.exe
+    // subprocess running panel_worker.py via stdin/stdout JSON-RPC.
+    // Sidesteps the cross-panel GIL contention documented in
+    // bench_concurrent_cascade.py 2026-05-27: embedded mode produced
+    // 14-second GIL holds and CC server lockups under 4+ panel
+    // concurrent load, subprocess mode kept the trigger powerOn under
+    // 2.2 s flat. Default ON since 2026-05-27 validation; set to false
+    // here to fall back to embedded interpreter for debugging.
+    bool useSubprocess = true;
+    // Where panel_worker.py lives. Empty = look beside CorneaController.exe
+    // at ./python/panel_worker.py.
+    QString workerScriptPath;
 };
 
 struct DeviceConfig {

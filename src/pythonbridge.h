@@ -11,7 +11,10 @@
 #include <QThread>
 #include <QMutex>
 #include <QRandomGenerator>
+#include <QJsonObject>
 #include <memory>
+
+class PanelSubprocess;
 
 // Forward declare Python types to avoid including Python.h in header
 struct _object;
@@ -41,6 +44,19 @@ public:
     double spiClkFreq() const { return m_spiClkFreq; }
     void setLogApl(bool on) { m_logApl = on; }
     bool logApl() const { return m_logApl; }
+
+    // Phase 2 subprocess mode toggles. When enabled, createDeviceInstance
+    // spawns a python.exe child running panel_worker.py and routes the
+    // critical-path operations (powerOn/Off, setBrightness, sendImage,
+    // getPanelId, getLeaTemperature) through it instead of the embedded
+    // interpreter — sidesteps the cross-panel GIL contention that caused
+    // 4+ panel cascade fails. workerScript defaults to
+    // <appdir>/python/panel_worker.py; pythonExe defaults to the venv's
+    // Scripts/python.exe relative to the configured venvPath.
+    void setUseSubprocess(bool on) { m_useSubprocess = on; }
+    bool useSubprocess() const { return m_useSubprocess; }
+    void setWorkerScript(const QString &path) { m_workerScript = path; }
+    void setSubprocessPythonExe(const QString &path) { m_subprocessPythonExe = path; }
     void shutdown();
     bool isInitialized() const { return m_initialized; }
 
@@ -140,6 +156,26 @@ private:
     QMap<int, bool> m_initOkMap;             // instanceId -> init_ok status
     QMap<int, QString> m_serialMap;          // instanceId -> serial number
     int m_nextInstanceId = 0;
+
+    // Phase 2 subprocess mode. When m_useSubprocess is true, each
+    // instanceId gets a PanelSubprocess in m_panelProcs INSTEAD of a
+    // PyObject* in m_deviceInstances. Operations route through the
+    // subprocess's JSON-RPC client. Mutex protects insertions /
+    // removals; per-instance reads are racy-but-OK after creation
+    // because instanceId allocation is single-threaded.
+    bool m_useSubprocess = false;
+    QString m_workerScript;
+    QString m_subprocessPythonExe;
+    QMap<int, PanelSubprocess*> m_panelProcs;
+    mutable QMutex m_panelProcsMutex;
+
+    // Helper that routes one JSON-RPC call to the panel's subprocess.
+    // Caller passes cmd + args; receives the full reply object so they
+    // can fish out the relevant "data" field with the correct type.
+    // Returns an object with success=false and an "error" string on
+    // any failure (no subprocess, send failed, worker reported error).
+    QJsonObject subprocessCall(int instanceId, const QString &cmd,
+                                const QJsonObject &args, int timeoutMs = 60000);
 
     // Main Python worker thread — used for interpreter init, module imports,
     // device enumeration, and other non-per-instance work. Per-instance ops
