@@ -223,14 +223,30 @@ bool CorneaWidget::initializePythonBridge()
     // config keys.
     if (py.useSubprocess) {
         m_pythonBridge->setUseSubprocess(true);
+
+        // Worker script: config key "worker_script" overrides, otherwise look
+        // beside the exe at ./python/panel_worker.py.
         QString workerScript = py.workerScriptPath;
         if (workerScript.isEmpty()) {
             workerScript = QCoreApplication::applicationDirPath() + "/python/panel_worker.py";
         }
         m_pythonBridge->setWorkerScript(workerScript);
-        const QString pyExe = py.venvPath + "/Scripts/python.exe";
-        m_pythonBridge->setSubprocessPythonExe(pyExe);
-        appendLog(QString("Subprocess mode ENABLED: python.exe=%1, worker=%2").arg(pyExe, workerScript));
+        if (!QFileInfo::exists(workerScript)) {
+            appendLog(QString("WARNING: panel_worker.py not found at: %1").arg(workerScript));
+        }
+
+        // Python exe: config key "python_exe" > venv_path/Scripts/python.exe > fallback.
+        QString pyExe = py.subprocessPythonExe;
+        if (pyExe.isEmpty()) {
+            pyExe = py.venvPath + "/Scripts/python.exe";
+        }
+        if (!QFileInfo::exists(pyExe)) {
+            appendLog(QString("WARNING: subprocess python.exe not found at: %1 — subprocess mode disabled").arg(pyExe));
+            m_pythonBridge->setUseSubprocess(false);
+        } else {
+            m_pythonBridge->setSubprocessPythonExe(pyExe);
+            appendLog(QString("Subprocess mode ENABLED: python.exe=%1, worker=%2").arg(pyExe, workerScript));
+        }
     }
     if (!m_pythonBridge->initialize(py.venvPath, py.pythonHome, py.dllPaths, py.calPath, py.allowDefaultHdf5)) {
         appendLog("Warning: Failed to initialize Python bridge. Check config paths.");

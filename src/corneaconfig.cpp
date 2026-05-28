@@ -84,6 +84,7 @@ bool CorneaConfig::load(const QString &path)
     // older config file, we still want subprocess on.
     m_python.useSubprocess = pythonObj["use_subprocess"].toBool(true);
     m_python.workerScriptPath = pythonObj["worker_script"].toString();
+    m_python.subprocessPythonExe = pythonObj["python_exe"].toString();
 
     m_python.dllPaths.clear();
     QJsonArray dllArray = pythonObj["dll_paths"].toArray();
@@ -135,6 +136,8 @@ bool CorneaConfig::save(const QString &path)
     pythonObj["log_apl"] = m_python.logApl;
     pythonObj["use_subprocess"] = m_python.useSubprocess;
     pythonObj["worker_script"] = m_python.workerScriptPath;
+    if (!m_python.subprocessPythonExe.isEmpty())
+        pythonObj["python_exe"] = m_python.subprocessPythonExe;
 
     QJsonArray dllArray;
     for (const auto &dll : m_python.dllPaths) {

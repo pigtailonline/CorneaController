@@ -28,6 +28,10 @@ struct PythonConfig {
     // Where panel_worker.py lives. Empty = look beside CorneaController.exe
     // at ./python/panel_worker.py.
     QString workerScriptPath;
+    // Full path to python.exe for subprocess mode. Empty = derive from
+    // venv_path + "/Scripts/python.exe". Set this when the venv python is not
+    // at the standard Scripts/ location (e.g. conda envs, custom layouts).
+    QString subprocessPythonExe;
 };
 
 struct DeviceConfig {
