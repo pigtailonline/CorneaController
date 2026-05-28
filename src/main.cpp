@@ -94,7 +94,7 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
 
     app.setApplicationName("Cornea Controller");
-    app.setApplicationVersion("1.1.20");
+    app.setApplicationVersion("1.1.21");
     app.setOrganizationName("Google AR Display Lab");
 
     // Setup file logging: <app_dir>/log/
