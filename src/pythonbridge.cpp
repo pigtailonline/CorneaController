@@ -846,12 +846,20 @@ void PythonBridge::shutdown()
     m_initialized = false;
     return;
 #endif
-    // First destroy per-device workers. Each destroyDeviceInstance dispatches
-    // the Python teardown to the device's own thread (which uses PyGILState)
-    // then tears down that thread, so references drop in the correct order.
+    // Tear down all panels. In subprocess mode iterate m_panelProcs;
+    // in embedded mode iterate m_deviceWorkers. Either way the
+    // destroyDeviceInstance branch picks the right path.
+    //
+    // Without this, subprocess panels stay LIT after the CC window
+    // closes (rax_lib's __del__ doesn't run reliably on process exit,
+    // and our cmd_shutdown didn't explicitly power off either — the
+    // panel hardware just keeps the rails up until reset).
     {
         QList<int> instanceIds;
-        {
+        if (m_useSubprocess) {
+            QMutexLocker lock(&m_panelProcsMutex);
+            instanceIds = m_panelProcs.keys();
+        } else {
             QMutexLocker lock(&m_deviceThreadsMutex);
             instanceIds = m_deviceWorkers.keys();
         }
@@ -1515,6 +1523,21 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
         m_initOkMap.remove(instanceId);
         const QString serial = m_serialMap.take(instanceId);
         if (proc) {
+            // Power off the panel hardware BEFORE killing the worker
+            // process. Without this the rails stay up — the rax_lib
+            // __del__ that would normally do power-down doesn't run
+            // reliably on process exit, so we have to do it explicitly
+            // via JSON-RPC while the subprocess is still alive.
+            // Bounded short timeout — if powerOff hangs we still want
+            // shutdown to finish, the next CC launch will re-init.
+            const QJsonObject offReply = proc->sendBlocking("powerOff", 5000);
+            if (!offReply.value("success").toBool()) {
+                emit logMessage(QString("[Instance %1] powerOff during teardown "
+                                        "failed (serial=%2): %3 — panel rails may "
+                                        "stay up until the next powerOn cycle")
+                                    .arg(instanceId).arg(serial)
+                                    .arg(offReply.value("error").toString()));
+            }
             proc->stop(5000);
             // Plain delete (NOT deleteLater): deleteLater posts the deletion
             // event to proc's home thread (its own worker thread). The

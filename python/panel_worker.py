@@ -270,9 +270,20 @@ class Worker:
         return {"alive": True, "pid": os.getpid(), "initialized": self.cornea is not None}
 
     def cmd_shutdown(self, args: dict) -> dict:
-        # Stop the main loop. Letting Python destruct the cornea instance
-        # naturally on process exit handles cleanup; if rax_lib's __del__
-        # blocks we can swap to explicit teardown in Phase 2.
+        # Best-effort explicit power-off of the panel before we exit.
+        # Python's __del__ on cornea_rax720 is unreliable at process exit
+        # (interpreter teardown order, daemon-thread cleanup, etc.), so
+        # leaving the power-off to GC means the panel rails stay up and
+        # the operator sees "驅動板軟件 关机了光机还是亮的". CC's
+        # destroyDeviceInstance also sends a powerOff before this, but
+        # having it here protects standalone uses (tests, smoke runs).
+        if self.cornea is not None:
+            try:
+                self.cornea.system_power_off()
+                log.info("system_power_off OK during shutdown")
+            except Exception as e:
+                log.warning("system_power_off during shutdown raised: %s", e)
+        # Returning {"goodbye": True} signals the main loop to break.
         return {"goodbye": True}
 
 
