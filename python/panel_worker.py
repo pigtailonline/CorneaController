@@ -59,6 +59,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -75,6 +76,21 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("panel_worker")
+
+
+class _PowerErrorCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = record.getMessage()
+        if (
+            "Failed to complete cornea_power_down" in msg
+            or "Failure to sequence power supplies" in msg
+            or "NACK from slave" in msg
+        ):
+            self.messages.append(msg)
 
 
 def emit(resp: dict) -> None:
@@ -100,10 +116,17 @@ class Worker:
     def __init__(self):
         self.cornea = None              # CorneaRax720 instance
         self.cached_temp: float = -999.0  # last successful get_lea_temperature
+        self.cal_path: str = ""
+        self.defect_map_output_root: str = ""
+        self.python_exe: str = sys.executable
+        self._exported_defect_map_ids: set[str] = set()
 
     def cmd_init(self, args: dict) -> dict:
         if self.cornea is not None:
             return {"already_initialized": True}
+
+        self.cal_path = str(args.get("cal_path", ""))
+        self.defect_map_output_root = str(args.get("defect_map_output_root", ""))
 
         # Import deferred — keeps `ping` / `init` self-tests fast and lets
         # the parent test stdin/stdout wiring without paying the ~1-3 s
@@ -130,10 +153,18 @@ class Worker:
         dt_ms = int((time.monotonic() - t0) * 1000)
         log.info("CorneaRax720 ctor done in %d ms (variant=%s, index=%d)",
                  dt_ms, kwargs["hardware_variant"], kwargs["cornea_index"])
+        init_ok = bool(getattr(self.cornea, "init_ok", True))
+        panel_id = self._require_panel_id("init") if init_ok else ""
         return {
-            "init_ok": bool(getattr(self.cornea, "init_ok", True)),
+            "init_ok": init_ok,
             "cornea_serial": getattr(self.cornea, "cornea_serial", None),
+            "panel_id": panel_id,
             "duration_ms": dt_ms,
+            "defect_maps": self._export_defect_maps_once(panel_id) if init_ok else {
+                "ok": False,
+                "skipped": True,
+                "reason": "init_not_ok",
+            },
         }
 
     def _require(self):
@@ -141,18 +172,118 @@ class Worker:
             raise RuntimeError("instance not initialized; call 'init' first")
         return self.cornea
 
+    def _current_panel_id(self) -> str:
+        c = self._require()
+        state_vals = getattr(c, "state_vals", None)
+        if isinstance(state_vals, dict):
+            for key in ("unique_chip_id_str", "panel_ucid", "ucid"):
+                value = state_vals.get(key)
+                if value:
+                    return str(value)
+
+        info = c.get_rj1_chip_info_decoded()
+        return str(info.get("unique_chip_id_str", ""))
+
+    def _require_panel_id(self, operation: str) -> str:
+        panel_id = self._current_panel_id().strip()
+        if not panel_id:
+            raise RuntimeError(f"{operation} failed: empty Panel ID / UCID")
+        return panel_id
+
+    def _defect_map_output_dir(self, panel_id: str) -> Path:
+        if self.defect_map_output_root:
+            return Path(self.defect_map_output_root) / panel_id
+        return Path(self.cal_path) / "defect_maps" / panel_id
+
+    def _export_defect_maps_once(self, panel_id: str) -> dict:
+        if not panel_id:
+            return {"ok": False, "skipped": True, "reason": "empty_panel_id"}
+        if not self.cal_path:
+            return {"ok": False, "skipped": True, "reason": "empty_cal_path"}
+
+        output_dir = self._defect_map_output_dir(panel_id)
+        if panel_id in self._exported_defect_map_ids:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "already_exported",
+                "output_path": str(output_dir),
+            }
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            self.python_exe,
+            "-m",
+            "ar_display_lab_lib.utilities.data_structures.hdf5_cal_file_updater",
+            self.cal_path,
+            panel_id,
+            "--get-defect-maps",
+            str(output_dir),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except Exception as e:
+            log.warning("defect map export failed for panel %s: %s", panel_id, e)
+            return {"ok": False, "error": str(e), "output_path": str(output_dir)}
+
+        if result.returncode != 0:
+            error = (result.stderr or result.stdout or "").strip()
+            log.warning("defect map export failed for panel %s: %s", panel_id, error)
+            return {"ok": False, "error": error, "output_path": str(output_dir)}
+
+        self._exported_defect_map_ids.add(panel_id)
+        log.info("defect maps exported for panel %s -> %s", panel_id, output_dir)
+        return {"ok": True, "output_path": str(output_dir)}
+
+    def _maybe_export_defect_maps(self) -> dict:
+        try:
+            return self._export_defect_maps_once(self._current_panel_id())
+        except Exception as e:
+            log.warning("defect map auto-export skipped: %s", e)
+            return {"ok": False, "error": str(e)}
+
     def cmd_powerOn(self, args: dict) -> dict:
         c = self._require()
         # rax_lib returns init_ok (bool). False means panel did not respond
         # (Pogo unseated / brown-out / etc.) but no exception is thrown —
         # mirror CC's PythonBridge::systemPowerOn handling so the parent
         # doesn't misinterpret a "False" return as "success".
-        result = c.system_power_on()
-        return {"init_ok": bool(result)}
+        capture = _PowerErrorCapture()
+        cornea_logger = getattr(c, "logger", None)
+        if cornea_logger is not None:
+            cornea_logger.addHandler(capture)
+        try:
+            result = c.system_power_on()
+        finally:
+            if cornea_logger is not None:
+                cornea_logger.removeHandler(capture)
+        data = {"init_ok": bool(result)}
+        if not result and capture.messages:
+            raise RuntimeError(capture.messages[-1])
+        if result:
+            panel_id = self._require_panel_id("powerOn")
+            data["panel_id"] = panel_id
+            data["defect_maps"] = self._export_defect_maps_once(panel_id)
+        return data
 
     def cmd_powerOff(self, args: dict) -> dict:
         c = self._require()
-        c.system_power_off()
+        capture = _PowerErrorCapture()
+        cornea_logger = getattr(c, "logger", None)
+        if cornea_logger is not None:
+            cornea_logger.addHandler(capture)
+        try:
+            c.system_power_off()
+        finally:
+            if cornea_logger is not None:
+                cornea_logger.removeHandler(capture)
+        if capture.messages:
+            raise RuntimeError(capture.messages[-1])
         return {}
 
     def cmd_setBrightness(self, args: dict) -> dict:
@@ -166,12 +297,14 @@ class Worker:
         return {"level": float(c.get_brightness())}
 
     def cmd_getPanelId(self, args: dict) -> dict:
-        c = self._require()
         # rax_lib exposes panel UCID through the RJ1 chip info dict.
         # When the panel hasn't been programmed yet (cold pre-init state)
         # the field is absent — return empty string rather than raising.
-        info = c.get_rj1_chip_info_decoded()
-        return {"panel_id": str(info.get("unique_chip_id_str", ""))}
+        panel_id = self._require_panel_id("getPanelId")
+        return {
+            "panel_id": panel_id,
+            "defect_maps": self._export_defect_maps_once(panel_id),
+        }
 
     def cmd_getTemperature(self, args: dict) -> dict:
         c = self._require()
@@ -204,8 +337,11 @@ class Worker:
         elif ext in (".png", ".jpg", ".jpeg", ".bmp"):
             from PIL import Image  # pillow is in station_venv already
             import numpy as np
+            # PIL loads as RGB; write_rj1_frame expects BGR (opencv_frame default).
+            # Reverse channel order to match the non-subprocess C++ path which
+            # builds BGR via qimageToPyArray + passes opencv_frame=True.
             img = Image.open(path).convert("RGB")
-            frame = np.array(img)
+            frame = np.array(img)[:, :, ::-1]  # RGB → BGR
         else:
             raise ValueError(f"unsupported image extension: {ext}")
 

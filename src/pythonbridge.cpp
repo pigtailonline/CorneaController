@@ -1261,15 +1261,25 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         const QJsonObject data = reply.value("data").toObject();
         const bool initOk = data.value("init_ok").toBool();
         const QString serial = data.value("cornea_serial").toString();
+        emit logMessage(QString("[Instance %1] subprocess ready (pid=%2, serial=%3, init_ok=%4, %5 ms)")
+                            .arg(instanceId).arg(proc->processId()).arg(serial)
+                            .arg(initOk).arg(data.value("duration_ms").toInt()));
+
+        if (!initOk) {
+            emit logMessage(QString("[Instance %1] hardware init failed (init_ok=0) — aborting connect")
+                                .arg(instanceId));
+            proc->stop(3000);
+            delete proc;
+            m_nextInstanceId--;
+            return -1;
+        }
+
         {
             QMutexLocker lock(&m_panelProcsMutex);
             m_panelProcs.insert(instanceId, proc);
         }
         m_initOkMap[instanceId] = initOk;
         m_serialMap[instanceId] = serial;
-        emit logMessage(QString("[Instance %1] subprocess ready (pid=%2, serial=%3, init_ok=%4, %5 ms)")
-                            .arg(instanceId).arg(proc->processId()).arg(serial)
-                            .arg(initOk).arg(data.value("duration_ms").toInt()));
         return instanceId;
     }
 
@@ -1636,8 +1646,21 @@ bool PythonBridge::systemPowerOn(int instanceId)
 #endif
     if (m_useSubprocess) {
         const QJsonObject reply = subprocessCall(instanceId, "powerOn", {}, 60000);
-        return reply.value("success").toBool()
-               && reply.value("data").toObject().value("init_ok").toBool();
+        if (!reply.value("success").toBool()) {
+            const QString error = reply.value("error").toString("powerOn subprocess failed");
+            setError(QString("[Instance %1] System power ON FAILED: %2").arg(instanceId).arg(error));
+            emit logMessage(m_lastError);
+            return false;
+        }
+        const QJsonObject data = reply.value("data").toObject();
+        if (!data.value("init_ok").toBool()) {
+            const QString error = QString("[Instance %1] System power ON returned init_ok=False").arg(instanceId);
+            setError(error);
+            emit logMessage(error);
+            return false;
+        }
+        emit logMessage(QString("[Instance %1] System power ON").arg(instanceId));
+        return true;
     }
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_on");
@@ -1678,7 +1701,14 @@ bool PythonBridge::systemPowerOff(int instanceId)
 #endif
     if (m_useSubprocess) {
         const QJsonObject reply = subprocessCall(instanceId, "powerOff", {}, 30000);
-        return reply.value("success").toBool();
+        if (!reply.value("success").toBool()) {
+            const QString error = reply.value("error").toString("powerOff subprocess failed");
+            setError(QString("[Instance %1] System power OFF FAILED: %2").arg(instanceId).arg(error));
+            emit logMessage(m_lastError);
+            return false;
+        }
+        emit logMessage(QString("[Instance %1] System power OFF").arg(instanceId));
+        return true;
     }
     return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_off");
