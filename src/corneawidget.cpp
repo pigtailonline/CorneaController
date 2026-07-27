@@ -17,6 +17,9 @@
 #include <QThread>
 #include <QProgressDialog>
 #include <QApplication>
+#include <QPointer>
+#include <QThreadPool>
+#include <QtConcurrent>
 
 CorneaWidget::CorneaWidget(QWidget *parent)
     : QWidget(parent)
@@ -32,6 +35,7 @@ CorneaWidget::CorneaWidget(QWidget *parent)
 
 CorneaWidget::~CorneaWidget()
 {
+    m_asyncGuard->store(false);
     m_pythonOutputTimer->stop();
 
     // Stop TCP server before deleting UI — TcpServer::stop() emits logMessage
@@ -40,6 +44,7 @@ CorneaWidget::~CorneaWidget()
         m_tcpServer->disconnect(this);
         m_tcpServer.reset();
     }
+    QThreadPool::globalInstance()->waitForDone();
 
     // Destroy device panels before members (PythonBridge) are destroyed.
     // Panels are QWidget children, normally destroyed in QWidget::~QWidget()
@@ -69,11 +74,13 @@ void CorneaWidget::shutdown()
     // destructor's tear-down order so a Ctrl-Q or window-X both exit cleanly:
     // stop the poll/TCP first (no more inbound work), tear down panels (so
     // Python instance references go away), then ask Python to finalize.
+    m_asyncGuard->store(false);
     m_pythonOutputTimer->stop();
     if (m_tcpServer) {
         m_tcpServer->disconnect(this);
         m_tcpServer.reset();
     }
+    QThreadPool::globalInstance()->waitForDone();
     qDeleteAll(m_devicePanels);
     m_devicePanels.clear();
     m_indexToPanelMap.clear();
@@ -154,7 +161,7 @@ bool CorneaWidget::loadConfig(const QString &configPath)
 
         appendLog(QString("Pre-init: %1 (variant=%2, FTDI only)...")
                   .arg(panel->deviceSerial(), variant));
-        if (ctrl->preInit(panel->deviceIndex(), variant)) {
+        if (ctrl->preInit(panel->deviceIndex(), variant, panel->deviceSerial())) {
             appendLog(QString("Pre-init: %1 OK").arg(panel->deviceSerial()));
         } else {
             appendLog(QString("Pre-init: %1 FAILED (will retry on powerOn)")
@@ -544,16 +551,14 @@ bool CorneaWidget::powerOnBySerial(const QString &serial)
 
     CorneaController *ctrl = panel->controller();
 
-    // Already connected and powered on — nothing to do
+    // Already connected and powered on: nothing to do.
     if (ctrl->isConnected() && ctrl->isPoweredOn()) return true;
 
-    // v1.1.19: always rebuild on powerOn (see devicecontrolpanel.cpp::powerOnCore
-    // for full rationale). Reverts v1.1.13 reuse path.
     if (ctrl->isConnected()) {
-        appendLog(QString("[PowerOn] %1 — destroying previous instance, fresh connect").arg(serial));
+        appendLog(QString("[PowerOn] %1 - destroying previous instance, fresh connect").arg(serial));
         ctrl->disconnect();
     }
-    return ctrl->connect(panel->deviceIndex(), panel->currentVariant());
+    return ctrl->connect(panel->deviceIndex(), panel->currentVariant(), serial);
 }
 
 bool CorneaWidget::powerOnBySerial(const QString &serial, const QString &variant)
@@ -561,14 +566,8 @@ bool CorneaWidget::powerOnBySerial(const QString &serial, const QString &variant
     DeviceControlPanel *panel = getPanelBySerial(serial);
     if (!panel) return false;
 
-    // Compare BEFORE updating the cache so we can decide whether a
-    // destroy+rebuild is actually warranted. Same-variant repeat calls
-    // (LEA flow re-sends powerOn with the JSON-baked variant on every
-    // test cycle) used to force a full disconnect/reconnect — that path
-    // is 5–30 s of FTDI re-enumeration AND triggers cornea_rax720's
-    // module-level instance teardown, which has historically been the
-    // source of multi-panel cascade fails. Skipping the rebuild when the
-    // variant hasn't changed cuts the slow path out entirely.
+    // Compare before updating the cache. If a previous instance is still
+    // connected with a different variant, rebuild it before the next power-on.
     const QString previousVariant = panel->currentVariant();
     const bool variantChanged = (previousVariant != variant);
 
@@ -582,23 +581,17 @@ bool CorneaWidget::powerOnBySerial(const QString &serial, const QString &variant
 
     if (ctrl->isConnected() && ctrl->isPoweredOn()) return true;
 
-    // Only destroy if the variant actually changed (different I2C address
-    // table / different chip set → must reinitialize). Otherwise reuse the
-    // existing instance and just toggle the power rails via system_power_on.
-    // v1.1.19's "always rebuild" rationale (avoid stale rj1lib/pyftdi
-    // globals across power cycles) still applies on a true variant switch
-    // — that's the rare case worth the cost.
+    // Normal production power-off disconnects the instance between DUTs.
+    // This branch only handles an already-connected controller state.
     if (ctrl->isConnected() && variantChanged) {
-        appendLog(QString("[PowerOn] %1 — variant changed (%2 -> %3), destroying previous instance, fresh connect")
+        appendLog(QString("[PowerOn] %1 - variant changed (%2 -> %3), destroying previous instance, fresh connect")
                   .arg(serial, previousVariant, variant));
         ctrl->disconnect();
     } else if (ctrl->isConnected()) {
-        // Same variant + already connected (pre-init kept FTDI alive) =>
-        // fast path: just bring rails up via system_power_on. No destroy.
-        appendLog(QString("[PowerOn] %1 — reusing instance (variant=%2)").arg(serial, variant));
+        appendLog(QString("[PowerOn] %1 - connected instance already present (variant=%2)").arg(serial, variant));
         return ctrl->powerOn();
     }
-    return ctrl->connect(panel->deviceIndex(), variant);
+    return ctrl->connect(panel->deviceIndex(), variant, serial);
 }
 
 bool CorneaWidget::powerOffBySerial(const QString &serial)
@@ -606,11 +599,8 @@ bool CorneaWidget::powerOffBySerial(const QString &serial)
     CorneaController *ctrl = getControllerBySerial(serial);
     if (!ctrl || !ctrl->isConnected()) return true;
 
-    // v1.1.19: full disconnect on powerOff (destroy Python instance).
-    // Pairs with always-rebuild on powerOn — guarantees no stale rj1lib /
-    // pyftdi globals carry across power cycles. The previous behavior
-    // ("keep SDK alive, software-off only") was the v1.1.13+ optimization
-    // that we suspect causes production half-dead state.
+    // Production changes panel/LEA frequently. Destroy the instance on
+    // power-off and let the next power-on bind a fresh one by serial.
     ctrl->disconnect();
     return !ctrl->isConnected();
 }
@@ -631,9 +621,32 @@ bool CorneaWidget::sendImageBySerial(const QString &serial, const QImage &image)
 
 bool CorneaWidget::setBrightnessBySerial(const QString &serial, double level)
 {
-    CorneaController *ctrl = getControllerBySerial(serial);
+    DeviceControlPanel *panel = getPanelBySerial(serial);
+    if (!panel) return false;
+
+    CorneaController *ctrl = panel->controller();
     if (!ctrl || !ctrl->isConnected()) return false;
-    return ctrl->setBrightness(level);
+    if (ctrl->setBrightness(level)) return true;
+
+    const QString firstError = ctrl->lastError();
+    if (firstError.contains(QStringLiteral("USB_BUSY_TIMEOUT"))) {
+        appendLog(QString("[setBrightness] %1 busy; not reconnecting a healthy worker: %2")
+                      .arg(serial, firstError));
+        return false;
+    }
+
+    appendLog(QString("[setBrightness] %1 failed at level=%2; reconnecting once before retry")
+                  .arg(serial).arg(level));
+    ctrl->disconnect();
+    if (!ctrl->connect(panel->deviceIndex(), panel->currentVariant(), serial)) {
+        appendLog(QString("[setBrightness] %1 reconnect failed after brightness error").arg(serial));
+        return false;
+    }
+
+    const bool retryOk = ctrl->setBrightness(level);
+    appendLog(QString("[setBrightness] %1 retry %2")
+                  .arg(serial, retryOk ? QStringLiteral("OK") : QStringLiteral("FAILED")));
+    return retryOk;
 }
 
 bool CorneaWidget::setFlipBySerial(const QString &serial, bool xFlip, bool yFlip)
@@ -677,7 +690,9 @@ ApiResult CorneaWidget::sendImageBySerialEx(const QString &serial, const QImage 
     if (ctrl->sendImage(image)) {
         return ApiResult::ok();
     }
-    return ApiResult::fail("Failed to send image to device");
+    const QString detail = ctrl->lastError();
+    return ApiResult::fail(
+        detail.isEmpty() ? QStringLiteral("Failed to send image to device") : detail);
 }
 
 ApiResult CorneaWidget::setBrightnessBySerialEx(const QString &serial, double level, bool waitProtection)
@@ -873,7 +888,22 @@ void CorneaWidget::setupConnections()
 void CorneaWidget::onRefreshDevicesClicked()
 {
     appendLog("Refreshing device list...");
-    refreshDeviceList();
+    ui->btnRefreshDevices->setEnabled(false);
+
+    auto guard = m_asyncGuard;
+    PythonBridge *bridge = m_pythonBridge.get();
+    QPointer<CorneaWidget> self(this);
+    QtConcurrent::run([self, guard, bridge]() {
+        if (!guard->load() || !self) return;
+        const QList<DeviceInfo> devices = bridge->getAvailableDevicesInfo();
+        if (!guard->load() || !self) return;
+
+        QMetaObject::invokeMethod(self, [self, guard, devices]() {
+            if (!guard->load() || !self) return;
+            self->applyDeviceList(devices);
+            self->ui->btnRefreshDevices->setEnabled(true);
+        }, Qt::QueuedConnection);
+    });
 }
 
 void CorneaWidget::refreshDeviceList()
@@ -882,7 +912,11 @@ void CorneaWidget::refreshDeviceList()
         return;
     }
 
-    QList<DeviceInfo> devices = m_pythonBridge->getAvailableDevicesInfo();
+    applyDeviceList(m_pythonBridge->getAvailableDevicesInfo());
+}
+
+void CorneaWidget::applyDeviceList(const QList<DeviceInfo> &devices)
+{
 
     // Fast path: if the USB enumeration returned the same serials in the same
     // order as our current panel set, every panel tab is already correct.

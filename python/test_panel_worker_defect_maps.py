@@ -28,6 +28,19 @@ class FakeCorneaPowerOffFailure:
         self.logger.error("Failed to complete cornea_power_down. e=I2cNackError('NACK from slave')")
 
 
+class FakeLoggerAdapter:
+    def __init__(self, logger):
+        self.logger = logger
+
+    def error(self, message):
+        self.logger.error(message)
+
+
+class FakeCorneaPowerOffFailureWithLoggerAdapter(FakeCorneaPowerOffFailure):
+    def __init__(self):
+        self.logger = FakeLoggerAdapter(logging.getLogger(f"{__name__}.FakeCorneaPowerOffFailureWithLoggerAdapter"))
+
+
 class FakeCorneaPowerOnFailure(FakeCornea):
     def __init__(self):
         super().__init__(panel_id="04830377")
@@ -115,6 +128,13 @@ class DefectMapExportTests(unittest.TestCase):
     def test_power_off_reports_failure_when_rax_lib_only_logs_cornea_power_down_error(self):
         worker = Worker()
         worker.cornea = FakeCorneaPowerOffFailure()
+
+        with self.assertRaisesRegex(RuntimeError, "Failed to complete cornea_power_down"):
+            worker.cmd_powerOff({})
+
+    def test_power_off_capture_supports_logger_adapter(self):
+        worker = Worker()
+        worker.cornea = FakeCorneaPowerOffFailureWithLoggerAdapter()
 
         with self.assertRaisesRegex(RuntimeError, "Failed to complete cornea_power_down"):
             worker.cmd_powerOff({})

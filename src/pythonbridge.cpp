@@ -87,6 +87,72 @@ static QMap<QString, int> g_freqCounter;
 // not also hold the GIL — keeps unrelated Python work in other threads
 // (e.g. logging, background timers) responsive.
 static QMutex g_libusbGlobalMutex;
+static QAtomicInteger<int> g_libusbGateWaiters{0};
+static QAtomicInteger<int> g_libusbGateInFlight{0};
+static QAtomicInteger<int> g_libusbGateMaxInFlight{0};
+
+class LibusbGateLease
+{
+public:
+    LibusbGateLease(const QString &command, const QString &serial, int waitTimeoutMs)
+        : m_command(command)
+        , m_serial(serial)
+    {
+        m_totalTimer.start();
+        const int queued = g_libusbGateWaiters.fetchAndAddRelaxed(1) + 1;
+        qInfo().noquote()
+            << QString("[USB-GATE] waiting cmd=%1 serial=%2 queue_depth=%3 timeout_ms=%4")
+                   .arg(m_command, m_serial.isEmpty() ? QStringLiteral("<unknown>") : m_serial)
+                   .arg(queued).arg(waitTimeoutMs);
+
+        m_acquired = g_libusbGlobalMutex.tryLock(waitTimeoutMs);
+        g_libusbGateWaiters.fetchAndSubRelaxed(1);
+        m_waitMs = m_totalTimer.elapsed();
+        if (!m_acquired) {
+            qWarning().noquote()
+                << QString("[USB-GATE] timeout cmd=%1 serial=%2 wait_ms=%3")
+                       .arg(m_command, m_serial.isEmpty() ? QStringLiteral("<unknown>") : m_serial)
+                       .arg(m_waitMs);
+            return;
+        }
+
+        const int inFlight = g_libusbGateInFlight.fetchAndAddRelaxed(1) + 1;
+        if (inFlight > g_libusbGateMaxInFlight.loadRelaxed()) {
+            g_libusbGateMaxInFlight.storeRelaxed(inFlight);
+        }
+        qInfo().noquote()
+            << QString("[USB-GATE] acquired cmd=%1 serial=%2 wait_ms=%3 "
+                       "inflight=%4 max_inflight=%5")
+                   .arg(m_command, m_serial.isEmpty() ? QStringLiteral("<unknown>") : m_serial)
+                   .arg(m_waitMs).arg(inFlight)
+                   .arg(g_libusbGateMaxInFlight.loadRelaxed());
+        m_executeTimer.start();
+    }
+
+    ~LibusbGateLease()
+    {
+        if (!m_acquired) return;
+        const qint64 executeMs = m_executeTimer.elapsed();
+        g_libusbGateInFlight.fetchAndSubRelaxed(1);
+        g_libusbGlobalMutex.unlock();
+        qInfo().noquote()
+            << QString("[USB-GATE] done cmd=%1 serial=%2 wait_ms=%3 "
+                       "execute_ms=%4 total_ms=%5 inflight=0")
+                   .arg(m_command, m_serial.isEmpty() ? QStringLiteral("<unknown>") : m_serial)
+                   .arg(m_waitMs).arg(executeMs).arg(m_totalTimer.elapsed());
+    }
+
+    bool acquired() const { return m_acquired; }
+    qint64 waitMs() const { return m_waitMs; }
+
+private:
+    QString m_command;
+    QString m_serial;
+    bool m_acquired = false;
+    qint64 m_waitMs = 0;
+    QElapsedTimer m_totalTimer;
+    QElapsedTimer m_executeTimer;
+};
 
 // Forward decl
 static void watchdogEnsureStarted();
@@ -865,6 +931,19 @@ void PythonBridge::shutdown()
         }
         for (int id : instanceIds) destroyDeviceInstance(id);
     }
+    if (m_useSubprocess) {
+        QList<PanelSubprocess*> idleProcs;
+        {
+            QMutexLocker lock(&m_panelProcsMutex);
+            idleProcs = m_idlePanelProcs.values();
+            m_idlePanelProcs.clear();
+        }
+        for (PanelSubprocess *proc : idleProcs) {
+            if (!proc) continue;
+            proc->stop(3000);
+            delete proc;
+        }
+    }
 
     // Everything below runs ON m_pythonThread — that's the thread that holds
     // the saved main interpreter state. Restoring a PyThreadState has to
@@ -1182,9 +1261,11 @@ QList<DeviceInfo> PythonBridge::getAvailableDevicesInfo()
     });
 }
 
-int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareVariant)
+int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareVariant,
+                                       const QString &expectedSerial)
 {
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+    Q_UNUSED(expectedSerial);
     int instanceId = m_nextInstanceId++;
     QString serial = QString("SIM%1").arg(deviceIndex, 4, 10, QChar('0'));
     emit logMessage(QString("[SIM] Creating device instance %1 for device %2 (%3)...")
@@ -1209,67 +1290,153 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
     // for the embedded-Python failure mode this replaces.
     if (m_useSubprocess) {
         const int instanceId = m_nextInstanceId++;
-        emit logMessage(QString("[Instance %1] Spawning subprocess for device index %2 (variant: %3)...")
-                            .arg(instanceId).arg(deviceIndex).arg(hardwareVariant));
+        constexpr int kSubprocessInitAttempts = 2;
+        PanelSubprocess *proc = nullptr;
+        QJsonObject data;
+        bool initOk = false;
+        const QString reuseKey = expectedSerial.isEmpty()
+            ? QStringLiteral("index:%1").arg(deviceIndex)
+            : expectedSerial;
 
-        // No parent: PanelSubprocess moves itself to its own QThread in its
-        // ctor, and we'd otherwise hit Qt's "Cannot create children for a
-        // parent that is in a different thread" when createDeviceInstance
-        // is called from a TCP worker thread (which is most of them).
-        // Lifetime is manually managed via m_panelProcs + delete in
-        // destroyDeviceInstance.
-        auto *proc = new PanelSubprocess(nullptr);
-        proc->setPythonExe(m_subprocessPythonExe);
-        proc->setWorkerScript(m_workerScript);
-        // Qt::QueuedConnection because the signal fires on PanelSubprocess's
-        // worker thread; the slot mutates state owned by PythonBridge (logs)
-        // so it must hop over to PythonBridge's thread.
-        connect(proc, &PanelSubprocess::logMessage, this,
-                [this, instanceId](const QString &line) {
-                    emit logMessage(QString("[Instance %1] %2").arg(instanceId).arg(line));
-                },
-                Qt::QueuedConnection);
+        for (int attempt = 1; attempt <= kSubprocessInitAttempts; ++attempt) {
+            if (attempt == 1) {
+                QMutexLocker lock(&m_panelProcsMutex);
+                proc = m_idlePanelProcs.take(reuseKey);
+            }
 
-        if (!proc->spawn(10000)) {
-            emit logMessage(QString("[Instance %1] subprocess spawn failed").arg(instanceId));
-            delete proc;
-            m_nextInstanceId--;
-            return -1;
-        }
+            if (proc) {
+                emit logMessage(QString("[Instance %1] Reusing idle subprocess for %2 "
+                                        "(variant: %3, attempt %4/%5)...")
+                                    .arg(instanceId).arg(reuseKey)
+                                    .arg(hardwareVariant).arg(attempt).arg(kSubprocessInitAttempts));
+                const QJsonObject pingReply = proc->sendBlocking("ping", QJsonObject{}, 5000);
+                if (!pingReply.value("success").toBool()) {
+                    emit logMessage(QString("[Instance %1] idle subprocess ping failed: %2")
+                                        .arg(instanceId)
+                                        .arg(pingReply.value("error").toString()));
+                    proc->stop(3000);
+                    delete proc;
+                    proc = nullptr;
+                }
+            }
 
-        QJsonObject initArgs{
-            {"cornea_index",       deviceIndex},
-            {"hardware_variant",   hardwareVariant},
-            {"cal_path",           m_calPath},
-            {"init_cornea",        true},
-            {"init_rj1",           true},
-            {"allow_default_hdf5", m_allowDefaultHdf5},
-            {"spi_clk_freq",       m_spiClkFreq},
-        };
-        // 60 s is generous for a cold cornea_rax720 ctor (typical 5–30 s
-        // including FTDI enum + RJ1 init + cal file load).
-        const QJsonObject reply = proc->sendBlocking("init", initArgs, 60000);
-        if (!reply.value("success").toBool()) {
-            emit logMessage(QString("[Instance %1] init failed: %2")
-                                .arg(instanceId).arg(reply.value("error").toString()));
+            if (!proc) {
+                emit logMessage(QString("[Instance %1] Spawning subprocess for device index %2 serial=%3 "
+                                        "(variant: %4, attempt %5/%6)...")
+                                    .arg(instanceId).arg(deviceIndex)
+                                    .arg(expectedSerial.isEmpty() ? QStringLiteral("<index-only>") : expectedSerial)
+                                    .arg(hardwareVariant).arg(attempt).arg(kSubprocessInitAttempts));
+
+                // No parent: PanelSubprocess moves itself to its own QThread in its
+                // ctor, and we'd otherwise hit Qt's "Cannot create children for a
+                // parent that is in a different thread" when createDeviceInstance
+                // is called from a TCP worker thread (which is most of them).
+                // Lifetime is manually managed via m_panelProcs + delete in
+                // destroyDeviceInstance.
+                proc = new PanelSubprocess(nullptr);
+                proc->setPythonExe(m_subprocessPythonExe);
+                proc->setWorkerScript(m_workerScript);
+                // Qt::QueuedConnection because the signal fires on PanelSubprocess's
+                // worker thread; the slot mutates state owned by PythonBridge (logs)
+                // so it must hop over to PythonBridge's thread.
+                connect(proc, &PanelSubprocess::logMessage, this,
+                        [this, instanceId](const QString &line) {
+                            emit logMessage(QString("[Instance %1] %2").arg(instanceId).arg(line));
+                        },
+                        Qt::QueuedConnection);
+
+                if (!proc->spawn(10000)) {
+                    emit logMessage(QString("[Instance %1] subprocess spawn failed on attempt %2")
+                                        .arg(instanceId).arg(attempt));
+                    delete proc;
+                    proc = nullptr;
+                    QThread::msleep(1000);
+                    continue;
+                }
+            }
+
+            QJsonObject initArgs{
+                {"cornea_index",       deviceIndex},
+                {"hardware_variant",   hardwareVariant},
+                {"cal_path",           m_calPath},
+                {"init_cornea",        true},
+                {"init_rj1",           true},
+                {"allow_default_hdf5", m_allowDefaultHdf5},
+                {"spi_clk_freq",       m_spiClkFreq},
+            };
+            if (!expectedSerial.isEmpty()) {
+                initArgs.insert("cornea_serial", expectedSerial);
+            }
+            // The subprocess architecture bypasses invokeOnWorker(), so take
+            // the same process-wide libusb gate explicitly.  The 60 s worker
+            // timeout starts only after this lease is acquired; queue wait and
+            // USB execution are logged separately.
+            QJsonObject reply;
+            qint64 initGateWaitMs = 0;
+            {
+                LibusbGateLease initLease(QStringLiteral("init"), expectedSerial, 60000);
+                if (initLease.acquired()) {
+                    initGateWaitMs = initLease.waitMs();
+                    // 60 s is generous for a cold cornea_rax720 ctor (typical
+                    // 5–30 s including FTDI enum + RJ1 init + cal file load).
+                    reply = proc->sendBlocking("init", initArgs, 60000);
+                } else {
+                    initGateWaitMs = initLease.waitMs();
+                    reply = QJsonObject{
+                        {"success", false},
+                        {"error", QString("USB_BUSY_TIMEOUT after %1ms")
+                                      .arg(initGateWaitMs)},
+                        {"errorCode", QStringLiteral("USB_BUSY_TIMEOUT")}
+                    };
+                }
+            }
+            if (!reply.value("success").toBool()) {
+                emit logMessage(QString("[Instance %1] init failed on attempt %2: %3")
+                                    .arg(instanceId).arg(attempt)
+                                    .arg(reply.value("error").toString()));
+                proc->stop(3000);
+                delete proc;
+                proc = nullptr;
+                QThread::msleep(1000);
+                continue;
+            }
+
+            data = reply.value("data").toObject();
+            initOk = data.value("init_ok").toBool();
+            const QString serial = data.value("cornea_serial").toString().trimmed();
+            emit logMessage(QString("[Instance %1] subprocess ready (pid=%2, serial=%3, init_ok=%4, %5 ms)")
+                                .arg(instanceId).arg(proc->processId()).arg(serial)
+                                .arg(initOk).arg(data.value("duration_ms").toInt()));
+
+            if (initOk && !expectedSerial.isEmpty() && serial != expectedSerial) {
+                emit logMessage(QString("[Instance %1] SERIAL_MISMATCH: expected=%2 actual=%3; "
+                                        "rejecting worker")
+                                    .arg(instanceId).arg(expectedSerial,
+                                        serial.isEmpty() ? QStringLiteral("<empty>") : serial));
+                initOk = false;
+            }
+
+            if (initOk) {
+                break;
+            }
+
+            emit logMessage(QString("[Instance %1] hardware init failed on attempt %2 "
+                                    "(init_ok=0) — restarting worker")
+                                .arg(instanceId).arg(attempt));
             proc->stop(3000);
             delete proc;
-            m_nextInstanceId--;
-            return -1;
+            proc = nullptr;
+            QThread::msleep(1000);
         }
 
-        const QJsonObject data = reply.value("data").toObject();
-        const bool initOk = data.value("init_ok").toBool();
-        const QString serial = data.value("cornea_serial").toString();
-        emit logMessage(QString("[Instance %1] subprocess ready (pid=%2, serial=%3, init_ok=%4, %5 ms)")
-                            .arg(instanceId).arg(proc->processId()).arg(serial)
-                            .arg(initOk).arg(data.value("duration_ms").toInt()));
-
-        if (!initOk) {
-            emit logMessage(QString("[Instance %1] hardware init failed (init_ok=0) — aborting connect")
-                                .arg(instanceId));
-            proc->stop(3000);
-            delete proc;
+        if (!proc || !initOk) {
+            const QString detail = QString(
+                "Hardware init failed after %1 attempt(s); expected serial=%2")
+                    .arg(kSubprocessInitAttempts)
+                    .arg(expectedSerial.isEmpty() ? QStringLiteral("<index-only>") : expectedSerial);
+            setError(detail);
+            emit logMessage(QString("[Instance %1] %2 — aborting connect")
+                                .arg(instanceId).arg(detail));
             m_nextInstanceId--;
             return -1;
         }
@@ -1279,11 +1446,11 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
             m_panelProcs.insert(instanceId, proc);
         }
         m_initOkMap[instanceId] = initOk;
-        m_serialMap[instanceId] = serial;
+        m_serialMap[instanceId] = data.value("cornea_serial").toString(expectedSerial);
         return instanceId;
     }
 
-    return dispatch([this, deviceIndex, hardwareVariant]() -> int {
+    return dispatch([this, deviceIndex, hardwareVariant, expectedSerial]() -> int {
         if (!m_initialized) {
             setError("Python bridge not initialized");
             return -1;
@@ -1303,7 +1470,11 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         PyDict_SetItemString(kwargs, "rj1_use_spi", Py_True);
         PyDict_SetItemString(kwargs, "allow_default_hdf5", m_allowDefaultHdf5 ? Py_True : Py_False);
         PyDict_SetItemString(kwargs, "cal_revision", Py_None);
-        PyDict_SetItemString(kwargs, "cornea_serial", Py_None);
+        if (expectedSerial.isEmpty()) {
+            PyDict_SetItemString(kwargs, "cornea_serial", Py_None);
+        } else {
+            PyDict_SetItemString(kwargs, "cornea_serial", PyUnicode_FromString(expectedSerial.toUtf8().constData()));
+        }
         PyDict_SetItemString(kwargs, "rj1_version", Py_None);
         PyDict_SetItemString(kwargs, "spi_clk_freq", PyFloat_FromDouble(m_spiClkFreq));
         emit logMessage(QString("[Instance %1] SPI clock freq: %2 Hz (%3 MHz)")
@@ -1428,6 +1599,19 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         }
         Py_XDECREF(serialObj);
 
+        if (!expectedSerial.isEmpty() && serial != expectedSerial) {
+            const QString detail = QString(
+                "SERIAL_MISMATCH: expected %1, actual %2")
+                    .arg(expectedSerial,
+                         serial.isEmpty() ? QStringLiteral("<empty>") : serial);
+            setError(detail);
+            emit logMessage(QString("[Instance %1] %2 — rejecting instance")
+                                .arg(instanceId).arg(detail));
+            Py_DECREF(instance);
+            m_nextInstanceId--;
+            return -1;
+        }
+
         m_deviceInstances[instanceId] = instance;
         m_initOkMap[instanceId] = true;
         m_serialMap[instanceId] = serial;
@@ -1444,12 +1628,13 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
     });
 }
 
-int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant)
+int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant,
+                                        const QString &expectedSerial)
 {
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
-    return createDeviceInstance(deviceIndex, hardwareVariant);
+    return createDeviceInstance(deviceIndex, hardwareVariant, expectedSerial);
 #endif
-    return dispatch([this, deviceIndex, hardwareVariant]() -> int {
+    return dispatch([this, deviceIndex, hardwareVariant, expectedSerial]() -> int {
         if (!m_initialized) {
             setError("Python bridge not initialized");
             return -1;
@@ -1469,7 +1654,11 @@ int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardware
         PyDict_SetItemString(kwargs, "rj1_use_spi", Py_True);
         PyDict_SetItemString(kwargs, "allow_default_hdf5", Py_True);
         PyDict_SetItemString(kwargs, "cal_revision", Py_None);
-        PyDict_SetItemString(kwargs, "cornea_serial", Py_None);
+        if (expectedSerial.isEmpty()) {
+            PyDict_SetItemString(kwargs, "cornea_serial", Py_None);
+        } else {
+            PyDict_SetItemString(kwargs, "cornea_serial", PyUnicode_FromString(expectedSerial.toUtf8().constData()));
+        }
         PyDict_SetItemString(kwargs, "rj1_version", Py_None);
         PyDict_SetItemString(kwargs, "spi_clk_freq", PyFloat_FromDouble(m_spiClkFreq));
         PyDict_SetItemString(kwargs, "console_log_level", PyLong_FromLong(20));
@@ -1493,6 +1682,19 @@ int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardware
             serial = QString::fromUtf8(PyUnicode_AsUTF8(serialObj));
         }
         Py_XDECREF(serialObj);
+
+        if (!expectedSerial.isEmpty() && serial != expectedSerial) {
+            const QString detail = QString(
+                "SERIAL_MISMATCH: expected %1, actual %2")
+                    .arg(expectedSerial,
+                         serial.isEmpty() ? QStringLiteral("<empty>") : serial);
+            setError(detail);
+            emit logMessage(QString("[Instance %1] Pre-init %2 — rejecting instance")
+                                .arg(instanceId).arg(detail));
+            Py_DECREF(instance);
+            m_nextInstanceId--;
+            return -1;
+        }
 
         m_deviceInstances[instanceId] = instance;
         m_initOkMap[instanceId] = false;  // Not fully initialized yet
@@ -1519,11 +1721,10 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
     return;
 #endif
 
-    // Subprocess path: send shutdown, wait, kill on hang. Python's
-    // process exit handles cornea_rax720 instance teardown (rax_lib's
-    // __del__ runs on python.exe shutdown), and the OS releases the
-    // FT4232 USB claim when the process dies. Much simpler than the
-    // embedded-Python teardown below.
+    // Subprocess path: release the CorneaRax720 hardware object but keep
+    // python.exe alive for this station. The next DUT gets a fresh init()
+    // inside the same worker process, reducing process/import churn without
+    // carrying hardware instance state across panels.
     if (m_useSubprocess) {
         PanelSubprocess *proc = nullptr;
         {
@@ -1533,6 +1734,15 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
         m_initOkMap.remove(instanceId);
         const QString serial = m_serialMap.take(instanceId);
         if (proc) {
+            LibusbGateLease teardownLease(QStringLiteral("teardown"), serial, 15000);
+            if (!teardownLease.acquired()) {
+                emit logMessage(QString("[Instance %1] USB_BUSY_TIMEOUT during teardown "
+                                        "(serial=%2) — stopping subprocess without touching USB")
+                                    .arg(instanceId).arg(serial));
+                proc->stop(3000);
+                delete proc;
+                return;
+            }
             // Power off the panel hardware BEFORE killing the worker
             // process. Without this the rails stay up — the rax_lib
             // __del__ that would normally do power-down doesn't run
@@ -1548,15 +1758,36 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
                                     .arg(instanceId).arg(serial)
                                     .arg(offReply.value("error").toString()));
             }
-            proc->stop(5000);
-            // Plain delete (NOT deleteLater): deleteLater posts the deletion
-            // event to proc's home thread (its own worker thread). The
-            // destructor then calls m_workerThread.wait() — which would
-            // deadlock waiting for itself to exit. Synchronous delete on
-            // the caller's thread avoids that; the ~PanelSubprocess runs
-            // here and its m_workerThread is a foreign thread it can wait on.
-            delete proc;
-            emit logMessage(QString("[Instance %1] subprocess stopped (serial=%2)")
+            const QJsonObject resetReply = proc->sendBlocking("reset", QJsonObject{}, 10000);
+            if (!resetReply.value("success").toBool()) {
+                emit logMessage(QString("[Instance %1] reset during teardown failed "
+                                        "(serial=%2): %3 — stopping subprocess")
+                                    .arg(instanceId).arg(serial)
+                                    .arg(resetReply.value("error").toString()));
+                proc->stop(3000);
+                delete proc;
+                return;
+            }
+
+            if (serial.isEmpty()) {
+                emit logMessage(QString("[Instance %1] empty serial after reset — stopping subprocess")
+                                    .arg(instanceId));
+                proc->stop(3000);
+                delete proc;
+                return;
+            }
+
+            PanelSubprocess *oldIdle = nullptr;
+            {
+                QMutexLocker lock(&m_panelProcsMutex);
+                oldIdle = m_idlePanelProcs.take(serial);
+                m_idlePanelProcs.insert(serial, proc);
+            }
+            if (oldIdle) {
+                oldIdle->stop(3000);
+                delete oldIdle;
+            }
+            emit logMessage(QString("[Instance %1] subprocess reset and kept idle (serial=%2)")
                                 .arg(instanceId).arg(serial));
         }
         return;
@@ -1752,7 +1983,22 @@ bool PythonBridge::setBrightness(int instanceId, double level)
     if (m_useSubprocess) {
         const QJsonObject reply = subprocessCall(instanceId, "setBrightness",
                                                   QJsonObject{{"level", level}}, 10000);
-        return reply.value("success").toBool();
+        if (reply.value("success").toBool()) {
+            return true;
+        }
+        const QString errorCode = reply.value("errorCode").toString();
+        const QString detail = reply.value("error").toString("subprocess command failed");
+        setError(QString("%1: %2").arg(
+            errorCode.isEmpty() ? QStringLiteral("USB_TRANSPORT_LOST") : errorCode,
+            detail));
+        if (errorCode == QStringLiteral("USB_BUSY_TIMEOUT")) {
+            emit logMessage(QString("[Instance %1] setBrightness skipped: %2")
+                                .arg(instanceId).arg(detail));
+            return false;
+        }
+        markSubprocessUnhealthy(instanceId, "setBrightness",
+                                detail);
+        return false;
     }
     return dispatchToDevice(instanceId, [this, instanceId, level]() -> bool {
         PyObject *args = PyTuple_Pack(1, PyFloat_FromDouble(level));
@@ -1903,7 +2149,21 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image)
         }
         const QJsonObject reply = subprocessCall(
             instanceId, "sendImage", QJsonObject{{"path", tmpPath}}, 30000);
-        return reply.value("success").toBool();
+        if (reply.value("success").toBool()) {
+            return true;
+        }
+        const QString errorCode = reply.value("errorCode").toString();
+        const QString detail = reply.value("error").toString("sendImage subprocess failed");
+        setError(QString("%1: %2").arg(
+            errorCode.isEmpty() ? QStringLiteral("USB_TRANSPORT_LOST") : errorCode,
+            detail));
+        if (errorCode != QStringLiteral("USB_BUSY_TIMEOUT")) {
+            markSubprocessUnhealthy(instanceId, "sendImage", detail);
+        } else {
+            emit logMessage(QString("[Instance %1] sendImage skipped: %2")
+                                .arg(instanceId).arg(detail));
+        }
+        return false;
     }
     return dispatchToDevice(instanceId, [this, instanceId, image]() -> bool {
         PyObject *instance = getDeviceInstance(instanceId);
@@ -2368,25 +2628,111 @@ QVariantMap PythonBridge::getDemuraRlutState(int instanceId)
     });
 }
 
+void PythonBridge::markSubprocessUnhealthy(int instanceId, const QString &operation,
+                                           const QString &detail)
+{
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+    Q_UNUSED(instanceId);
+    Q_UNUSED(operation);
+    Q_UNUSED(detail);
+    return;
+#endif
+    if (!m_useSubprocess) return;
+
+    PanelSubprocess *proc = nullptr;
+    QString serial;
+    {
+        QMutexLocker lock(&m_panelProcsMutex);
+        serial = m_serialMap.value(instanceId);
+    }
+
+    // Do not delete a worker while another command is inside sendBlocking().
+    // subprocessCall resolves the worker pointer only after taking this same
+    // gate, which closes the previous stale-pointer/UAF window.
+    LibusbGateLease lease(QStringLiteral("isolate"), serial, 15000);
+    if (!lease.acquired()) {
+        emit logMessage(QString("[Instance %1] unable to isolate unhealthy worker: "
+                                "USB_BUSY_TIMEOUT (serial=%2)")
+                            .arg(instanceId).arg(serial));
+        return;
+    }
+    {
+        QMutexLocker lock(&m_panelProcsMutex);
+        proc = m_panelProcs.take(instanceId);
+    }
+
+    m_initOkMap.remove(instanceId);
+    m_serialMap.remove(instanceId);
+
+    emit logMessage(QString("[Instance %1] %2 failed: %3 — stopping unhealthy subprocess (serial=%4)")
+                        .arg(instanceId, 0, 10)
+                        .arg(operation, detail, serial));
+
+    if (proc) {
+        proc->stop(1000);
+        delete proc;
+    }
+}
+
 QJsonObject PythonBridge::subprocessCall(int instanceId, const QString &cmd,
                                           const QJsonObject &args, int timeoutMs)
 {
     // Per-instance route. The per-device worker thread serializes calls
     // for one panel; PanelSubprocess itself isn't internally locked, but
     // the single-thread-per-panel guarantee from caller side is enough.
+    QString serial;
+    {
+        QMutexLocker lock(&m_panelProcsMutex);
+        serial = m_serialMap.value(instanceId);
+    }
+
+    // Temperature is background telemetry.  Never let it queue behind a
+    // production image/brightness command; CorneaController retains the last
+    // valid sample and the next timer tick will retry.
+    const int gateWaitTimeoutMs =
+        (cmd == QStringLiteral("getTemperature")) ? 0
+        : ((cmd == QStringLiteral("powerOn")) ? 60000 : 15000);
+    LibusbGateLease lease(cmd, serial, gateWaitTimeoutMs);
+    if (!lease.acquired()) {
+        return QJsonObject{
+            {"success", false},
+            {"error", QString("USB_BUSY_TIMEOUT: global USB gate wait exceeded %1ms")
+                          .arg(gateWaitTimeoutMs)},
+            {"errorCode", QStringLiteral("USB_BUSY_TIMEOUT")},
+            {"queue_wait_ms", lease.waitMs()}
+        };
+    }
+
+    // Resolve the pointer only while holding the global gate.  An error path
+    // may isolate and delete the worker, so looking it up before queueing
+    // would leave a stale pointer for another command waiting behind it.
     PanelSubprocess *proc = nullptr;
     {
         QMutexLocker lock(&m_panelProcsMutex);
         proc = m_panelProcs.value(instanceId, nullptr);
     }
     if (!proc || !proc->isRunning()) {
-        QJsonObject err{
+        return QJsonObject{
             {"success", false},
-            {"error", QString("subprocess for instance %1 not running").arg(instanceId)}
+            {"error", QString("subprocess for instance %1 not running").arg(instanceId)},
+            {"errorCode", QStringLiteral("USB_TRANSPORT_LOST")}
         };
-        return err;
     }
-    return proc->sendBlocking(cmd, args, timeoutMs);
+
+    QJsonObject reply = proc->sendBlocking(cmd, args, timeoutMs);
+    reply["queue_wait_ms"] = lease.waitMs();
+    if (!reply.value("success").toBool()
+        && !reply.contains("errorCode")) {
+        const QString detail = reply.value("error").toString();
+        if (detail.contains("SERIAL_NOT_FOUND")) {
+            reply["errorCode"] = QStringLiteral("SERIAL_NOT_FOUND");
+        } else if (detail.contains("SERIAL_MISMATCH")) {
+            reply["errorCode"] = QStringLiteral("SERIAL_MISMATCH");
+        } else {
+            reply["errorCode"] = QStringLiteral("USB_TRANSPORT_LOST");
+        }
+    }
+    return reply;
 }
 
 void PythonBridge::flushPythonOutput()

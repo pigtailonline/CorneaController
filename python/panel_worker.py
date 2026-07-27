@@ -59,8 +59,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import gc
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -78,6 +80,78 @@ logging.basicConfig(
 log = logging.getLogger("panel_worker")
 
 
+class UsbGateTimeout(RuntimeError):
+    """The process-wide USB gate could not be acquired within its deadline."""
+
+
+class _UsbGate:
+    """Cross-process guard for every pyftdi/libusb transaction.
+
+    CorneaController normally serializes commands in the C++ parent.  The
+    Windows named mutex is a second line of defence: it still protects the
+    FT4232/libusb-win32 stack if two controller applications are accidentally
+    started, or a future C++ call path bypasses the parent scheduler.
+    """
+
+    _NAME = r"Global\CorneaController_USB_GATE_v1"
+
+    def __init__(self):
+        self._local_lock = threading.Lock()
+        self._handle = None
+        if os.name == "nt":
+            import ctypes
+            self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            self._kernel32.CreateMutexW.argtypes = (
+                ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p
+            )
+            self._kernel32.CreateMutexW.restype = ctypes.c_void_p
+            self._kernel32.WaitForSingleObject.argtypes = (
+                ctypes.c_void_p, ctypes.c_uint32
+            )
+            self._kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+            self._kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+            self._kernel32.ReleaseMutex.restype = ctypes.c_bool
+            self._kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            self._kernel32.CloseHandle.restype = ctypes.c_bool
+            self._handle = self._kernel32.CreateMutexW(None, False, self._NAME)
+            if not self._handle:
+                raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
+
+    def acquire(self, timeout_s: float) -> int:
+        started = time.monotonic()
+        if self._handle is None:
+            acquired = self._local_lock.acquire(timeout=timeout_s)
+        else:
+            # WAIT_OBJECT_0=0, WAIT_ABANDONED=0x80.  An abandoned mutex is
+            # safely acquired by this process and proves crash recovery works.
+            result = self._kernel32.WaitForSingleObject(
+                self._handle, max(0, int(timeout_s * 1000))
+            )
+            acquired = result in (0x00000000, 0x00000080)
+        wait_ms = int((time.monotonic() - started) * 1000)
+        if not acquired:
+            raise UsbGateTimeout(
+                f"USB_BUSY_TIMEOUT: named USB gate wait exceeded "
+                f"{int(timeout_s * 1000)}ms"
+            )
+        return wait_ms
+
+    def release(self) -> None:
+        if self._handle is None:
+            self._local_lock.release()
+        elif not self._kernel32.ReleaseMutex(self._handle):
+            import ctypes
+            raise OSError(ctypes.get_last_error(), "ReleaseMutex failed")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+USB_GATE = _UsbGate()
+
+
 class _PowerErrorCapture(logging.Handler):
     def __init__(self):
         super().__init__(level=logging.ERROR)
@@ -93,6 +167,17 @@ class _PowerErrorCapture(logging.Handler):
             self.messages.append(msg)
 
 
+def _handler_logger(logger):
+    if logger is None:
+        return None
+    if hasattr(logger, "addHandler") and hasattr(logger, "removeHandler"):
+        return logger
+    wrapped = getattr(logger, "logger", None)
+    if hasattr(wrapped, "addHandler") and hasattr(wrapped, "removeHandler"):
+        return wrapped
+    return None
+
+
 def emit(resp: dict) -> None:
     """Write one line of JSON to stdout, flushed immediately. stdout is
     pipe-buffered by default which would defeat the protocol if the parent
@@ -105,8 +190,11 @@ def ok(req_id, **data) -> dict:
     return {"id": req_id, "success": True, "data": data}
 
 
-def err(req_id, message: str) -> dict:
-    return {"id": req_id, "success": False, "error": message}
+def err(req_id, message: str, error_code: str = "") -> dict:
+    response = {"id": req_id, "success": False, "error": message}
+    if error_code:
+        response["errorCode"] = error_code
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +221,57 @@ class Worker:
         # cornea_rax720 import cost.
         from ar_display_lab_lib.control_boards.cornea_rax720 import CorneaRax720
 
+        expected_serial = str(args.get("cornea_serial") or "").strip()
+        resolved_index = int(args.get("cornea_index", 0))
+        if expected_serial:
+            # Never trust a cached numeric index.  Windows can reorder FT4232
+            # devices after a transient disconnect, so require two consecutive
+            # identical enumerations and resolve the current index by serial.
+            stable_result = None
+            previous_result = None
+            for enum_attempt in range(3):
+                try:
+                    from pyftdi.usbtools import UsbTools
+                    UsbTools.flush_cache()
+                except Exception as e:
+                    log.warning("pyftdi cache flush before init failed: %s", e)
+
+                indices, serials = CorneaRax720.get_available_corneas()
+                current_result = (
+                    tuple(int(v) for v in indices),
+                    tuple(str(v) for v in serials),
+                )
+                log.info(
+                    "USB enumeration %d/3: indices=%s serials=%s",
+                    enum_attempt + 1, current_result[0], current_result[1],
+                )
+                if current_result == previous_result:
+                    stable_result = current_result
+                    break
+                previous_result = current_result
+                time.sleep(0.2)
+
+            if stable_result is None:
+                raise RuntimeError(
+                    "SERIAL_NOT_FOUND: USB enumeration did not stabilize "
+                    "for two consecutive reads"
+                )
+            indices, serials = stable_result
+            try:
+                serial_pos = serials.index(expected_serial)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"SERIAL_NOT_FOUND: expected {expected_serial}, "
+                    f"visible={list(serials)}"
+                ) from exc
+            resolved_index = indices[serial_pos]
+            log.info(
+                "Resolved expected serial %s: requested_index=%s current_index=%s",
+                expected_serial, args.get("cornea_index"), resolved_index,
+            )
+
         kwargs = {
-            "cornea_index":      int(args.get("cornea_index", 0)),
+            "cornea_index":      resolved_index,
             "init_cornea":       bool(args.get("init_cornea", True)),
             "init_rj1":          bool(args.get("init_rj1", True)),
             "cal_path":          str(args.get("cal_path", "")),
@@ -154,10 +291,22 @@ class Worker:
         log.info("CorneaRax720 ctor done in %d ms (variant=%s, index=%d)",
                  dt_ms, kwargs["hardware_variant"], kwargs["cornea_index"])
         init_ok = bool(getattr(self.cornea, "init_ok", True))
+        actual_serial = str(getattr(self.cornea, "cornea_serial", "") or "")
+        if expected_serial and actual_serial != expected_serial:
+            try:
+                self.cornea.system_power_off()
+            except Exception as e:
+                log.warning("power off after serial mismatch raised: %s", e)
+            self.cornea = None
+            gc.collect()
+            raise RuntimeError(
+                f"SERIAL_MISMATCH: expected {expected_serial}, "
+                f"actual {actual_serial or '<empty>'}"
+            )
         panel_id = self._require_panel_id("init") if init_ok else ""
         return {
             "init_ok": init_ok,
-            "cornea_serial": getattr(self.cornea, "cornea_serial", None),
+            "cornea_serial": actual_serial,
             "panel_id": panel_id,
             "duration_ms": dt_ms,
             "defect_maps": self._export_defect_maps_once(panel_id) if init_ok else {
@@ -254,7 +403,7 @@ class Worker:
         # mirror CC's PythonBridge::systemPowerOn handling so the parent
         # doesn't misinterpret a "False" return as "success".
         capture = _PowerErrorCapture()
-        cornea_logger = getattr(c, "logger", None)
+        cornea_logger = _handler_logger(getattr(c, "logger", None))
         if cornea_logger is not None:
             cornea_logger.addHandler(capture)
         try:
@@ -274,7 +423,7 @@ class Worker:
     def cmd_powerOff(self, args: dict) -> dict:
         c = self._require()
         capture = _PowerErrorCapture()
-        cornea_logger = getattr(c, "logger", None)
+        cornea_logger = _handler_logger(getattr(c, "logger", None))
         if cornea_logger is not None:
             cornea_logger.addHandler(capture)
         try:
@@ -285,6 +434,25 @@ class Worker:
         if capture.messages:
             raise RuntimeError(capture.messages[-1])
         return {}
+
+    def cmd_reset(self, args: dict) -> dict:
+        """Release the CorneaRax720 object but keep this python.exe alive.
+
+        The parent uses this between DUTs: the next init creates a fresh
+        hardware instance while avoiding Python process startup/import cost.
+        """
+        had_instance = self.cornea is not None
+        if self.cornea is not None:
+            try:
+                self.cornea.system_power_off()
+            except Exception as e:
+                log.warning("system_power_off during reset raised: %s", e)
+            self.cornea = None
+            gc.collect()
+        self.cached_temp = -999.0
+        self.cal_path = ""
+        self.defect_map_output_root = ""
+        return {"had_instance": had_instance}
 
     def cmd_setBrightness(self, args: dict) -> dict:
         c = self._require()
@@ -439,6 +607,7 @@ def main() -> int:
         "init":                 worker.cmd_init,
         "powerOn":              worker.cmd_powerOn,
         "powerOff":             worker.cmd_powerOff,
+        "reset":                worker.cmd_reset,
         "setBrightness":        worker.cmd_setBrightness,
         "getBrightness":        worker.cmd_getBrightness,
         "getPanelId":           worker.cmd_getPanelId,
@@ -475,16 +644,47 @@ def main() -> int:
             emit(err(req_id, f"unknown cmd: {cmd!r}"))
             continue
 
+        gate_required = cmd not in {"ping"}
+        gate_acquired = False
         try:
+            gate_wait_ms = 0
+            if gate_required:
+                gate_wait_ms = USB_GATE.acquire(60.0 if cmd == "init" else 30.0)
+                gate_acquired = True
+                log.info(
+                    "[USB-GATE] acquired cmd=%s wait_ms=%d pid=%d",
+                    cmd, gate_wait_ms, os.getpid(),
+                )
+            started = time.monotonic()
             data = handler(args) or {}
+            if gate_required:
+                log.info(
+                    "[USB-GATE] done cmd=%s wait_ms=%d execute_ms=%d pid=%d",
+                    cmd, gate_wait_ms,
+                    int((time.monotonic() - started) * 1000), os.getpid(),
+                )
             emit(ok(req_id, **data))
             if cmd == "shutdown":
                 break
         except Exception as e:
             log.error("cmd %s raised: %s\n%s", cmd, e, traceback.format_exc())
-            emit(err(req_id, f"{type(e).__name__}: {e}"))
+            message = f"{type(e).__name__}: {e}"
+            error_code = ""
+            for candidate in (
+                "USB_BUSY_TIMEOUT",
+                "SERIAL_NOT_FOUND",
+                "SERIAL_MISMATCH",
+            ):
+                if candidate in message:
+                    error_code = candidate
+                    break
+            emit(err(req_id, message, error_code))
+        finally:
+            if gate_acquired:
+                USB_GATE.release()
 
     log.info("panel_worker exiting cleanly")
+    USB_GATE.close()
     return 0
 
 

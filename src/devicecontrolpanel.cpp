@@ -144,7 +144,7 @@ DeviceControlPanel::OpResult DeviceControlPanel::powerOnCore()
         }
         emit logMessage(panelLabel(), QString("Powering on device %1 (variant: %2)...")
                             .arg(deviceIndex).arg(variant));
-        r.ok = m_controller->connect(deviceIndex, variant);
+        r.ok = m_controller->connect(deviceIndex, variant, m_deviceInfo.serial);
     }
     if (!r.ok) r.error = m_controller->lastError();
     return r;
@@ -154,12 +154,17 @@ DeviceControlPanel::OpResult DeviceControlPanel::powerOffCore()
 {
     OpResult r{};
     if (!isConnected()) {
-        r.ok = true;   // already off — idempotent success
+        r.ok = true;   // already off: idempotent success
         return r;
     }
+
+    // Production changes panel/LEA frequently. Destroy the hardware instance
+    // on power-off so the next DUT starts from a fresh serial-bound connect.
     m_controller->disconnect();
     r.ok = !isConnected();
-    if (!r.ok) r.error = QStringLiteral("Failed to disconnect");
+    if (!r.ok) {
+        r.error = QStringLiteral("Failed to disconnect");
+    }
     return r;
 }
 
@@ -970,9 +975,13 @@ void DeviceControlPanel::onControllerConnected()
         }, Qt::QueuedConnection);
     });
 
-    // Start temperature monitoring timer, staggered by panel ID to avoid
-    // all devices polling simultaneously and blocking the UI
-    int staggerMs = m_panelId * 1000;  // 0s, 1s, 2s, 3s, ... offset
+    // Spread six panels evenly across the 5 s period.  The former
+    // panelId*1000 scheme put Panel A (0 ms) and Panel F (5000 ms) on the
+    // same phase, recreating the exact station-5/station-6 collision.
+    constexpr int kExpectedStationCount = 6;
+    const int staggerMs =
+        ((m_panelId % kExpectedStationCount) * TEMPERATURE_CHECK_INTERVAL_MS)
+        / kExpectedStationCount;
     QTimer::singleShot(staggerMs, this, [this]() {
         if (isConnected()) {
             m_temperatureTimer->start(TEMPERATURE_CHECK_INTERVAL_MS);

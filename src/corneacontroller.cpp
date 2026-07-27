@@ -30,17 +30,21 @@ QString CorneaController::lastError() const
     return m_bridge ? m_bridge->getLastError() : QString();
 }
 
-bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant)
+bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant,
+                               const QString &expectedSerial)
 {
     if (m_instanceId >= 0) {
         disconnect();
     }
 
-    int instanceId = m_bridge->createDeviceInstance(deviceIndex, hardwareVariant);
+    int instanceId = m_bridge->createDeviceInstance(deviceIndex, hardwareVariant, expectedSerial);
     if (instanceId >= 0) {
         m_instanceId = instanceId;
         m_deviceIndex = deviceIndex;
         m_deviceSerial = m_bridge->getDeviceSerial(instanceId);
+        if (m_deviceSerial.isEmpty()) {
+            m_deviceSerial = expectedSerial;
+        }
         m_currentBrightness = m_bridge->getBrightness(instanceId);
         m_poweredOn = true;
 
@@ -66,17 +70,21 @@ bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant)
     return false;
 }
 
-bool CorneaController::preInit(int deviceIndex, const QString &hardwareVariant)
+bool CorneaController::preInit(int deviceIndex, const QString &hardwareVariant,
+                               const QString &expectedSerial)
 {
     if (m_instanceId >= 0) {
         return true; // Already initialized
     }
 
-    int instanceId = m_bridge->preInitDeviceInstance(deviceIndex, hardwareVariant);
+    int instanceId = m_bridge->preInitDeviceInstance(deviceIndex, hardwareVariant, expectedSerial);
     if (instanceId >= 0) {
         m_instanceId = instanceId;
         m_deviceIndex = deviceIndex;
         m_deviceSerial = m_bridge->getDeviceSerial(instanceId);
+        if (m_deviceSerial.isEmpty()) {
+            m_deviceSerial = expectedSerial;
+        }
         m_poweredOn = false; // FTDI ready but not powered on
 
         emit logMessage(QString("Pre-init OK: %1 (FTDI ready)").arg(getDeviceLabel()));
@@ -321,8 +329,14 @@ double CorneaController::getRj1Temperature()
         QMutexLocker lock(&m_tempCacheMutex);
         m_cachedRj1Temp = temp;
         m_lastRj1ReadMs = now;
+        return temp;
     }
-    return temp;
+
+    // USB gate busy or transient read failure: retain the last valid sample.
+    // Background telemetry must never queue behind sendImage/setBrightness,
+    // and a skipped poll must not blank the UI or overwrite the cache.
+    QMutexLocker lock(&m_tempCacheMutex);
+    return m_cachedRj1Temp;
 }
 
 double CorneaController::getCachedRj1Temperature() const

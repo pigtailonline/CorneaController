@@ -538,6 +538,15 @@ QJsonObject TcpServer::makeError(const QString &message)
     QJsonObject obj;
     obj["success"] = false;
     obj["error"] = message;
+    if (message.contains(QStringLiteral("USB_BUSY_TIMEOUT"))) {
+        obj["errorCode"] = QStringLiteral("USB_BUSY_TIMEOUT");
+    } else if (message.contains(QStringLiteral("USB_TRANSPORT_LOST"))) {
+        obj["errorCode"] = QStringLiteral("USB_TRANSPORT_LOST");
+    } else if (message.contains(QStringLiteral("SERIAL_NOT_FOUND"))) {
+        obj["errorCode"] = QStringLiteral("SERIAL_NOT_FOUND");
+    } else if (message.contains(QStringLiteral("SERIAL_MISMATCH"))) {
+        obj["errorCode"] = QStringLiteral("SERIAL_MISMATCH");
+    }
     return obj;
 }
 

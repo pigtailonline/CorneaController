@@ -26,6 +26,7 @@ class CorneaController;
 class DeviceControlPanel;
 class ImageLoader;
 class TcpServer;
+struct DeviceInfo;
 
 class CorneaWidget : public QWidget
 {
@@ -140,6 +141,7 @@ private:
     void appendLog(const QString &message);
     void appendLog(const QString &panelLabel, const QString &message);
     void refreshDeviceList();
+    void applyDeviceList(const QList<DeviceInfo> &devices);
     void loadTestChartImages();
     bool initializePythonBridge();
 
@@ -170,6 +172,8 @@ private:
 
     // TCP Server
     std::unique_ptr<TcpServer> m_tcpServer;
+    std::shared_ptr<std::atomic<bool>> m_asyncGuard =
+        std::make_shared<std::atomic<bool>>(true);
 };
 
 #endif // CORNEAWIDGET_H

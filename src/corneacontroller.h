@@ -21,8 +21,10 @@ public:
     ~CorneaController();
 
     // Connection
-    bool connect(int deviceIndex, const QString &hardwareVariant = "standard");
-    bool preInit(int deviceIndex, const QString &hardwareVariant = "standard"); // FTDI only, no panel needed
+    bool connect(int deviceIndex, const QString &hardwareVariant = "standard",
+                 const QString &expectedSerial = QString());
+    bool preInit(int deviceIndex, const QString &hardwareVariant = "standard",
+                 const QString &expectedSerial = QString()); // FTDI only, no panel needed
     void disconnect();
     bool isConnected() const;
     bool isInitOk() const;

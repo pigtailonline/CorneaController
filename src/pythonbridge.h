@@ -64,8 +64,10 @@ public:
     QList<DeviceInfo> getAvailableDevicesInfo();
 
     // Multi-instance device management
-    int createDeviceInstance(int deviceIndex, const QString &hardwareVariant = "standard");  // Returns instanceId, -1 on failure
-    int preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant = "standard"); // Light init: FTDI only, no RJ1/panel needed
+    int createDeviceInstance(int deviceIndex, const QString &hardwareVariant = "standard",
+                             const QString &expectedSerial = QString());  // Returns instanceId, -1 on failure
+    int preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant = "standard",
+                              const QString &expectedSerial = QString()); // Light init: FTDI only, no RJ1/panel needed
     void destroyDeviceInstance(int instanceId);
     bool isDeviceConnected(int instanceId) const;
     bool isDeviceInitOk(int instanceId) const;
@@ -163,10 +165,11 @@ private:
     // subprocess's JSON-RPC client. Mutex protects insertions /
     // removals; per-instance reads are racy-but-OK after creation
     // because instanceId allocation is single-threaded.
-    bool m_useSubprocess = false;
+    bool m_useSubprocess = true;
     QString m_workerScript;
     QString m_subprocessPythonExe;
     QMap<int, PanelSubprocess*> m_panelProcs;
+    QMap<QString, PanelSubprocess*> m_idlePanelProcs; // serial -> reset worker
     mutable QMutex m_panelProcsMutex;
 
     // Helper that routes one JSON-RPC call to the panel's subprocess.
@@ -176,6 +179,8 @@ private:
     // any failure (no subprocess, send failed, worker reported error).
     QJsonObject subprocessCall(int instanceId, const QString &cmd,
                                 const QJsonObject &args, int timeoutMs = 60000);
+    void markSubprocessUnhealthy(int instanceId, const QString &operation,
+                                 const QString &detail);
 
     // Main Python worker thread — used for interpreter init, module imports,
     // device enumeration, and other non-per-instance work. Per-instance ops
