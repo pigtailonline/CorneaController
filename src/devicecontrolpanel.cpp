@@ -518,7 +518,7 @@ void DeviceControlPanel::setupConnections()
     connect(m_controller.get(), &CorneaController::temperatureUpdated,
             this, &DeviceControlPanel::onControllerTemperatureUpdated);
     connect(m_controller.get(), &CorneaController::errorOccurred,
-            this, &DeviceControlPanel::onControllerError);
+            this, &DeviceControlPanel::onControllerError, Qt::QueuedConnection);
 
     // Refresh UI whenever the controller's power state changes. Without this
     // connection, TCP-triggered powerOn/powerOff (called via the controller
@@ -535,6 +535,7 @@ void DeviceControlPanel::setupConnections()
     // a fresh USB-level connect.
     connect(m_controller.get(), &CorneaController::powerStateChanged,
             this, [this](bool poweredOn){
+                m_commandError = false;
                 updateUIState();
                 if (poweredOn) {
                     updatePanelInfo();
@@ -612,6 +613,10 @@ void DeviceControlPanel::updateUIState()
     // user-visible "Connecting → Off → On" oscillation.
     if (m_powerOpInProgress) {
         // status label preserved by the on-click handler
+    } else if (poweredOn && m_commandError) {
+        m_lblStatus->setText("On - Command Error");
+        m_lblStatus->setStyleSheet(
+            "color: darkorange; font-weight: bold;");
     } else if (poweredOn) {
         m_lblStatus->setText("On");
         m_lblStatus->setStyleSheet("color: green; font-weight: bold;");
@@ -905,6 +910,7 @@ void DeviceControlPanel::onSendImageClicked()
 
 void DeviceControlPanel::onControllerConnected()
 {
+    m_commandError = false;
     updateUIState();
     emit connectionChanged(m_panelId, true);
     emit logMessage(panelLabel(), QString("Connected: %1").arg(m_controller->getDeviceLabel()));
@@ -993,6 +999,7 @@ void DeviceControlPanel::onControllerConnected()
 
 void DeviceControlPanel::onControllerDisconnected()
 {
+    m_commandError = false;
     updateUIState();
     emit connectionChanged(m_panelId, false);
 
@@ -1111,7 +1118,19 @@ void DeviceControlPanel::onControllerTemperatureUpdated(double rj1, double da927
         return QString("%1 C").arg(temp, 0, 'f', 1);
     };
 
-    m_lblRj1Temp->setText(formatTemp(rj1));
+    const bool invalidRj1 = !std::isfinite(rj1)
+                         || (rj1 <= -30.0 && rj1 > -900.0);
+    if (invalidRj1) {
+        m_lblRj1Temp->setText(QString("Invalid (%1 C)").arg(rj1, 0, 'f', 1));
+        m_lblRj1Temp->setStyleSheet("color: red; font-weight: bold;");
+        m_commandError = true;
+        updateUIState();
+    } else {
+        m_lblRj1Temp->setStyleSheet(QString());
+        m_lblRj1Temp->setText(rj1 <= -900.0
+            ? QStringLiteral("-")
+            : QString("%1 C").arg(rj1, 0, 'f', 1));
+    }
     m_lblDa9272Temp->setText(formatTemp(da9272));
 }
 
@@ -1169,6 +1188,10 @@ void DeviceControlPanel::onTemperatureMonitorTimeout()
 void DeviceControlPanel::onControllerError(const QString &error)
 {
     emit logMessage(panelLabel(), QString("ERROR: %1").arg(error));
+    if (isPoweredOn()) {
+        m_commandError = true;
+        updateUIState();
+    }
 }
 
 void DeviceControlPanel::onControllerLog(const QString &message)

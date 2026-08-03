@@ -257,6 +257,16 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("setInstanceError(instanceId, commandError)", frame_fallback)
         self.assertIn("if (error) *error = commandError", frame_fallback)
 
+    def test_powered_panel_latches_command_error_ui(self):
+        header = read("src/devicecontrolpanel.h")
+        source = read("src/devicecontrolpanel.cpp")
+
+        self.assertIn("bool m_commandError = false;", header)
+        self.assertIn('m_lblStatus->setText("On - Command Error")', source)
+        self.assertIn("color: darkorange", source)
+        self.assertIn('QString("Invalid (%1 C)")', source)
+        self.assertIn("m_commandError = true", source)
+
 
 if __name__ == "__main__":
     unittest.main()

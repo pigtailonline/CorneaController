@@ -222,6 +222,7 @@ private:
     // the button "come back" and clicked again, racing pyftdi resources
     // between two CorneaRax720 instances. updateUIState() respects this flag.
     bool m_powerOpInProgress = false;
+    bool m_commandError = false;
 
 public:
     // APL calculation with gamma LUT (fast, same result as std::pow)
