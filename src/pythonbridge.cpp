@@ -357,6 +357,25 @@ static void watchdogEnsureStarted() {
 // lambda fired and wrote to the dead stack frame → access violation, process
 // died. Observed 2026-05-12 15:07: three simultaneous dispatchToDevice
 // timeouts on inst=6/7/8 followed by process crash.
+class SharedErrorDetail {
+public:
+    void set(const QString &detail)
+    {
+        QMutexLocker lock(&m_mutex);
+        m_detail = detail;
+    }
+
+    QString get() const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_detail;
+    }
+
+private:
+    mutable QMutex m_mutex;
+    QString m_detail;
+};
+
 template<typename Result>
 struct InvokeState {
     Result result{};
@@ -1506,13 +1525,13 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         return instanceId;
     }
 
-    const auto creationError = std::make_shared<QString>();
+    const auto creationError = std::make_shared<SharedErrorDetail>();
     const int instanceId = dispatch(
         [this, deviceIndex, hardwareVariant, expectedSerial, creationError]() -> int {
         if (!m_initialized) {
             const QString detail = QStringLiteral("Python bridge not initialized");
             setError(detail);
-            *creationError = detail;
+            creationError->set(detail);
             return -1;
         }
 
@@ -1557,7 +1576,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
             if (!future) {
                 const QString detail = QString("Failed to submit device %1 to executor").arg(deviceIndex);
                 setError(detail);
-                *creationError = detail;
+                creationError->set(detail);
                 PyErr_Print();
                 m_nextInstanceId--;
                 return -1;
@@ -1619,7 +1638,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
             QString fullError = QString("Failed to create device %1: [%2] %3")
                                     .arg(deviceIndex).arg(typeName, pyError);
             setError(fullError);
-            *creationError = fullError;
+            creationError->set(fullError);
             emit logMessage(QString("[Instance %1] FAILED: %2").arg(instanceId).arg(fullError));
             return -1;
         }
@@ -1650,7 +1669,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                 detail = QString("Hardware initialization failed for device %1 (init_ok=False)").arg(deviceIndex);
             }
             setError(detail);
-            *creationError = detail;
+            creationError->set(detail);
             emit logMessage(QString("[Instance %1] FAILED: %2").arg(instanceId).arg(detail));
             Py_DECREF(instance);
             return -1;
@@ -1669,7 +1688,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                     .arg(expectedSerial,
                          serial.isEmpty() ? QStringLiteral("<empty>") : serial);
             setError(detail);
-            *creationError = detail;
+            creationError->set(detail);
             emit logMessage(QString("[Instance %1] %2 — rejecting instance")
                                 .arg(instanceId).arg(detail));
             Py_DECREF(instance);
@@ -1691,7 +1710,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
 
         return instanceId;
     });
-    if (error) *error = *creationError;
+    if (error) *error = creationError->get();
     return instanceId;
 }
 
@@ -1976,14 +1995,14 @@ bool PythonBridge::systemPowerOn(int instanceId, QString *error)
         return true;
     }
 
-    const auto failureDetail = std::make_shared<QString>();
+    const auto failureDetail = std::make_shared<SharedErrorDetail>();
     const bool success = dispatchToDevice(
         instanceId, [this, instanceId, failureDetail]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_on");
         if (!result) {
-            *failureDetail = QString("[Instance %1] System power ON FAILED: %2")
+            failureDetail->set(QString("[Instance %1] System power ON FAILED: %2")
                 .arg(instanceId)
-                .arg(QStringLiteral("Error calling method: system_power_on"));
+                .arg(QStringLiteral("Error calling method: system_power_on")));
             flushPythonOutput();
             return false;
         }
@@ -1999,18 +2018,19 @@ bool PythonBridge::systemPowerOn(int instanceId, QString *error)
         Py_DECREF(result);
         if (initOk) return true;
 
-        *failureDetail = QString(
+        failureDetail->set(QString(
             "[Instance %1] System power ON returned init_ok=False "
             "(panel not responding — check Pogo connection / hardware)")
-            .arg(instanceId);
+            .arg(instanceId));
         flushPythonOutput();
         return false;
     });
 
     if (!success) {
-        return fail(failureDetail->isEmpty()
+        const QString detail = failureDetail->get();
+        return fail(detail.isEmpty()
             ? QString("[Instance %1] System power ON FAILED").arg(instanceId)
-            : *failureDetail);
+            : detail);
     }
     clearInstanceError(instanceId);
     if (error) error->clear();
@@ -2102,44 +2122,44 @@ bool PythonBridge::setBrightness(int instanceId, double level, QString *error)
                                 detail);
         return false;
     }
-    const auto fallbackDetail = std::make_shared<QString>();
+    const auto fallbackDetail = std::make_shared<SharedErrorDetail>();
     const bool success = dispatchToDevice(instanceId, [this, instanceId, level, fallbackDetail]() -> bool {
         PyObject *args = PyTuple_Pack(1, PyFloat_FromDouble(level));
         PyObject *result = callInstanceMethod(instanceId, "set_brightness", args);
         Py_DECREF(args);
         if (!result) {
-            *fallbackDetail = QStringLiteral(
-                "BRIGHTNESS_SET_FAILED: set_brightness failed");
+            fallbackDetail->set(QStringLiteral(
+                "BRIGHTNESS_SET_FAILED: set_brightness failed"));
             return false;
         }
         const bool setterReturnedFalse = result == Py_False;
         Py_DECREF(result);
         if (setterReturnedFalse) {
-            *fallbackDetail = QStringLiteral(
-                "BRIGHTNESS_SET_FAILED: set_brightness returned False");
+            fallbackDetail->set(QStringLiteral(
+                "BRIGHTNESS_SET_FAILED: set_brightness returned False"));
             return false;
         }
 
         PyObject *readback = callInstanceMethod(instanceId, "get_brightness");
         if (!readback) {
-            *fallbackDetail = QStringLiteral(
-                "BRIGHTNESS_SET_FAILED: get_brightness failed");
+            fallbackDetail->set(QStringLiteral(
+                "BRIGHTNESS_SET_FAILED: get_brightness failed"));
             return false;
         }
         const double actual = PyFloat_AsDouble(readback);
         Py_DECREF(readback);
         if (PyErr_Occurred()) {
             PyErr_Clear();
-            *fallbackDetail = QStringLiteral(
-                "BRIGHTNESS_SET_FAILED: get_brightness failed");
+            fallbackDetail->set(QStringLiteral(
+                "BRIGHTNESS_SET_FAILED: get_brightness failed"));
             return false;
         }
         if (!std::isfinite(actual)
             || qRound64(actual * 100.0) != qRound64(level * 100.0)) {
-            *fallbackDetail = QStringLiteral(
+            fallbackDetail->set(QStringLiteral(
                 "BRIGHTNESS_SET_FAILED: requested=%1, actual=%2")
                 .arg(level, 0, 'f', 2)
-                .arg(actual, 0, 'f', 2);
+                .arg(actual, 0, 'f', 2));
             return false;
         }
 
@@ -2152,9 +2172,10 @@ bool PythonBridge::setBrightness(int instanceId, double level, QString *error)
         return true;
     }
 
-    const QString commandError = fallbackDetail->isEmpty()
+    const QString detail = fallbackDetail->get();
+    const QString commandError = detail.isEmpty()
         ? QStringLiteral("BRIGHTNESS_SET_FAILED: set_brightness failed")
-        : *fallbackDetail;
+        : detail;
     setInstanceError(instanceId, commandError);
     if (error) *error = commandError;
     return false;
@@ -2327,20 +2348,20 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
         }
         return false;
     }
-    const auto fallbackDetail = std::make_shared<QString>();
+    const auto fallbackDetail = std::make_shared<SharedErrorDetail>();
     const bool success = dispatchToDevice(instanceId, [this, instanceId, image, fallbackDetail]() -> bool {
         PyObject *instance = getDeviceInstance(instanceId);
         if (!instance) {
             setError(QString("Device instance %1 not found").arg(instanceId));
-            *fallbackDetail = QStringLiteral(
-                "IMAGE_TRANSFER_FAILED: device instance not found");
+            fallbackDetail->set(QStringLiteral(
+                "IMAGE_TRANSFER_FAILED: device instance not found"));
             return false;
         }
 
         PyObject *pyArray = qimageToPyArray(image);
         if (!pyArray) {
-            *fallbackDetail = QStringLiteral(
-                "IMAGE_TRANSFER_FAILED: failed to convert image");
+            fallbackDetail->set(QStringLiteral(
+                "IMAGE_TRANSFER_FAILED: failed to convert image"));
             return false;
         }
 
@@ -2349,8 +2370,8 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
             setError(QString("write_rj1_frame not found on instance %1").arg(instanceId));
             PyErr_Clear();
             Py_DECREF(pyArray);
-            *fallbackDetail = QStringLiteral(
-                "IMAGE_TRANSFER_FAILED: write_rj1_frame not found");
+            fallbackDetail->set(QStringLiteral(
+                "IMAGE_TRANSFER_FAILED: write_rj1_frame not found"));
             return false;
         }
 
@@ -2390,8 +2411,8 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
             } else {
                 emit logMessage(QString("[Instance %1] Frame write returned False (rax write_rj1_frame: %2 ms)")
                                     .arg(instanceId).arg(rax_call_ms));
-                *fallbackDetail = QStringLiteral(
-                    "IMAGE_TRANSFER_FAILED: write_rj1_frame returned False");
+                fallbackDetail->set(QStringLiteral(
+                    "IMAGE_TRANSFER_FAILED: write_rj1_frame returned False"));
             }
             return success;
         }
@@ -2399,8 +2420,8 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
         emit logMessage(QString("[Instance %1] Frame write threw (rax write_rj1_frame: %2 ms before throw)")
                             .arg(instanceId).arg(rax_call_ms));
         PyErr_Print();
-        *fallbackDetail = QStringLiteral(
-            "IMAGE_TRANSFER_FAILED: write_rj1_frame failed");
+        fallbackDetail->set(QStringLiteral(
+            "IMAGE_TRANSFER_FAILED: write_rj1_frame failed"));
         return false;
     });
     if (success) {
@@ -2409,9 +2430,10 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
         return true;
     }
 
-    const QString commandError = fallbackDetail->isEmpty()
+    const QString detail = fallbackDetail->get();
+    const QString commandError = detail.isEmpty()
         ? QStringLiteral("IMAGE_TRANSFER_FAILED: write_rj1_frame failed")
-        : *fallbackDetail;
+        : detail;
     setInstanceError(instanceId, commandError);
     if (error) *error = commandError;
     return false;

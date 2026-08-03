@@ -307,6 +307,19 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("setLastError(commandError)", brightness)
         self.assertIn("setLastError(commandError)", image)
 
+    def test_shared_error_detail_synchronizes_worker_writes_and_caller_reads(self):
+        source = read("src/pythonbridge.cpp")
+        self.assertIn("class SharedErrorDetail", source)
+
+        state = function_body(source, "class SharedErrorDetail")
+        setter = function_body(state, "void set(const QString &detail)")
+        getter = function_body(state, "QString get() const")
+        self.assertIn("mutable QMutex m_mutex;", state)
+        self.assertIn("QMutexLocker lock(&m_mutex);", setter)
+        self.assertIn("m_detail = detail;", setter)
+        self.assertIn("QMutexLocker lock(&m_mutex);", getter)
+        self.assertIn("return m_detail;", getter)
+
     def test_embedded_create_keeps_caller_error_outside_dispatched_lambda(self):
         body = function_body(
             read("src/pythonbridge.cpp"),
@@ -322,15 +335,58 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
 
         self.assertNotRegex(capture, r"\berror\b")
         self.assertNotIn("*error", dispatched_body)
-        self.assertIn("std::make_shared<QString>()", body[:dispatch_start])
+        self.assertIn(
+            "std::make_shared<SharedErrorDetail>()", body[:dispatch_start]
+        )
         self.assertEqual(
             dispatched_body.count("setError("),
-            dispatched_body.count("*creationError ="),
+            dispatched_body.count("creationError->set("),
         )
+        self.assertNotIn("*creationError", body)
+        self.assertNotIn("creationError->isEmpty()", body)
 
-        caller_copy = "if (error) *error = *creationError;"
+        caller_copy = "if (error) *error = creationError->get();"
         self.assertIn(caller_copy, body)
         self.assertGreater(body.index(caller_copy), dispatch_start + len(dispatch_call))
+
+    def test_embedded_command_error_details_are_synchronized_across_dispatch(self):
+        source = read("src/pythonbridge.cpp")
+        cases = (
+            (
+                "bool PythonBridge::systemPowerOn(int instanceId, QString *error)",
+                "failureDetail",
+            ),
+            (
+                "bool PythonBridge::setBrightness(int instanceId, double level, QString *error)",
+                "fallbackDetail",
+            ),
+            (
+                "bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *error)",
+                "fallbackDetail",
+            ),
+        )
+
+        for signature, state_name in cases:
+            with self.subTest(signature=signature):
+                body = function_body(source, signature)
+                dispatch_start = body.index("dispatchToDevice(")
+                dispatch_call = call_expression(body, dispatch_start)
+                capture_start = dispatch_call.index("[")
+                capture_end = dispatch_call.index("]", capture_start) + 1
+                capture = dispatch_call[capture_start:capture_end]
+                dispatched_body = block_body(dispatch_call, capture_start)
+                caller_body = body[dispatch_start + len(dispatch_call) :]
+
+                self.assertIn(state_name, capture)
+                self.assertNotRegex(capture, r"\berror\b")
+                self.assertIn(
+                    "std::make_shared<SharedErrorDetail>()",
+                    body[:dispatch_start],
+                )
+                self.assertIn(f"{state_name}->set(", dispatched_body)
+                self.assertIn(f"{state_name}->get()", caller_body)
+                self.assertNotIn(f"*{state_name}", body)
+                self.assertNotIn(f"{state_name}->isEmpty()", body)
 
     def test_invalid_temperature_replaces_the_tcp_temperature_observation(self):
         header = read("src/corneacontroller.h")
