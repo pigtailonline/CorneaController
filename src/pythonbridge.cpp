@@ -1506,11 +1506,13 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         return instanceId;
     }
 
-    return dispatch([this, deviceIndex, hardwareVariant, expectedSerial, error]() -> int {
+    const auto creationError = std::make_shared<QString>();
+    const int instanceId = dispatch(
+        [this, deviceIndex, hardwareVariant, expectedSerial, creationError]() -> int {
         if (!m_initialized) {
             const QString detail = QStringLiteral("Python bridge not initialized");
             setError(detail);
-            if (error) *error = detail;
+            *creationError = detail;
             return -1;
         }
 
@@ -1555,7 +1557,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
             if (!future) {
                 const QString detail = QString("Failed to submit device %1 to executor").arg(deviceIndex);
                 setError(detail);
-                if (error) *error = detail;
+                *creationError = detail;
                 PyErr_Print();
                 m_nextInstanceId--;
                 return -1;
@@ -1617,7 +1619,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
             QString fullError = QString("Failed to create device %1: [%2] %3")
                                     .arg(deviceIndex).arg(typeName, pyError);
             setError(fullError);
-            if (error) *error = fullError;
+            *creationError = fullError;
             emit logMessage(QString("[Instance %1] FAILED: %2").arg(instanceId).arg(fullError));
             return -1;
         }
@@ -1648,7 +1650,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                 detail = QString("Hardware initialization failed for device %1 (init_ok=False)").arg(deviceIndex);
             }
             setError(detail);
-            if (error) *error = detail;
+            *creationError = detail;
             emit logMessage(QString("[Instance %1] FAILED: %2").arg(instanceId).arg(detail));
             Py_DECREF(instance);
             return -1;
@@ -1667,7 +1669,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                     .arg(expectedSerial,
                          serial.isEmpty() ? QStringLiteral("<empty>") : serial);
             setError(detail);
-            if (error) *error = detail;
+            *creationError = detail;
             emit logMessage(QString("[Instance %1] %2 — rejecting instance")
                                 .arg(instanceId).arg(detail));
             Py_DECREF(instance);
@@ -1689,6 +1691,8 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
 
         return instanceId;
     });
+    if (error) *error = *creationError;
+    return instanceId;
 }
 
 int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant,

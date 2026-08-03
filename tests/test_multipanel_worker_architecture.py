@@ -307,6 +307,31 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("setLastError(commandError)", brightness)
         self.assertIn("setLastError(commandError)", image)
 
+    def test_embedded_create_keeps_caller_error_outside_dispatched_lambda(self):
+        body = function_body(
+            read("src/pythonbridge.cpp"),
+            "int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareVariant,\n"
+            "                                       const QString &expectedSerial, QString *error)",
+        )
+        dispatch_start = body.index("dispatch(")
+        dispatch_call = call_expression(body, dispatch_start)
+        capture_start = dispatch_call.index("[")
+        capture_end = dispatch_call.index("]", capture_start) + 1
+        capture = dispatch_call[capture_start:capture_end]
+        dispatched_body = block_body(dispatch_call, capture_start)
+
+        self.assertNotRegex(capture, r"\berror\b")
+        self.assertNotIn("*error", dispatched_body)
+        self.assertIn("std::make_shared<QString>()", body[:dispatch_start])
+        self.assertEqual(
+            dispatched_body.count("setError("),
+            dispatched_body.count("*creationError ="),
+        )
+
+        caller_copy = "if (error) *error = *creationError;"
+        self.assertIn(caller_copy, body)
+        self.assertGreater(body.index(caller_copy), dispatch_start + len(dispatch_call))
+
     def test_invalid_temperature_replaces_the_tcp_temperature_observation(self):
         header = read("src/corneacontroller.h")
         body = function_body(
