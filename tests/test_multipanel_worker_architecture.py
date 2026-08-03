@@ -12,6 +12,10 @@ def read(rel: str) -> str:
 
 def function_body(source: str, signature: str) -> str:
     start = source.index(signature)
+    return block_body(source, start)
+
+
+def block_body(source: str, start: int) -> str:
     brace = source.index("{", start)
     depth = 0
     for i in range(brace, len(source)):
@@ -257,15 +261,108 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("setInstanceError(instanceId, commandError)", frame_fallback)
         self.assertIn("if (error) *error = commandError", frame_fallback)
 
-    def test_powered_panel_latches_command_error_ui(self):
+    def test_powered_panel_error_handler_latches_only_while_powered(self):
+        source = read("src/devicecontrolpanel.cpp")
+        error_body = function_body(
+            source,
+            "void DeviceControlPanel::onControllerError(const QString &error)",
+        )
+        powered_guard_start = error_body.index("if (isPoweredOn())")
+        powered_guard = block_body(error_body, powered_guard_start)
+
+        self.assertIn('emit logMessage(panelLabel(), QString("ERROR: %1").arg(error));', error_body)
+        self.assertEqual(error_body.count("m_commandError = true"), 1)
+        self.assertNotIn("m_commandError = true", error_body[:powered_guard_start])
+        self.assertIn("m_commandError = true", powered_guard)
+        self.assertIn("updateUIState();", powered_guard)
+
+    def test_powered_panel_command_error_status_precedes_normal_on_status(self):
+        status_body = function_body(
+            read("src/devicecontrolpanel.cpp"),
+            "void DeviceControlPanel::updateUIState()",
+        )
+        command_error_branch = status_body.index(
+            "} else if (poweredOn && m_commandError) {"
+        )
+        normal_on_branch = status_body.index("} else if (poweredOn) {")
+
+        self.assertLess(command_error_branch, normal_on_branch)
+        self.assertIn(
+            'm_lblStatus->setText("On - Command Error")',
+            status_body[command_error_branch:normal_on_branch],
+        )
+        self.assertIn(
+            "color: darkorange; font-weight: bold;",
+            status_body[command_error_branch:normal_on_branch],
+        )
+
+    def test_powered_panel_command_error_latch_resets_only_on_power_lifecycle(self):
         header = read("src/devicecontrolpanel.h")
         source = read("src/devicecontrolpanel.cpp")
+        power_off_body = function_body(
+            source,
+            "DeviceControlPanel::OpResult DeviceControlPanel::powerOffCore()",
+        )
+        connected_body = function_body(
+            source,
+            "void DeviceControlPanel::onControllerConnected()",
+        )
+        disconnected_body = function_body(
+            source,
+            "void DeviceControlPanel::onControllerDisconnected()",
+        )
+        setup_body = function_body(source, "void DeviceControlPanel::setupConnections()")
+        power_state_start = setup_body.index(
+            "connect(m_controller.get(), &CorneaController::powerStateChanged"
+        )
+        power_state_body = block_body(setup_body, power_state_start)
 
         self.assertIn("bool m_commandError = false;", header)
-        self.assertIn('m_lblStatus->setText("On - Command Error")', source)
-        self.assertIn("color: darkorange", source)
-        self.assertIn('QString("Invalid (%1 C)")', source)
-        self.assertIn("m_commandError = true", source)
+        self.assertIn("m_controller->disconnect()", power_off_body)
+        self.assertIn("m_commandError = false;", disconnected_body)
+        self.assertIn("m_commandError = false;", connected_body)
+        self.assertIn("m_commandError = false;", power_state_body)
+        self.assertLess(
+            power_state_body.index("m_commandError = false;"),
+            power_state_body.index("if (poweredOn)"),
+        )
+
+        for signature in (
+            "void DeviceControlPanel::onControllerBrightnessChanged(double level)",
+            "void DeviceControlPanel::onControllerXFlipChanged(bool flip)",
+            "void DeviceControlPanel::onControllerYFlipChanged(bool flip)",
+        ):
+            self.assertNotIn("m_commandError = false", function_body(source, signature))
+
+    def test_powered_panel_invalid_rj1_feedback_preserves_unavailable_value(self):
+        temperature_body = function_body(
+            read("src/devicecontrolpanel.cpp"),
+            "void DeviceControlPanel::onControllerTemperatureUpdated(double rj1, double da9272)",
+        )
+        invalid_definition_end = temperature_body.index("if (invalidRj1)")
+        invalid_body = block_body(temperature_body, invalid_definition_end)
+        valid_start = temperature_body.index("} else {", invalid_definition_end)
+        valid_body = block_body(temperature_body, valid_start)
+
+        self.assertIn("!std::isfinite(rj1)", temperature_body[:invalid_definition_end])
+        self.assertIn(
+            "(rj1 <= -30.0 && rj1 > -900.0)",
+            temperature_body[:invalid_definition_end],
+        )
+        self.assertIn(
+            "m_lblRj1Temp->setText(QString(\"Invalid (%1 C)\").arg(rj1, 0, 'f', 1));",
+            invalid_body,
+        )
+        self.assertIn(
+            "m_lblRj1Temp->setStyleSheet(\"color: red; font-weight: bold;\");",
+            invalid_body,
+        )
+        self.assertIn("m_commandError = true;", invalid_body)
+        self.assertIn("updateUIState();", invalid_body)
+        self.assertIn("m_lblRj1Temp->setStyleSheet(QString());", valid_body)
+        self.assertIn("rj1 <= -900.0", valid_body)
+        self.assertIn('QStringLiteral("-")', valid_body)
+        self.assertNotIn("m_commandError = true", valid_body)
 
 
 if __name__ == "__main__":
