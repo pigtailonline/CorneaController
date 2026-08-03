@@ -25,10 +25,27 @@ def block_body(source: str, start: int) -> str:
             depth -= 1
             if depth == 0:
                 return source[brace + 1:i]
-    raise AssertionError(f"function body not found: {signature}")
+    raise AssertionError(f"block body not found from index {start}")
+
+
+def call_expression(source: str, start: int) -> str:
+    paren = source.index("(", start)
+    depth = 0
+    for i in range(paren, len(source)):
+        if source[i] == "(":
+            depth += 1
+        elif source[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return source[start:i + 1]
+    raise AssertionError(f"call expression not closed from index {start}")
 
 
 class MultiPanelWorkerArchitectureTests(unittest.TestCase):
+    def test_block_body_reports_start_index_when_unclosed(self):
+        with self.assertRaisesRegex(AssertionError, "block body not found from index 0"):
+            block_body("{", 0)
+
     def test_usb_serialization_config_defaults_off_and_is_persisted(self):
         header = read("src/corneaconfig.h")
         source = read("src/corneaconfig.cpp")
@@ -296,9 +313,10 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
             status_body[command_error_branch:normal_on_branch],
         )
 
-    def test_powered_panel_command_error_latch_resets_only_on_power_lifecycle(self):
+    def test_powered_panel_globally_confines_command_error_clears(self):
         header = read("src/devicecontrolpanel.h")
         source = read("src/devicecontrolpanel.cpp")
+        clear = "m_commandError = false;"
         power_off_body = function_body(
             source,
             "DeviceControlPanel::OpResult DeviceControlPanel::powerOffCore()",
@@ -317,22 +335,29 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         )
         power_state_body = block_body(setup_body, power_state_start)
 
-        self.assertIn("bool m_commandError = false;", header)
+        self.assertEqual(header.count(clear), 1)
         self.assertIn("m_controller->disconnect()", power_off_body)
-        self.assertIn("m_commandError = false;", disconnected_body)
-        self.assertIn("m_commandError = false;", connected_body)
-        self.assertIn("m_commandError = false;", power_state_body)
+        self.assertEqual(disconnected_body.count(clear), 1)
+        self.assertEqual(connected_body.count(clear), 1)
+        self.assertEqual(power_state_body.count(clear), 1)
         self.assertLess(
-            power_state_body.index("m_commandError = false;"),
+            disconnected_body.index(clear),
+            disconnected_body.index("updateUIState();"),
+        )
+        self.assertLess(
+            connected_body.index(clear),
+            connected_body.index("updateUIState();"),
+        )
+        self.assertEqual(
+            source.count(clear),
+            disconnected_body.count(clear)
+            + connected_body.count(clear)
+            + power_state_body.count(clear),
+        )
+        self.assertLess(
+            power_state_body.index(clear),
             power_state_body.index("if (poweredOn)"),
         )
-
-        for signature in (
-            "void DeviceControlPanel::onControllerBrightnessChanged(double level)",
-            "void DeviceControlPanel::onControllerXFlipChanged(bool flip)",
-            "void DeviceControlPanel::onControllerYFlipChanged(bool flip)",
-        ):
-            self.assertNotIn("m_commandError = false", function_body(source, signature))
 
     def test_powered_panel_invalid_rj1_feedback_preserves_unavailable_value(self):
         temperature_body = function_body(
@@ -343,6 +368,8 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         invalid_body = block_body(temperature_body, invalid_definition_end)
         valid_start = temperature_body.index("} else {", invalid_definition_end)
         valid_body = block_body(temperature_body, valid_start)
+        valid_display_start = valid_body.index("m_lblRj1Temp->setText")
+        valid_display = call_expression(valid_body, valid_display_start)
 
         self.assertIn("!std::isfinite(rj1)", temperature_body[:invalid_definition_end])
         self.assertIn(
@@ -359,9 +386,16 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         )
         self.assertIn("m_commandError = true;", invalid_body)
         self.assertIn("updateUIState();", invalid_body)
-        self.assertIn("m_lblRj1Temp->setStyleSheet(QString());", valid_body)
-        self.assertIn("rj1 <= -900.0", valid_body)
-        self.assertIn('QStringLiteral("-")', valid_body)
+        self.assertLess(
+            valid_body.index("m_lblRj1Temp->setStyleSheet(QString());"),
+            valid_display_start,
+        )
+        self.assertEqual(
+            valid_display,
+            "m_lblRj1Temp->setText(rj1 <= -900.0\n"
+            "            ? QStringLiteral(\"-\")\n"
+            "            : QString(\"%1 C\").arg(rj1, 0, 'f', 1))",
+        )
         self.assertNotIn("m_commandError = true", valid_body)
 
 
