@@ -234,6 +234,29 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("m_hasRj1TemperatureObservation = true", after_read)
         self.assertNotIn("return m_cachedRj1Temp;", after_read)
 
+    def test_embedded_fallback_populates_command_local_errors(self):
+        bridge = read("src/pythonbridge.cpp")
+        brightness = function_body(
+            bridge,
+            "bool PythonBridge::setBrightness(int instanceId, double level, QString *error)",
+        )
+        frame = function_body(
+            bridge,
+            "bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *error)",
+        )
+
+        brightness_fallback = brightness
+        self.assertIn("const bool success = dispatchToDevice", brightness_fallback)
+        self.assertIn("BRIGHTNESS_SET_FAILED:", brightness_fallback)
+        self.assertIn("setInstanceError(instanceId, commandError)", brightness_fallback)
+        self.assertIn("if (error) *error = commandError", brightness_fallback)
+
+        frame_fallback = frame
+        self.assertIn("const bool success = dispatchToDevice", frame_fallback)
+        self.assertIn("IMAGE_TRANSFER_FAILED:", frame_fallback)
+        self.assertIn("setInstanceError(instanceId, commandError)", frame_fallback)
+        self.assertIn("if (error) *error = commandError", frame_fallback)
+
 
 if __name__ == "__main__":
     unittest.main()

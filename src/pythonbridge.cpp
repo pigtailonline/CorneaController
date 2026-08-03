@@ -2060,17 +2060,38 @@ bool PythonBridge::setBrightness(int instanceId, double level, QString *error)
                                 detail);
         return false;
     }
-    return dispatchToDevice(instanceId, [this, instanceId, level]() -> bool {
+    const auto fallbackDetail = std::make_shared<QString>();
+    const bool success = dispatchToDevice(instanceId, [this, instanceId, level, fallbackDetail]() -> bool {
         PyObject *args = PyTuple_Pack(1, PyFloat_FromDouble(level));
         PyObject *result = callInstanceMethod(instanceId, "set_brightness", args);
         Py_DECREF(args);
         if (result) {
+            const bool success = result != Py_False;
             Py_DECREF(result);
-            emit logMessage(QString("[Instance %1] Brightness set to %2").arg(instanceId).arg(level));
-            return true;
+            if (success) {
+                emit logMessage(QString("[Instance %1] Brightness set to %2").arg(instanceId).arg(level));
+                return true;
+            }
+            *fallbackDetail = QStringLiteral(
+                "BRIGHTNESS_SET_FAILED: set_brightness returned False");
+            return false;
         }
+        *fallbackDetail = QStringLiteral(
+            "BRIGHTNESS_SET_FAILED: set_brightness failed");
         return false;
     });
+    if (success) {
+        clearInstanceError(instanceId);
+        if (error) error->clear();
+        return true;
+    }
+
+    const QString commandError = fallbackDetail->isEmpty()
+        ? QStringLiteral("BRIGHTNESS_SET_FAILED: set_brightness failed")
+        : *fallbackDetail;
+    setInstanceError(instanceId, commandError);
+    if (error) *error = commandError;
+    return false;
 }
 
 double PythonBridge::getBrightness(int instanceId)
@@ -2240,15 +2261,20 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
         }
         return false;
     }
-    return dispatchToDevice(instanceId, [this, instanceId, image]() -> bool {
+    const auto fallbackDetail = std::make_shared<QString>();
+    const bool success = dispatchToDevice(instanceId, [this, instanceId, image, fallbackDetail]() -> bool {
         PyObject *instance = getDeviceInstance(instanceId);
         if (!instance) {
             setError(QString("Device instance %1 not found").arg(instanceId));
+            *fallbackDetail = QStringLiteral(
+                "IMAGE_TRANSFER_FAILED: device instance not found");
             return false;
         }
 
         PyObject *pyArray = qimageToPyArray(image);
         if (!pyArray) {
+            *fallbackDetail = QStringLiteral(
+                "IMAGE_TRANSFER_FAILED: failed to convert image");
             return false;
         }
 
@@ -2257,6 +2283,8 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
             setError(QString("write_rj1_frame not found on instance %1").arg(instanceId));
             PyErr_Clear();
             Py_DECREF(pyArray);
+            *fallbackDetail = QStringLiteral(
+                "IMAGE_TRANSFER_FAILED: write_rj1_frame not found");
             return false;
         }
 
@@ -2296,6 +2324,8 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
             } else {
                 emit logMessage(QString("[Instance %1] Frame write returned False (rax write_rj1_frame: %2 ms)")
                                     .arg(instanceId).arg(rax_call_ms));
+                *fallbackDetail = QStringLiteral(
+                    "IMAGE_TRANSFER_FAILED: write_rj1_frame returned False");
             }
             return success;
         }
@@ -2303,8 +2333,22 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
         emit logMessage(QString("[Instance %1] Frame write threw (rax write_rj1_frame: %2 ms before throw)")
                             .arg(instanceId).arg(rax_call_ms));
         PyErr_Print();
+        *fallbackDetail = QStringLiteral(
+            "IMAGE_TRANSFER_FAILED: write_rj1_frame failed");
         return false;
     });
+    if (success) {
+        clearInstanceError(instanceId);
+        if (error) error->clear();
+        return true;
+    }
+
+    const QString commandError = fallbackDetail->isEmpty()
+        ? QStringLiteral("IMAGE_TRANSFER_FAILED: write_rj1_frame failed")
+        : *fallbackDetail;
+    setInstanceError(instanceId, commandError);
+    if (error) *error = commandError;
+    return false;
 }
 
 bool PythonBridge::writeFrameFromPath(int instanceId, const QString &imagePath)
