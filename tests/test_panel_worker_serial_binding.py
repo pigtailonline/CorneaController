@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 import unittest
@@ -193,6 +194,54 @@ class PanelWorkerSerialBindingTests(unittest.TestCase):
         result = worker.cmd_getTemperature({})
         self.assertFalse(result["ok"])
         self.assertEqual(-40.0, result["temperature"])
+
+    def test_worker_loop_emits_strict_json_for_non_finite_temperatures(self):
+        harness = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import panel_worker
+
+temperature = float(sys.argv[2])
+original_init = panel_worker.Worker.__init__
+
+class FakeCornea:
+    def get_lea_temperature(self):
+        return temperature
+
+def fake_init(self):
+    original_init(self)
+    self.cornea = FakeCornea()
+
+panel_worker.Worker.__init__ = fake_init
+raise SystemExit(panel_worker.main())
+"""
+        requests = (
+            '{"id":1,"cmd":"getTemperature","args":{}}\n'
+            '{"id":2,"cmd":"shutdown","args":{}}\n'
+        )
+
+        for value in ("nan", "inf"):
+            with self.subTest(value=value):
+                result = subprocess.run(
+                    [sys.executable, "-c", harness, str(ROOT / "python"), value],
+                    input=requests,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                response_line = result.stdout.splitlines()[0]
+                response = json.loads(
+                    response_line,
+                    parse_constant=lambda token: self.fail(
+                        f"non-standard JSON token {token}: {response_line}"
+                    ),
+                )
+
+                self.assertTrue(response["success"])
+                self.assertFalse(response["data"]["ok"])
+                self.assertTrue(response["data"]["non_finite"])
+                self.assertIsNone(response["data"]["temperature"])
 
     def test_send_image_rejects_false_driver_result(self):
         import tempfile

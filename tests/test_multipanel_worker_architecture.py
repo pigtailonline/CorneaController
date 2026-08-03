@@ -66,7 +66,13 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         controller_cpp = read("src/corneacontroller.cpp")
         bridge_cpp = read("src/pythonbridge.cpp")
         worker_py = read("python/panel_worker.py")
-        self.assertIn("createDeviceInstance(deviceIndex, hardwareVariant, expectedSerial)", controller_cpp)
+        connect_body = function_body(controller_cpp, "bool CorneaController::connect")
+        create_call = call_expression(
+            connect_body, connect_body.index("m_bridge->createDeviceInstance")
+        )
+        self.assertIn("deviceIndex", create_call)
+        self.assertIn("hardwareVariant", create_call)
+        self.assertIn("expectedSerial", create_call)
         self.assertIn('"cornea_serial"', bridge_cpp)
         self.assertIn("expectedSerial.isEmpty()", bridge_cpp)
         self.assertIn("actual_serial != expected_serial", worker_py)
@@ -242,6 +248,65 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         ]
         self.assertIn("return false", semantic_branch)
 
+    def test_controller_lifecycle_errors_are_local_and_clear_when_stale(self):
+        bridge_header = read("src/pythonbridge.h")
+        bridge = read("src/pythonbridge.cpp")
+        controller = read("src/corneacontroller.cpp")
+
+        create_decl = call_expression(
+            bridge_header, bridge_header.index("int createDeviceInstance")
+        )
+        self.assertIn("const QString &expectedSerial = QString()", create_decl)
+        self.assertIn("QString *error = nullptr", create_decl)
+
+        connect_body = function_body(controller, "bool CorneaController::connect")
+        self.assertIn("QString commandError;", connect_body)
+        create_call = call_expression(
+            connect_body, connect_body.index("m_bridge->createDeviceInstance")
+        )
+        self.assertIn("deviceIndex", create_call)
+        self.assertIn("hardwareVariant", create_call)
+        self.assertIn("expectedSerial", create_call)
+        self.assertIn("&commandError", create_call)
+        self.assertIn("return failWithError(commandError", connect_body)
+        self.assertIn("setLastError(QString());", connect_body)
+
+        power_on = function_body(controller, "bool CorneaController::powerOn()")
+        self.assertIn("QString commandError;", power_on)
+        self.assertIn("systemPowerOn(m_instanceId, &commandError)", power_on)
+        self.assertIn("return failWithError(commandError", power_on)
+        self.assertIn("setLastError(QString());", power_on)
+
+        precondition = function_body(
+            controller, "bool CorneaController::requirePoweredOn"
+        )
+        self.assertEqual(2, precondition.count("return failWithError(err);"))
+
+        disconnect = function_body(controller, "void CorneaController::disconnect()")
+        power_off = function_body(controller, "bool CorneaController::powerOff()")
+        self.assertIn("setLastError(QString());", disconnect)
+        self.assertIn("setLastError(QString());", power_off)
+
+        bridge_connect = function_body(
+            bridge,
+            "int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareVariant,\n"
+            "                                       const QString &expectedSerial, QString *error)",
+        )
+        self.assertIn("if (error) *error = detail", bridge_connect)
+
+        bridge_power_on = function_body(
+            bridge, "bool PythonBridge::systemPowerOn(int instanceId, QString *error)"
+        )
+        self.assertIn("setInstanceError(instanceId, commandError)", bridge_power_on)
+        self.assertIn("if (error) *error = commandError", bridge_power_on)
+        self.assertIn("clearInstanceError(instanceId)", bridge_power_on)
+        self.assertNotIn("getLastError()", bridge_power_on)
+
+        brightness = function_body(controller, "bool CorneaController::setBrightness")
+        image = function_body(controller, "bool CorneaController::sendImage")
+        self.assertIn("setLastError(commandError)", brightness)
+        self.assertIn("setLastError(commandError)", image)
+
     def test_invalid_temperature_replaces_the_tcp_temperature_observation(self):
         header = read("src/corneacontroller.h")
         body = function_body(
@@ -254,6 +319,28 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("m_cachedRj1Temp = temp", after_read)
         self.assertIn("m_hasRj1TemperatureObservation = true", after_read)
         self.assertNotIn("return m_cachedRj1Temp;", after_read)
+
+    def test_non_finite_worker_temperature_remains_invalid_across_bridge(self):
+        worker = read("python/panel_worker.py")
+        bridge = function_body(
+            read("src/pythonbridge.cpp"),
+            "double PythonBridge::getLeaTemperature(int instanceId)",
+        )
+        tcp = function_body(
+            read("src/tcpserver.cpp"),
+            "QJsonObject TcpServer::handleGetTemperature",
+        )
+        ui = function_body(
+            read("src/devicecontrolpanel.cpp"),
+            "void DeviceControlPanel::onControllerTemperatureUpdated",
+        )
+
+        self.assertIn("allow_nan=False", worker)
+        self.assertIn('"non_finite": non_finite', worker)
+        self.assertIn('data.value("non_finite").toBool()', bridge)
+        self.assertIn("quiet_NaN()", bridge)
+        self.assertIn("std::isfinite", tcp)
+        self.assertIn("std::isfinite", ui)
 
     def test_embedded_fallback_populates_command_local_errors(self):
         bridge = read("src/pythonbridge.cpp")
@@ -277,6 +364,25 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("IMAGE_TRANSFER_FAILED:", frame_fallback)
         self.assertIn("setInstanceError(instanceId, commandError)", frame_fallback)
         self.assertIn("if (error) *error = commandError", frame_fallback)
+
+    def test_embedded_brightness_requires_matching_readback(self):
+        body = function_body(
+            read("src/pythonbridge.cpp"),
+            "bool PythonBridge::setBrightness(int instanceId, double level, QString *error)",
+        )
+        fallback = body[body.index("const auto fallbackDetail") :]
+
+        self.assertIn('callInstanceMethod(instanceId, "set_brightness", args)', fallback)
+        self.assertIn("result == Py_False", fallback)
+        self.assertIn('callInstanceMethod(instanceId, "get_brightness")', fallback)
+        self.assertIn("PyFloat_AsDouble", fallback)
+        self.assertIn("std::isfinite(actual)", fallback)
+        self.assertIn("qRound64(actual * 100.0) != qRound64(level * 100.0)", fallback)
+        self.assertIn("BRIGHTNESS_SET_FAILED: get_brightness failed", fallback)
+        self.assertIn("BRIGHTNESS_SET_FAILED: requested=%1, actual=%2", fallback)
+        self.assertIn("setInstanceError(instanceId, commandError)", fallback)
+        self.assertIn("if (error) *error = commandError", fallback)
+        self.assertNotIn("markSubprocessUnhealthy", fallback)
 
     def test_powered_panel_error_handler_latches_only_while_powered(self):
         source = read("src/devicecontrolpanel.cpp")

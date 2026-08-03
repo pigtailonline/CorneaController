@@ -38,6 +38,16 @@ void CorneaController::setLastError(const QString &error)
     m_lastError = error;
 }
 
+bool CorneaController::failWithError(const QString &error)
+{
+    const QString detail = error.trimmed().isEmpty()
+        ? QStringLiteral("Controller operation failed")
+        : error;
+    setLastError(detail);
+    emit errorOccurred(detail);
+    return false;
+}
+
 bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant,
                                const QString &expectedSerial)
 {
@@ -45,7 +55,9 @@ bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant,
         disconnect();
     }
 
-    int instanceId = m_bridge->createDeviceInstance(deviceIndex, hardwareVariant, expectedSerial);
+    QString commandError;
+    int instanceId = m_bridge->createDeviceInstance(
+        deviceIndex, hardwareVariant, expectedSerial, &commandError);
     if (instanceId >= 0) {
         m_instanceId = instanceId;
         m_deviceIndex = deviceIndex;
@@ -55,6 +67,7 @@ bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant,
         }
         m_currentBrightness = m_bridge->getBrightness(instanceId);
         m_poweredOn = true;
+        setLastError(QString());
 
         emit connected();
         // Do NOT emit powerStateChanged(true) here. onControllerConnected
@@ -75,7 +88,9 @@ bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant,
         return true;
     }
 
-    return false;
+    return failWithError(commandError.isEmpty()
+        ? QString("Failed to connect device %1").arg(deviceIndex)
+        : commandError);
 }
 
 bool CorneaController::preInit(int deviceIndex, const QString &hardwareVariant,
@@ -94,6 +109,7 @@ bool CorneaController::preInit(int deviceIndex, const QString &hardwareVariant,
             m_deviceSerial = expectedSerial;
         }
         m_poweredOn = false; // FTDI ready but not powered on
+        setLastError(QString());
 
         emit logMessage(QString("Pre-init OK: %1 (FTDI ready)").arg(getDeviceLabel()));
         return true;
@@ -113,6 +129,7 @@ void CorneaController::disconnect()
         m_deviceIndex = -1;
         m_deviceSerial.clear();
         m_poweredOn = false;
+        setLastError(QString());
 
         emit disconnected();
         emit logMessage(QString("Disconnected from device: %1").arg(label));
@@ -147,12 +164,13 @@ QString CorneaController::getDeviceLabel() const
 bool CorneaController::powerOn()
 {
     if (!isConnected()) {
-        emit errorOccurred("Not connected to device");
-        return false;
+        return failWithError(QStringLiteral("Power on failed: device not connected"));
     }
 
-    if (m_bridge->systemPowerOn(m_instanceId)) {
+    QString commandError;
+    if (m_bridge->systemPowerOn(m_instanceId, &commandError)) {
         m_poweredOn = true;
+        setLastError(QString());
         emit powerStateChanged(true);
         emit logMessage("Power ON");
         // Pre-warm temperature cache on the reuse path too — see connect().
@@ -160,24 +178,29 @@ bool CorneaController::powerOn()
         return true;
     }
 
-    return false;
+    return failWithError(commandError.isEmpty()
+        ? QStringLiteral("Power on failed")
+        : commandError);
 }
 
 bool CorneaController::powerOff()
 {
     if (!isConnected()) {
-        emit errorOccurred("Not connected to device");
-        return false;
+        return failWithError(QStringLiteral("Power off failed: device not connected"));
     }
 
     if (m_bridge->systemPowerOff(m_instanceId)) {
         m_poweredOn = false;
+        setLastError(QString());
         emit powerStateChanged(false);
         emit logMessage("Power OFF");
         return true;
     }
 
-    return false;
+    const QString bridgeError = m_bridge->getLastError(m_instanceId);
+    return failWithError(bridgeError.isEmpty()
+        ? QStringLiteral("Power off failed")
+        : bridgeError);
 }
 
 bool CorneaController::setVsysEnabled(bool enabled)
@@ -194,15 +217,13 @@ bool CorneaController::requirePoweredOn(const QString &operation)
 {
     if (!isConnected()) {
         QString err = QString("%1 failed: device not connected").arg(operation);
-        emit errorOccurred(err);
         qWarning() << err;
-        return false;
+        return failWithError(err);
     }
     if (!isPoweredOn()) {
         QString err = QString("%1 failed: device is powered off (possibly overheated)").arg(operation);
-        emit errorOccurred(err);
         qWarning() << err;
-        return false;
+        return failWithError(err);
     }
     return true;
 }

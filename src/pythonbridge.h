@@ -67,7 +67,8 @@ public:
 
     // Multi-instance device management
     int createDeviceInstance(int deviceIndex, const QString &hardwareVariant = "standard",
-                             const QString &expectedSerial = QString());  // Returns instanceId, -1 on failure
+                             const QString &expectedSerial = QString(),
+                             QString *error = nullptr);  // Returns instanceId, -1 on failure
     int preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant = "standard",
                               const QString &expectedSerial = QString()); // Light init: FTDI only, no RJ1/panel needed
     void destroyDeviceInstance(int instanceId);
@@ -76,7 +77,7 @@ public:
     QString getDeviceSerial(int instanceId) const;
 
     // Power control (per instance)
-    bool systemPowerOn(int instanceId);
+    bool systemPowerOn(int instanceId, QString *error = nullptr);
     bool systemPowerOff(int instanceId);
     bool enableVsys(int instanceId, bool enable);
 

@@ -113,6 +113,7 @@ private slots:
     bool requirePoweredOn(const QString &operation);
 
 private:
+    bool failWithError(const QString &error);
     void setLastError(const QString &error);
 
     PythonBridge *m_bridge;  // Shared, not owned

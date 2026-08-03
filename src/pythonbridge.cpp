@@ -39,7 +39,9 @@
 #include <QSet>
 #include <QThread>
 #include <QTimer>
+#include <cmath>
 #include <functional>
+#include <limits>
 
 // ---------------------------------------------------------------------------
 // Dispatch helpers: run work on a Python-capable thread with proper GIL
@@ -1310,8 +1312,9 @@ QList<DeviceInfo> PythonBridge::getAvailableDevicesInfo()
 }
 
 int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareVariant,
-                                       const QString &expectedSerial)
+                                       const QString &expectedSerial, QString *error)
 {
+    if (error) error->clear();
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(expectedSerial);
     int instanceId = m_nextInstanceId++;
@@ -1487,6 +1490,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                     .arg(kSubprocessInitAttempts)
                     .arg(expectedSerial.isEmpty() ? QStringLiteral("<index-only>") : expectedSerial);
             setError(detail);
+            if (error) *error = detail;
             emit logMessage(QString("[Instance %1] %2 — aborting connect")
                                 .arg(instanceId).arg(detail));
             m_nextInstanceId--;
@@ -1502,9 +1506,11 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         return instanceId;
     }
 
-    return dispatch([this, deviceIndex, hardwareVariant, expectedSerial]() -> int {
+    return dispatch([this, deviceIndex, hardwareVariant, expectedSerial, error]() -> int {
         if (!m_initialized) {
-            setError("Python bridge not initialized");
+            const QString detail = QStringLiteral("Python bridge not initialized");
+            setError(detail);
+            if (error) *error = detail;
             return -1;
         }
 
@@ -1547,7 +1553,9 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
             Py_DECREF(kwargs);
 
             if (!future) {
-                setError(QString("Failed to submit device %1 to executor").arg(deviceIndex));
+                const QString detail = QString("Failed to submit device %1 to executor").arg(deviceIndex);
+                setError(detail);
+                if (error) *error = detail;
                 PyErr_Print();
                 m_nextInstanceId--;
                 return -1;
@@ -1609,6 +1617,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
             QString fullError = QString("Failed to create device %1: [%2] %3")
                                     .arg(deviceIndex).arg(typeName, pyError);
             setError(fullError);
+            if (error) *error = fullError;
             emit logMessage(QString("[Instance %1] FAILED: %2").arg(instanceId).arg(fullError));
             return -1;
         }
@@ -1639,6 +1648,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                 detail = QString("Hardware initialization failed for device %1 (init_ok=False)").arg(deviceIndex);
             }
             setError(detail);
+            if (error) *error = detail;
             emit logMessage(QString("[Instance %1] FAILED: %2").arg(instanceId).arg(detail));
             Py_DECREF(instance);
             return -1;
@@ -1657,6 +1667,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                     .arg(expectedSerial,
                          serial.isEmpty() ? QStringLiteral("<empty>") : serial);
             setError(detail);
+            if (error) *error = detail;
             emit logMessage(QString("[Instance %1] %2 — rejecting instance")
                                 .arg(instanceId).arg(detail));
             Py_DECREF(instance);
@@ -1917,41 +1928,58 @@ QString PythonBridge::getDeviceSerial(int instanceId) const
     return m_serialMap.value(instanceId, QString());
 }
 
-bool PythonBridge::systemPowerOn(int instanceId)
+bool PythonBridge::systemPowerOn(int instanceId, QString *error)
 {
+    if (error) error->clear();
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     emit logMessage(QString("[SIM] systemPowerOn(%1)").arg(instanceId));
     simStallSleep(SIM_DELAY_MS);
-    if (!m_simDevices.contains(instanceId)) return false;
+    if (!m_simDevices.contains(instanceId)) {
+        const QString commandError = QString("[Instance %1] System power ON FAILED: device not found")
+                                         .arg(instanceId);
+        setInstanceError(instanceId, commandError);
+        if (error) *error = commandError;
+        return false;
+    }
     // Restore connected=true so subsequent setBrightness / sendImage /
     // getPanelId hit their simStallSleep instead of fail-fast at the
     // isConnected() gate in CorneaWidget::setBrightnessBySerial / etc.
     m_simDevices[instanceId].connected = true;
+    clearInstanceError(instanceId);
     return true;
 #endif
+    auto fail = [this, instanceId, error](const QString &commandError) -> bool {
+        setInstanceError(instanceId, commandError);
+        if (error) *error = commandError;
+        emit logMessage(commandError);
+        return false;
+    };
+
     if (m_useSubprocess) {
         const QJsonObject reply = subprocessCall(instanceId, "powerOn", {}, 60000);
         if (!reply.value("success").toBool()) {
-            const QString error = reply.value("error").toString("powerOn subprocess failed");
-            setError(QString("[Instance %1] System power ON FAILED: %2").arg(instanceId).arg(error));
-            emit logMessage(getLastError());
-            return false;
+            const QString detail = reply.value("error").toString("powerOn subprocess failed");
+            return fail(QString("[Instance %1] System power ON FAILED: %2")
+                            .arg(instanceId).arg(detail));
         }
         const QJsonObject data = reply.value("data").toObject();
         if (!data.value("init_ok").toBool()) {
-            const QString error = QString("[Instance %1] System power ON returned init_ok=False").arg(instanceId);
-            setError(error);
-            emit logMessage(error);
-            return false;
+            return fail(QString("[Instance %1] System power ON returned init_ok=False")
+                            .arg(instanceId));
         }
+        clearInstanceError(instanceId);
         emit logMessage(QString("[Instance %1] System power ON").arg(instanceId));
         return true;
     }
-    return dispatchToDevice(instanceId, [this, instanceId]() -> bool {
+
+    const auto failureDetail = std::make_shared<QString>();
+    const bool success = dispatchToDevice(
+        instanceId, [this, instanceId, failureDetail]() -> bool {
         PyObject *result = callInstanceMethod(instanceId, "system_power_on");
         if (!result) {
-            emit logMessage(QString("[Instance %1] System power ON threw exception: %2")
-                                .arg(instanceId).arg(getLastError()));
+            *failureDetail = QString("[Instance %1] System power ON FAILED: %2")
+                .arg(instanceId)
+                .arg(QStringLiteral("Error calling method: system_power_on"));
             flushPythonOutput();
             return false;
         }
@@ -1965,15 +1993,25 @@ bool PythonBridge::systemPowerOn(int instanceId)
         // station where right-eye Pogo was unseated; v1.1.12 reported "lit".
         const bool initOk = PyObject_IsTrue(result) == 1;
         Py_DECREF(result);
-        if (initOk) {
-            emit logMessage(QString("[Instance %1] System power ON").arg(instanceId));
-            return true;
-        }
-        emit logMessage(QString("[Instance %1] System power ON returned init_ok=False (panel not responding — check Pogo connection / hardware)")
-                            .arg(instanceId));
+        if (initOk) return true;
+
+        *failureDetail = QString(
+            "[Instance %1] System power ON returned init_ok=False "
+            "(panel not responding — check Pogo connection / hardware)")
+            .arg(instanceId);
         flushPythonOutput();
         return false;
     });
+
+    if (!success) {
+        return fail(failureDetail->isEmpty()
+            ? QString("[Instance %1] System power ON FAILED").arg(instanceId)
+            : *failureDetail);
+    }
+    clearInstanceError(instanceId);
+    if (error) error->clear();
+    emit logMessage(QString("[Instance %1] System power ON").arg(instanceId));
+    return true;
 }
 
 bool PythonBridge::systemPowerOff(int instanceId)
@@ -2065,20 +2103,44 @@ bool PythonBridge::setBrightness(int instanceId, double level, QString *error)
         PyObject *args = PyTuple_Pack(1, PyFloat_FromDouble(level));
         PyObject *result = callInstanceMethod(instanceId, "set_brightness", args);
         Py_DECREF(args);
-        if (result) {
-            const bool success = result != Py_False;
-            Py_DECREF(result);
-            if (success) {
-                emit logMessage(QString("[Instance %1] Brightness set to %2").arg(instanceId).arg(level));
-                return true;
-            }
+        if (!result) {
+            *fallbackDetail = QStringLiteral(
+                "BRIGHTNESS_SET_FAILED: set_brightness failed");
+            return false;
+        }
+        const bool setterReturnedFalse = result == Py_False;
+        Py_DECREF(result);
+        if (setterReturnedFalse) {
             *fallbackDetail = QStringLiteral(
                 "BRIGHTNESS_SET_FAILED: set_brightness returned False");
             return false;
         }
-        *fallbackDetail = QStringLiteral(
-            "BRIGHTNESS_SET_FAILED: set_brightness failed");
-        return false;
+
+        PyObject *readback = callInstanceMethod(instanceId, "get_brightness");
+        if (!readback) {
+            *fallbackDetail = QStringLiteral(
+                "BRIGHTNESS_SET_FAILED: get_brightness failed");
+            return false;
+        }
+        const double actual = PyFloat_AsDouble(readback);
+        Py_DECREF(readback);
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            *fallbackDetail = QStringLiteral(
+                "BRIGHTNESS_SET_FAILED: get_brightness failed");
+            return false;
+        }
+        if (!std::isfinite(actual)
+            || qRound64(actual * 100.0) != qRound64(level * 100.0)) {
+            *fallbackDetail = QStringLiteral(
+                "BRIGHTNESS_SET_FAILED: requested=%1, actual=%2")
+                .arg(level, 0, 'f', 2)
+                .arg(actual, 0, 'f', 2);
+            return false;
+        }
+
+        emit logMessage(QString("[Instance %1] Brightness set to %2").arg(instanceId).arg(level));
+        return true;
     });
     if (success) {
         clearInstanceError(instanceId);
@@ -2448,7 +2510,10 @@ double PythonBridge::getLeaTemperature(int instanceId)
         const QJsonObject reply = subprocessCall(instanceId, "getTemperature", {}, 10000);
         if (!reply.value("success").toBool()) return -999.0;
         const QJsonObject data = reply.value("data").toObject();
-        const double temperature = data.value("temperature").toDouble(-999.0);
+        const bool nonFinite = data.value("non_finite").toBool();
+        const double temperature = nonFinite
+            ? std::numeric_limits<double>::quiet_NaN()
+            : data.value("temperature").toDouble(-999.0);
         if (!data.value("ok").toBool()) {
             setInstanceError(instanceId,
                 QString("INVALID_TEMPERATURE: invalid RJ1 temperature %1 C")

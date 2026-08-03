@@ -197,7 +197,9 @@ def emit(resp: dict) -> None:
     """Write one line of JSON to stdout, flushed immediately. stdout is
     pipe-buffered by default which would defeat the protocol if the parent
     is doing a blocking read."""
-    sys.stdout.write(json.dumps(resp, separators=(",", ":")) + "\n")
+    sys.stdout.write(
+        json.dumps(resp, separators=(",", ":"), allow_nan=False) + "\n"
+    )
     sys.stdout.flush()
 
 
@@ -500,21 +502,25 @@ class Worker:
         c = self._require()
         if bool(args.get("cached", False)):
             temp_value = float(self.cached_temp)
-            valid = math.isfinite(temp_value) and temp_value > -30.0
+            non_finite = not math.isfinite(temp_value)
+            valid = not non_finite and temp_value > -30.0
             return {
-                "temperature": temp_value,
+                "temperature": None if non_finite else temp_value,
                 "from_cache": True,
                 "ok": valid,
+                "non_finite": non_finite,
             }
         temp = c.get_lea_temperature()
         temp_value = float(temp) if temp is not None else -999.0
-        valid = math.isfinite(temp_value) and temp_value > -30.0
+        non_finite = not math.isfinite(temp_value)
+        valid = not non_finite and temp_value > -30.0
         if valid:
             self.cached_temp = temp_value
         return {
-            "temperature": temp_value,
+            "temperature": None if non_finite else temp_value,
             "from_cache": False,
             "ok": valid,
+            "non_finite": non_finite,
         }
 
     def cmd_sendImage(self, args: dict) -> dict:
