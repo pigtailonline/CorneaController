@@ -113,6 +113,8 @@ private slots:
     bool requirePoweredOn(const QString &operation);
 
 private:
+    void setLastError(const QString &error);
+
     PythonBridge *m_bridge;  // Shared, not owned
     QTimer *m_tempPollTimer;
     bool m_poweredOn;
@@ -125,6 +127,9 @@ private:
     int m_deviceIndex = -1;     // Device index
     QString m_deviceSerial;     // Device serial number
 
+    mutable QMutex m_lastErrorMutex;
+    QString m_lastError;
+
     // Per-controller RJ1 temperature cache: deduplicates reads within a short
     // window so rapid TCP traffic (setBrightness + sendImage bursts) don't each
     // trigger a real I2C transaction. Overheat protection still reacts within
@@ -133,6 +138,8 @@ private:
     mutable QMutex m_tempCacheMutex;
     qint64 m_lastRj1ReadMs = 0;   // monotonic (QElapsedTimer) elapsed since class init
     double m_cachedRj1Temp = -999.0;
+    double m_lastValidRj1Temp = -999.0;
+    bool m_hasRj1TemperatureObservation = false;
     QElapsedTimer m_cacheClock;   // started in ctor; provides monotonic ms
 };
 

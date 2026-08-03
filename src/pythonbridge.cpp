@@ -1199,14 +1199,47 @@ PyObject* PythonBridge::variantToPyObject(const QVariant &var)
 
 void PythonBridge::setError(const QString &error)
 {
-    m_lastError = error;
+    {
+        QMutexLocker lock(&m_lastErrorMutex);
+        m_lastError = error;
+    }
     emit errorOccurred(error);
     qWarning() << "PythonBridge Error:" << error;
 }
 
+void PythonBridge::setInstanceError(int instanceId, const QString &error)
+{
+    {
+        QMutexLocker lock(&m_lastErrorMutex);
+        m_lastError = error;
+        m_instanceLastErrors[instanceId] = error;
+    }
+    emit errorOccurred(error);
+    qWarning() << "PythonBridge Error:" << error;
+}
+
+void PythonBridge::clearInstanceError(int instanceId)
+{
+    QMutexLocker lock(&m_lastErrorMutex);
+    m_instanceLastErrors.remove(instanceId);
+}
+
 void PythonBridge::clearError()
 {
+    QMutexLocker lock(&m_lastErrorMutex);
     m_lastError.clear();
+}
+
+QString PythonBridge::getLastError() const
+{
+    QMutexLocker lock(&m_lastErrorMutex);
+    return m_lastError;
+}
+
+QString PythonBridge::getLastError(int instanceId) const
+{
+    QMutexLocker lock(&m_lastErrorMutex);
+    return m_instanceLastErrors.value(instanceId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,6 +1765,7 @@ int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardware
 
 void PythonBridge::destroyDeviceInstance(int instanceId)
 {
+    clearInstanceError(instanceId);
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     m_simDevices.remove(instanceId);
     m_initOkMap.remove(instanceId);
@@ -1900,7 +1934,7 @@ bool PythonBridge::systemPowerOn(int instanceId)
         if (!reply.value("success").toBool()) {
             const QString error = reply.value("error").toString("powerOn subprocess failed");
             setError(QString("[Instance %1] System power ON FAILED: %2").arg(instanceId).arg(error));
-            emit logMessage(m_lastError);
+            emit logMessage(getLastError());
             return false;
         }
         const QJsonObject data = reply.value("data").toObject();
@@ -1917,7 +1951,7 @@ bool PythonBridge::systemPowerOn(int instanceId)
         PyObject *result = callInstanceMethod(instanceId, "system_power_on");
         if (!result) {
             emit logMessage(QString("[Instance %1] System power ON threw exception: %2")
-                                .arg(instanceId).arg(m_lastError));
+                                .arg(instanceId).arg(getLastError()));
             flushPythonOutput();
             return false;
         }
@@ -1955,7 +1989,7 @@ bool PythonBridge::systemPowerOff(int instanceId)
         if (!reply.value("success").toBool()) {
             const QString error = reply.value("error").toString("powerOff subprocess failed");
             setError(QString("[Instance %1] System power OFF FAILED: %2").arg(instanceId).arg(error));
-            emit logMessage(m_lastError);
+            emit logMessage(getLastError());
             return false;
         }
         emit logMessage(QString("[Instance %1] System power OFF").arg(instanceId));
@@ -1968,7 +2002,7 @@ bool PythonBridge::systemPowerOff(int instanceId)
             emit logMessage(QString("[Instance %1] System power OFF").arg(instanceId));
             return true;
         }
-        emit logMessage(QString("[Instance %1] System power OFF FAILED: %2").arg(instanceId).arg(m_lastError));
+        emit logMessage(QString("[Instance %1] System power OFF FAILED: %2").arg(instanceId).arg(getLastError()));
         flushPythonOutput();
         return false;
     });
@@ -1993,24 +2027,29 @@ bool PythonBridge::enableVsys(int instanceId, bool enable)
     });
 }
 
-bool PythonBridge::setBrightness(int instanceId, double level)
+bool PythonBridge::setBrightness(int instanceId, double level, QString *error)
 {
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     simStallSleep(SIM_DELAY_MS);
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].brightness = level;
+    if (error) error->clear();
     return m_simDevices.contains(instanceId);
 #endif
     if (m_useSubprocess) {
         const QJsonObject reply = subprocessCall(instanceId, "setBrightness",
                                                   QJsonObject{{"level", level}}, 10000);
         if (reply.value("success").toBool()) {
+            clearInstanceError(instanceId);
+            if (error) error->clear();
             return true;
         }
         const QString errorCode = reply.value("errorCode").toString();
         const QString detail = reply.value("error").toString("subprocess command failed");
-        setError(QString("%1: %2").arg(
+        const QString commandError = QString("%1: %2").arg(
             errorCode.isEmpty() ? QStringLiteral("USB_TRANSPORT_LOST") : errorCode,
-            detail));
+            detail);
+        setInstanceError(instanceId, commandError);
+        if (error) *error = commandError;
         if (errorCode == QStringLiteral("USB_BUSY_TIMEOUT")
             || errorCode == QStringLiteral("BRIGHTNESS_SET_FAILED")) {
             emit logMessage(QString("[Instance %1] setBrightness skipped: %2")
@@ -2149,12 +2188,13 @@ bool PythonBridge::getYFlip(int instanceId)
     });
 }
 
-bool PythonBridge::writeFrame(int instanceId, const QImage &image)
+bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *error)
 {
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     Q_UNUSED(image);
     emit logMessage(QString("[SIM] writeFrame(%1) %2x%3").arg(instanceId).arg(image.width()).arg(image.height()));
     simStallSleep(SIM_DELAY_MS);
+    if (error) error->clear();
     return m_simDevices.contains(instanceId);
 #endif
     if (m_useSubprocess) {
@@ -2165,24 +2205,32 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image)
         const QString tmpPath = QDir::tempPath()
             + QString("/cc_frame_inst%1.png").arg(instanceId);
         if (!image.save(tmpPath, "PNG")) {
-            setError(QString("writeFrame: failed to save temp image to %1").arg(tmpPath));
+            const QString commandError = QString("writeFrame: failed to save temp image to %1").arg(tmpPath);
+            setInstanceError(instanceId, commandError);
+            if (error) *error = commandError;
             return false;
         }
         const QJsonObject reply = subprocessCall(
             instanceId, "sendImage", QJsonObject{{"path", tmpPath}}, 30000);
         if (reply.value("success").toBool()) {
             if (!reply.value("data").toObject().value("ok").toBool(true)) {
-                setError(QStringLiteral(
-                    "IMAGE_TRANSFER_FAILED: write_rj1_frame returned False"));
+                const QString commandError = QStringLiteral(
+                    "IMAGE_TRANSFER_FAILED: write_rj1_frame returned False");
+                setInstanceError(instanceId, commandError);
+                if (error) *error = commandError;
                 return false;
             }
+            clearInstanceError(instanceId);
+            if (error) error->clear();
             return true;
         }
         const QString errorCode = reply.value("errorCode").toString();
         const QString detail = reply.value("error").toString("sendImage subprocess failed");
-        setError(QString("%1: %2").arg(
+        const QString commandError = QString("%1: %2").arg(
             errorCode.isEmpty() ? QStringLiteral("USB_TRANSPORT_LOST") : errorCode,
-            detail));
+            detail);
+        setInstanceError(instanceId, commandError);
+        if (error) *error = commandError;
         if (errorCode == QStringLiteral("USB_BUSY_TIMEOUT")
             || errorCode == QStringLiteral("IMAGE_TRANSFER_FAILED")) {
             emit logMessage(QString("[Instance %1] sendImage skipped: %2")
@@ -2358,8 +2406,9 @@ double PythonBridge::getLeaTemperature(int instanceId)
         const QJsonObject data = reply.value("data").toObject();
         const double temperature = data.value("temperature").toDouble(-999.0);
         if (!data.value("ok").toBool()) {
-            setError(QString("INVALID_TEMPERATURE: invalid RJ1 temperature %1 C")
-                         .arg(temperature, 0, 'f', 1));
+            setInstanceError(instanceId,
+                QString("INVALID_TEMPERATURE: invalid RJ1 temperature %1 C")
+                    .arg(temperature, 0, 'f', 1));
         }
         return temperature;
     }

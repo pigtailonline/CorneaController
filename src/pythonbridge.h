@@ -81,7 +81,7 @@ public:
     bool enableVsys(int instanceId, bool enable);
 
     // Brightness control (per instance)
-    bool setBrightness(int instanceId, double level);
+    bool setBrightness(int instanceId, double level, QString *error = nullptr);
     double getBrightness(int instanceId);
 
     // Flip control (per instance) - CalMetadata.x_flip / y_flip
@@ -91,7 +91,7 @@ public:
     bool getYFlip(int instanceId);
 
     // Image operations (per instance)
-    bool writeFrame(int instanceId, const QImage &image);
+    bool writeFrame(int instanceId, const QImage &image, QString *error = nullptr);
     bool writeFrameFromPath(int instanceId, const QString &imagePath);
 
     // Information retrieval (per instance)
@@ -120,7 +120,8 @@ public:
     QVariantMap getDemuraRlutState(int instanceId);
 
     // Utility
-    QString getLastError() const { return m_lastError; }
+    QString getLastError() const;
+    QString getLastError(int instanceId) const;
 
     // Python output capture
     void flushPythonOutput();
@@ -137,6 +138,8 @@ private:
     PyObject* variantToPyObject(const QVariant &var);
     PyObject* qimageToPyArray(const QImage &image);
     void setError(const QString &error);
+    void setInstanceError(int instanceId, const QString &error);
+    void clearInstanceError(int instanceId);
     void clearError();
     PyObject* getDeviceInstance(int instanceId) const;
 
@@ -146,6 +149,7 @@ private:
     PyObject *m_numpyModule;
     PyObject *m_executor;  // Python concurrent.futures.ThreadPoolExecutor
     QString m_lastError;
+    QMap<int, QString> m_instanceLastErrors;
     mutable QMutex m_lastErrorMutex;
     QString m_venvPath;
     QString m_pythonHome;

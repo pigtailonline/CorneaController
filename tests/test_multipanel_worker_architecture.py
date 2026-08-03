@@ -97,7 +97,7 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
     def test_transport_failure_isolates_only_failed_send_image_worker(self):
         body = function_body(
             read("src/pythonbridge.cpp"),
-            "bool PythonBridge::writeFrame(int instanceId, const QImage &image)",
+            "bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *error)",
         )
         self.assertIn('markSubprocessUnhealthy(instanceId, "sendImage"', body)
         self.assertIn("USB_BUSY_TIMEOUT", body)
@@ -139,7 +139,7 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         bridge_cpp = read("src/pythonbridge.cpp")
         self.assertIn("markSubprocessUnhealthy", bridge_cpp)
         self.assertIn('markSubprocessUnhealthy(instanceId, "setBrightness"', bridge_cpp)
-        set_brightness_body = function_body(bridge_cpp, "bool PythonBridge::setBrightness(int instanceId, double level)")
+        set_brightness_body = function_body(bridge_cpp, "bool PythonBridge::setBrightness(int instanceId, double level, QString *error)")
         self.assertIn("markSubprocessUnhealthy", set_brightness_body)
         self.assertIn("subprocessCall", set_brightness_body)
 
@@ -191,6 +191,48 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("BRIGHTNESS_SET_FAILED", body)
         self.assertIn('response["warning"] = true', body)
         self.assertIn("return response", body)
+
+    def test_semantic_errors_are_instance_scoped_and_do_not_reconnect(self):
+        bridge_header = read("src/pythonbridge.h")
+        controller_header = read("src/corneacontroller.h")
+        controller = read("src/corneacontroller.cpp")
+        widget = read("src/corneawidget.cpp")
+
+        self.assertIn("QString getLastError(int instanceId) const;", bridge_header)
+        self.assertIn("QMap<int, QString> m_instanceLastErrors;", bridge_header)
+        self.assertIn("QString m_lastError;", controller_header)
+        self.assertIn("mutable QMutex m_lastErrorMutex;", controller_header)
+
+        last_error = function_body(controller, "QString CorneaController::lastError() const")
+        self.assertIn("m_lastErrorMutex", last_error)
+        self.assertNotIn("m_bridge->getLastError()", last_error)
+
+        set_brightness = function_body(controller, "bool CorneaController::setBrightness(double level)")
+        self.assertIn("QString commandError;", set_brightness)
+        self.assertIn("m_bridge->setBrightness(m_instanceId, level, &commandError)", set_brightness)
+
+        serial_brightness = function_body(
+            widget,
+            "bool CorneaWidget::setBrightnessBySerial(const QString &serial, double level)",
+        )
+        semantic_branch = serial_brightness[
+            serial_brightness.index('BRIGHTNESS_SET_FAILED'):
+            serial_brightness.index("ctrl->disconnect()")
+        ]
+        self.assertIn("return false", semantic_branch)
+
+    def test_invalid_temperature_replaces_the_tcp_temperature_observation(self):
+        header = read("src/corneacontroller.h")
+        body = function_body(
+            read("src/corneacontroller.cpp"),
+            "double CorneaController::getRj1Temperature()",
+        )
+
+        self.assertIn("bool m_hasRj1TemperatureObservation = false;", header)
+        after_read = body[body.index("double temp = m_bridge->getLeaTemperature") :]
+        self.assertIn("m_cachedRj1Temp = temp", after_read)
+        self.assertIn("m_hasRj1TemperatureObservation = true", after_read)
+        self.assertNotIn("return m_cachedRj1Temp;", after_read)
 
 
 if __name__ == "__main__":

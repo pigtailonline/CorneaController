@@ -2,6 +2,7 @@
 #include "pythonbridge.h"
 
 #include <QDebug>
+#include <cmath>
 
 CorneaController::CorneaController(PythonBridge *sharedBridge, QObject *parent)
     : QObject(parent)
@@ -27,7 +28,14 @@ CorneaController::~CorneaController()
 
 QString CorneaController::lastError() const
 {
-    return m_bridge ? m_bridge->getLastError() : QString();
+    QMutexLocker lock(&m_lastErrorMutex);
+    return m_lastError;
+}
+
+void CorneaController::setLastError(const QString &error)
+{
+    QMutexLocker lock(&m_lastErrorMutex);
+    m_lastError = error;
 }
 
 bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant,
@@ -206,13 +214,16 @@ bool CorneaController::setBrightness(double level)
     // Clamp to valid range
     level = qBound(0.0, level, 1.0);
 
-    if (m_bridge->setBrightness(m_instanceId, level)) {
+    QString commandError;
+    if (m_bridge->setBrightness(m_instanceId, level, &commandError)) {
+        setLastError(QString());
         m_currentBrightness = level;
         emit brightnessChanged(level);
         return true;
     }
 
-    emit errorOccurred(m_bridge->getLastError());
+    setLastError(commandError);
+    emit errorOccurred(commandError);
     return false;
 }
 
@@ -277,9 +288,13 @@ bool CorneaController::sendImage(const QImage &image)
 {
     if (!requirePoweredOn("sendImage")) return false;
 
-    bool success = m_bridge->writeFrame(m_instanceId, image);
+    QString commandError;
+    bool success = m_bridge->writeFrame(m_instanceId, image, &commandError);
     if (!success) {
-        emit errorOccurred(m_bridge->getLastError());
+        setLastError(commandError);
+        emit errorOccurred(commandError);
+    } else {
+        setLastError(QString());
     }
     emit imageSent(success);
     return success;
@@ -323,24 +338,21 @@ double CorneaController::getRj1Temperature()
     const qint64 now = m_cacheClock.elapsed();
     {
         QMutexLocker lock(&m_tempCacheMutex);
-        if (m_cachedRj1Temp > -900.0 && (now - m_lastRj1ReadMs) < RJ1_CACHE_TTL_MS) {
+        if (m_hasRj1TemperatureObservation
+            && (now - m_lastRj1ReadMs) < RJ1_CACHE_TTL_MS) {
             return m_cachedRj1Temp;
         }
     }
 
     double temp = m_bridge->getLeaTemperature(m_instanceId);
-    if (temp > -900.0) {
-        QMutexLocker lock(&m_tempCacheMutex);
-        m_cachedRj1Temp = temp;
-        m_lastRj1ReadMs = now;
-        return temp;
-    }
-
-    // USB gate busy or transient read failure: retain the last valid sample.
-    // Background telemetry must never queue behind sendImage/setBrightness,
-    // and a skipped poll must not blank the UI or overwrite the cache.
     QMutexLocker lock(&m_tempCacheMutex);
-    return m_cachedRj1Temp;
+    m_cachedRj1Temp = temp;
+    m_hasRj1TemperatureObservation = true;
+    m_lastRj1ReadMs = now;
+    if (std::isfinite(temp) && temp > -30.0) {
+        m_lastValidRj1Temp = temp;
+    }
+    return temp;
 }
 
 double CorneaController::getCachedRj1Temperature() const
