@@ -320,6 +320,31 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("QMutexLocker lock(&m_mutex);", getter)
         self.assertIn("return m_detail;", getter)
 
+    def test_invoke_state_synchronizes_result_publication_and_readback(self):
+        source = read("src/pythonbridge.cpp")
+        state = function_body(source, "struct InvokeState")
+        invoke = function_body(source, "static auto invokeOnWorker")
+
+        self.assertIn("void setResult(const Result &result)", state)
+        publisher = function_body(state, "void setResult(const Result &result)")
+        snapshot = function_body(state, "Result resultCopy() const")
+        self.assertIn("mutable QMutex resultMutex;", state)
+        self.assertIn("Result result{};", state)
+        self.assertIn("QMutexLocker lock(&resultMutex);", publisher)
+        self.assertIn("this->result = result;", publisher)
+        self.assertIn("QMutexLocker lock(&resultMutex);", snapshot)
+        self.assertIn("return result;", snapshot)
+
+        self.assertNotIn("state->result =", invoke)
+        self.assertNotIn("return state->result;", invoke)
+        self.assertEqual(2, invoke.count("state->setResult(fn());"))
+        self.assertEqual(2, invoke.count("return state->resultCopy();"))
+        self.assertIn("state->done.tryAcquire(1, 15000)", invoke)
+        self.assertLess(
+            invoke.rindex("state->setResult(fn());"),
+            invoke.index("state->done.release();"),
+        )
+
     def test_embedded_create_keeps_caller_error_outside_dispatched_lambda(self):
         body = function_body(
             read("src/pythonbridge.cpp"),

@@ -378,8 +378,23 @@ private:
 
 template<typename Result>
 struct InvokeState {
-    Result result{};
+    void setResult(const Result &result)
+    {
+        QMutexLocker lock(&resultMutex);
+        this->result = result;
+    }
+
+    Result resultCopy() const
+    {
+        QMutexLocker lock(&resultMutex);
+        return result;
+    }
+
     QSemaphore done;
+
+private:
+    mutable QMutex resultMutex;
+    Result result{};
 };
 template<typename F>
 static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
@@ -453,7 +468,7 @@ static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
                       .arg(tag).arg(gil_wait)
                       .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16));
             }
-            state->result = fn();
+            state->setResult(fn());
             const qint64 fn_ms = QDateTime::currentMSecsSinceEpoch() - t_gil;
             if (fn_ms > 300 && logFn) {
                 logFn(QString("[invokeOnWorker] %1 fn_duration=%2ms tid=0x%3 — long Python call (held GIL %2ms)")
@@ -462,7 +477,7 @@ static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
             }
             PyGILState_Release(g);
         } else {
-            state->result = fn();
+            state->setResult(fn());
         }
         watchdogDeregister(op_id);
         state->done.release();
@@ -489,9 +504,9 @@ static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
                       .arg(op.tid, 0, 16));
             }
         }
-        return state->result;
+        return state->resultCopy();
     }
-    return state->result;
+    return state->resultCopy();
 }
 
 template<typename F>
