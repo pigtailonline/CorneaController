@@ -42,6 +42,27 @@ class FakeUsbTools:
         return None
 
 
+class FakeOperationCornea:
+    def __init__(self):
+        self.set_result = None
+        self.actual_brightness = 0.06
+        self.frame_result = True
+        self.temperature = 24.0
+
+    def set_brightness(self, level):
+        self.requested_brightness = level
+        return self.set_result
+
+    def get_brightness(self):
+        return self.actual_brightness
+
+    def write_rj1_frame(self, frame):
+        return self.frame_result
+
+    def get_lea_temperature(self):
+        return self.temperature
+
+
 def fake_modules():
     ar_root = types.ModuleType("ar_display_lab_lib")
     control_boards = types.ModuleType("ar_display_lab_lib.control_boards")
@@ -143,6 +164,48 @@ class PanelWorkerSerialBindingTests(unittest.TestCase):
                 worker.cmd_init(self.init_args())
         self.assertTrue(FakeCornea.powered_off)
         self.assertIsNone(worker.cornea)
+
+    def test_set_brightness_rejects_literal_false(self):
+        worker = panel_worker.Worker()
+        worker.cornea = FakeOperationCornea()
+        worker.cornea.set_result = False
+        with self.assertRaisesRegex(RuntimeError, "BRIGHTNESS_SET_FAILED"):
+            worker.cmd_setBrightness({"level": 0.06})
+
+    def test_set_brightness_rejects_readback_mismatch(self):
+        worker = panel_worker.Worker()
+        worker.cornea = FakeOperationCornea()
+        worker.cornea.actual_brightness = 0.50
+        with self.assertRaisesRegex(RuntimeError, "BRIGHTNESS_SET_FAILED"):
+            worker.cmd_setBrightness({"level": 0.06})
+
+    def test_set_brightness_accepts_none_with_matching_readback(self):
+        worker = panel_worker.Worker()
+        worker.cornea = FakeOperationCornea()
+        result = worker.cmd_setBrightness({"level": 0.06})
+        self.assertAlmostEqual(0.06, result["level"])
+        self.assertAlmostEqual(0.06, result["actual"])
+
+    def test_invalid_temperature_preserves_raw_value(self):
+        worker = panel_worker.Worker()
+        worker.cornea = FakeOperationCornea()
+        worker.cornea.temperature = -40.0
+        result = worker.cmd_getTemperature({})
+        self.assertFalse(result["ok"])
+        self.assertEqual(-40.0, result["temperature"])
+
+    def test_send_image_rejects_false_driver_result(self):
+        import tempfile
+        import numpy as np
+
+        worker = panel_worker.Worker()
+        worker.cornea = FakeOperationCornea()
+        worker.cornea.frame_result = False
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "frame.npy"
+            np.save(path, np.zeros((2, 2, 3), dtype=np.uint16))
+            with self.assertRaisesRegex(RuntimeError, "IMAGE_TRANSFER_FAILED"):
+                worker.cmd_sendImage({"path": str(path)})
 
 
 @unittest.skipUnless(os.name == "nt", "Windows named mutex behavior")

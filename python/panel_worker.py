@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import gc
 import subprocess
@@ -471,8 +472,15 @@ class Worker:
     def cmd_setBrightness(self, args: dict) -> dict:
         c = self._require()
         level = float(args["level"])
-        c.set_brightness(level)
-        return {"level": level}
+        result = c.set_brightness(level)
+        if result is False:
+            raise RuntimeError("BRIGHTNESS_SET_FAILED: set_brightness returned False")
+        actual = float(c.get_brightness())
+        if round(actual, 2) != round(level, 2):
+            raise RuntimeError(
+                f"BRIGHTNESS_SET_FAILED: requested={level:.2f}, actual={actual:.2f}"
+            )
+        return {"level": level, "actual": actual}
 
     def cmd_getBrightness(self, args: dict) -> dict:
         c = self._require()
@@ -491,12 +499,23 @@ class Worker:
     def cmd_getTemperature(self, args: dict) -> dict:
         c = self._require()
         if bool(args.get("cached", False)):
-            return {"temperature": self.cached_temp, "from_cache": True}
+            temp_value = float(self.cached_temp)
+            valid = math.isfinite(temp_value) and temp_value > -30.0
+            return {
+                "temperature": temp_value,
+                "from_cache": True,
+                "ok": valid,
+            }
         temp = c.get_lea_temperature()
-        if temp is None or temp <= -900.0:
-            return {"temperature": -999.0, "from_cache": False, "ok": False}
-        self.cached_temp = float(temp)
-        return {"temperature": self.cached_temp, "from_cache": False, "ok": True}
+        temp_value = float(temp) if temp is not None else -999.0
+        valid = math.isfinite(temp_value) and temp_value > -30.0
+        if valid:
+            self.cached_temp = temp_value
+        return {
+            "temperature": temp_value,
+            "from_cache": False,
+            "ok": valid,
+        }
 
     def cmd_sendImage(self, args: dict) -> dict:
         """Load an image from disk (PNG / NPY) and write_rj1_frame.
@@ -529,6 +548,8 @@ class Worker:
 
         t0 = time.monotonic()
         ok_ = c.write_rj1_frame(frame)
+        if not bool(ok_):
+            raise RuntimeError("IMAGE_TRANSFER_FAILED: write_rj1_frame returned False")
         dt_ms = int((time.monotonic() - t0) * 1000)
         return {"ok": bool(ok_), "duration_ms": dt_ms, "shape": list(frame.shape)}
 
@@ -692,6 +713,8 @@ def main() -> int:
                 "USB_BUSY_TIMEOUT",
                 "SERIAL_NOT_FOUND",
                 "SERIAL_MISMATCH",
+                "BRIGHTNESS_SET_FAILED",
+                "IMAGE_TRANSFER_FAILED",
             ):
                 if candidate in message:
                     error_code = candidate
