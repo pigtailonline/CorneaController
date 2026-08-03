@@ -161,6 +161,37 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         body = function_body(read("src/corneawidget.cpp"), "bool CorneaWidget::powerOnBySerial(const QString &serial, const QString &variant)")
         self.assertIn("ctrl->connect(panel->deviceIndex(), variant, serial)", body)
 
+    def test_semantic_command_failures_propagate_without_worker_isolation(self):
+        bridge = read("src/pythonbridge.cpp")
+        widget = read("src/corneawidget.cpp")
+        tcp = read("src/tcpserver.cpp")
+
+        for code in (
+            "BRIGHTNESS_SET_FAILED",
+            "IMAGE_TRANSFER_FAILED",
+            "INVALID_TEMPERATURE",
+        ):
+            self.assertIn(code, bridge + widget + tcp)
+        self.assertIn('errorCode == QStringLiteral("IMAGE_TRANSFER_FAILED")', bridge)
+        self.assertIn('firstError.contains(QStringLiteral("BRIGHTNESS_SET_FAILED"))', widget)
+
+    def test_tcp_temperature_rejects_minus_forty(self):
+        body = function_body(
+            read("src/tcpserver.cpp"),
+            "QJsonObject TcpServer::handleGetTemperature",
+        )
+        self.assertIn("INVALID_TEMPERATURE", body)
+        self.assertIn("-30.0", body)
+
+    def test_power_on_stays_successful_when_safe_brightness_warns(self):
+        body = function_body(
+            read("src/tcpserver.cpp"),
+            "QJsonObject TcpServer::handlePowerOn",
+        )
+        self.assertIn("BRIGHTNESS_SET_FAILED", body)
+        self.assertIn('response["warning"] = true', body)
+        self.assertIn("return response", body)
+
 
 if __name__ == "__main__":
     unittest.main()

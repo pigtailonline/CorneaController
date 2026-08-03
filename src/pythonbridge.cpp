@@ -2011,7 +2011,8 @@ bool PythonBridge::setBrightness(int instanceId, double level)
         setError(QString("%1: %2").arg(
             errorCode.isEmpty() ? QStringLiteral("USB_TRANSPORT_LOST") : errorCode,
             detail));
-        if (errorCode == QStringLiteral("USB_BUSY_TIMEOUT")) {
+        if (errorCode == QStringLiteral("USB_BUSY_TIMEOUT")
+            || errorCode == QStringLiteral("BRIGHTNESS_SET_FAILED")) {
             emit logMessage(QString("[Instance %1] setBrightness skipped: %2")
                                 .arg(instanceId).arg(detail));
             return false;
@@ -2170,6 +2171,11 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image)
         const QJsonObject reply = subprocessCall(
             instanceId, "sendImage", QJsonObject{{"path", tmpPath}}, 30000);
         if (reply.value("success").toBool()) {
+            if (!reply.value("data").toObject().value("ok").toBool(true)) {
+                setError(QStringLiteral(
+                    "IMAGE_TRANSFER_FAILED: write_rj1_frame returned False"));
+                return false;
+            }
             return true;
         }
         const QString errorCode = reply.value("errorCode").toString();
@@ -2177,11 +2183,12 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image)
         setError(QString("%1: %2").arg(
             errorCode.isEmpty() ? QStringLiteral("USB_TRANSPORT_LOST") : errorCode,
             detail));
-        if (errorCode != QStringLiteral("USB_BUSY_TIMEOUT")) {
-            markSubprocessUnhealthy(instanceId, "sendImage", detail);
-        } else {
+        if (errorCode == QStringLiteral("USB_BUSY_TIMEOUT")
+            || errorCode == QStringLiteral("IMAGE_TRANSFER_FAILED")) {
             emit logMessage(QString("[Instance %1] sendImage skipped: %2")
                                 .arg(instanceId).arg(detail));
+        } else {
+            markSubprocessUnhealthy(instanceId, "sendImage", detail);
         }
         return false;
     }
@@ -2348,7 +2355,13 @@ double PythonBridge::getLeaTemperature(int instanceId)
     if (m_useSubprocess) {
         const QJsonObject reply = subprocessCall(instanceId, "getTemperature", {}, 10000);
         if (!reply.value("success").toBool()) return -999.0;
-        return reply.value("data").toObject().value("temperature").toDouble(-999.0);
+        const QJsonObject data = reply.value("data").toObject();
+        const double temperature = data.value("temperature").toDouble(-999.0);
+        if (!data.value("ok").toBool()) {
+            setError(QString("INVALID_TEMPERATURE: invalid RJ1 temperature %1 C")
+                         .arg(temperature, 0, 'f', 1));
+        }
+        return temperature;
     }
     return dispatchToDevice(instanceId, [this, instanceId]() -> double {
         PyObject *instance = getDeviceInstance(instanceId);

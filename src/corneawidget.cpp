@@ -632,8 +632,9 @@ bool CorneaWidget::setBrightnessBySerial(const QString &serial, double level)
     if (ctrl->setBrightness(level)) return true;
 
     const QString firstError = ctrl->lastError();
-    if (firstError.contains(QStringLiteral("USB_BUSY_TIMEOUT"))) {
-        appendLog(QString("[setBrightness] %1 busy; not reconnecting a healthy worker: %2")
+    if (firstError.contains(QStringLiteral("USB_BUSY_TIMEOUT"))
+        || firstError.contains(QStringLiteral("BRIGHTNESS_SET_FAILED"))) {
+        appendLog(QString("[setBrightness] %1 failed; not reconnecting a healthy worker: %2")
                       .arg(serial, firstError));
         return false;
     }
@@ -707,7 +708,9 @@ ApiResult CorneaWidget::setBrightnessBySerialEx(const QString &serial, double le
     if (!ctrl->isConnected()) return ApiResult::fail(QString("Device not connected: %1").arg(serial));
 
     if (!ctrl->setBrightness(level)) {
-        return ApiResult::fail("Failed to set brightness");
+        const QString detail = ctrl->lastError();
+        return ApiResult::fail(
+            detail.isEmpty() ? QStringLiteral("Failed to set brightness") : detail);
     }
 
     if (waitProtection) {
@@ -757,6 +760,12 @@ double CorneaWidget::getTemperatureBySerial(const QString &serial) const
     // sendImage/setBrightness on the SPI bus, fixing the 0.8% getTemperature
     // success rate observed in 2026-05-21 stress test.
     return ctrl->getCachedRj1Temperature();
+}
+
+QString CorneaWidget::lastErrorForSerial(const QString &serial) const
+{
+    CorneaController *ctrl = getControllerBySerial(serial);
+    return ctrl ? ctrl->lastError() : QString();
 }
 
 QVariantMap CorneaWidget::getPowerBySerial(const QString &serial) const

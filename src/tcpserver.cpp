@@ -8,6 +8,7 @@
 #include <QImage>
 #include <QtConcurrent>
 #include <QThreadPool>
+#include <cmath>
 
 TcpServer::TcpServer(CorneaWidget *corneaWidget, QObject *parent)
     : QObject(parent)
@@ -291,7 +292,13 @@ QJsonObject TcpServer::handlePowerOn(const QJsonObject &params)
     double level = params.contains("brightness")
         ? params["brightness"].toDouble(kDefaultBrightness)
         : kDefaultBrightness;
-    m_corneaWidget->setBrightnessBySerial(serial, level);
+    if (!m_corneaWidget->setBrightnessBySerial(serial, level)) {
+        QJsonObject response = makeSuccess();
+        response["warning"] = true;
+        response["warningCode"] = QStringLiteral("BRIGHTNESS_SET_FAILED");
+        response["warningMessage"] = m_corneaWidget->lastErrorForSerial(serial);
+        return response;
+    }
 
     return makeSuccess();
 }
@@ -350,7 +357,7 @@ QJsonObject TcpServer::handleSetBrightness(const QJsonObject &params)
     if (result) {
         return makeSuccess();
     } else {
-        return makeError(QString("Failed to set brightness for device: %1").arg(serial));
+        return makeError(m_corneaWidget->lastErrorForSerial(serial));
     }
 }
 
@@ -406,8 +413,10 @@ QJsonObject TcpServer::handleGetTemperature(const QJsonObject &params)
     }
 
     double temp = m_corneaWidget->getTemperatureBySerial(serial);
-    if (temp < -900) {
-        return makeError(QString("Failed to get temperature for device: %1").arg(serial));
+    if (!std::isfinite(temp) || temp <= -30.0) {
+        return makeError(QString(
+            "INVALID_TEMPERATURE: invalid RJ1 temperature %1 C")
+            .arg(temp, 0, 'f', 1));
     }
 
     QJsonObject data;
@@ -552,6 +561,12 @@ QJsonObject TcpServer::makeError(const QString &message)
         obj["errorCode"] = QStringLiteral("SERIAL_NOT_FOUND");
     } else if (message.contains(QStringLiteral("SERIAL_MISMATCH"))) {
         obj["errorCode"] = QStringLiteral("SERIAL_MISMATCH");
+    } else if (message.contains(QStringLiteral("BRIGHTNESS_SET_FAILED"))) {
+        obj["errorCode"] = QStringLiteral("BRIGHTNESS_SET_FAILED");
+    } else if (message.contains(QStringLiteral("IMAGE_TRANSFER_FAILED"))) {
+        obj["errorCode"] = QStringLiteral("IMAGE_TRANSFER_FAILED");
+    } else if (message.contains(QStringLiteral("INVALID_TEMPERATURE"))) {
+        obj["errorCode"] = QStringLiteral("INVALID_TEMPERATURE");
     }
     return obj;
 }

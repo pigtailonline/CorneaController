@@ -87,6 +87,7 @@ public:
     bool isConnectedBySerial(const QString &serial) const;
     QString getPanelIdBySerial(const QString &serial) const;
     double getTemperatureBySerial(const QString &serial) const;
+    QString lastErrorForSerial(const QString &serial) const;
     QString getVariantBySerial(const QString &serial) const;
     QVariantMap getPowerBySerial(const QString &serial) const;  // {vsys_power_mw, vddio_power_mw}
 

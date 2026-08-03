@@ -212,6 +212,7 @@ bool CorneaController::setBrightness(double level)
         return true;
     }
 
+    emit errorOccurred(m_bridge->getLastError());
     return false;
 }
 
@@ -277,6 +278,9 @@ bool CorneaController::sendImage(const QImage &image)
     if (!requirePoweredOn("sendImage")) return false;
 
     bool success = m_bridge->writeFrame(m_instanceId, image);
+    if (!success) {
+        emit errorOccurred(m_bridge->getLastError());
+    }
     emit imageSent(success);
     return success;
 }
