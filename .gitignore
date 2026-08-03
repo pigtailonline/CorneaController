@@ -2,6 +2,7 @@
 build/
 release/
 debug/
+.worktrees/
 *.exe
 *.dll
 *.obj
