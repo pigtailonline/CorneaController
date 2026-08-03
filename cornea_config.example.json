@@ -11,7 +11,8 @@
             "C:/google_env/dll"
         ],
         "cal_path": "C:/google_env/hdf5_files",
-        "allow_default_hdf5": false
+        "allow_default_hdf5": false,
+        "serialize_usb": false
     },
     "devices": [
         null,

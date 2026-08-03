@@ -79,6 +79,7 @@ bool CorneaConfig::load(const QString &path)
     m_python.allowDefaultHdf5 = pythonObj["allow_default_hdf5"].toBool(false);
     m_python.spiClkFreq = pythonObj["spi_clk_freq"].toDouble(15e6);
     m_python.logApl = pythonObj["log_apl"].toBool(false);
+    m_python.serializeUsb = pythonObj["serialize_usb"].toBool(false);
     // Default true (subprocess mode is now the production path; embedded
     // is the explicit-opt-out fallback). If the key is missing from an
     // older config file, we still want subprocess on.
@@ -134,6 +135,7 @@ bool CorneaConfig::save(const QString &path)
     pythonObj["allow_default_hdf5"] = m_python.allowDefaultHdf5;
     pythonObj["spi_clk_freq"] = m_python.spiClkFreq;
     pythonObj["log_apl"] = m_python.logApl;
+    pythonObj["serialize_usb"] = m_python.serializeUsb;
     pythonObj["use_subprocess"] = m_python.useSubprocess;
     pythonObj["worker_script"] = m_python.workerScriptPath;
     if (!m_python.subprocessPythonExe.isEmpty())

@@ -16,6 +16,9 @@ struct PythonConfig {
     // Default false here = quieter logs + higher throughput. Flip to true
     // when debugging APL / brightness behavior.
     bool logApl = false;
+    // Serialize all panel USB access when diagnosing FTDI/libusb stability.
+    // Disabled by default so independent panels can run concurrently.
+    bool serializeUsb = false;
     // Phase 2 (v1.1.20): each panel routes through its own python.exe
     // subprocess running panel_worker.py via stdin/stdout JSON-RPC.
     // Sidesteps the cross-panel GIL contention documented in

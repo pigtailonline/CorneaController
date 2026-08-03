@@ -25,6 +25,16 @@ def function_body(source: str, signature: str) -> str:
 
 
 class MultiPanelWorkerArchitectureTests(unittest.TestCase):
+    def test_usb_serialization_config_defaults_off_and_is_persisted(self):
+        header = read("src/corneaconfig.h")
+        source = read("src/corneaconfig.cpp")
+        example = read("cornea_config.example.json")
+
+        self.assertIn("bool serializeUsb = false;", header)
+        self.assertIn('["serialize_usb"].toBool(false)', source)
+        self.assertIn('["serialize_usb"] = m_python.serializeUsb', source)
+        self.assertIn('"serialize_usb": false', example)
+
     def test_power_off_destroys_instance_between_duts(self):
         body = function_body(read("src/devicecontrolpanel.cpp"), "DeviceControlPanel::OpResult DeviceControlPanel::powerOffCore()")
         self.assertIn("m_controller->disconnect()", body)
