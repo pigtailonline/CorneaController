@@ -94,10 +94,17 @@ static QAtomicInteger<int> g_libusbGateMaxInFlight{0};
 class LibusbGateLease
 {
 public:
-    LibusbGateLease(const QString &command, const QString &serial, int waitTimeoutMs)
+    LibusbGateLease(bool enabled, const QString &command,
+                    const QString &serial, int waitTimeoutMs)
         : m_command(command)
         , m_serial(serial)
     {
+        if (!enabled) {
+            m_acquired = true;
+            m_bypassed = true;
+            return;
+        }
+
         m_totalTimer.start();
         const int queued = g_libusbGateWaiters.fetchAndAddRelaxed(1) + 1;
         qInfo().noquote()
@@ -131,7 +138,7 @@ public:
 
     ~LibusbGateLease()
     {
-        if (!m_acquired) return;
+        if (!m_acquired || m_bypassed) return;
         const qint64 executeMs = m_executeTimer.elapsed();
         g_libusbGateInFlight.fetchAndSubRelaxed(1);
         g_libusbGlobalMutex.unlock();
@@ -149,6 +156,7 @@ private:
     QString m_command;
     QString m_serial;
     bool m_acquired = false;
+    bool m_bypassed = false;
     qint64 m_waitMs = 0;
     QElapsedTimer m_totalTimer;
     QElapsedTimer m_executeTimer;
@@ -354,7 +362,8 @@ struct InvokeState {
 };
 template<typename F>
 static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
-                           bool acquireGil, const QString &timeoutTag,
+                           bool acquireGil, bool serializeUsb,
+                           const QString &timeoutTag,
                            std::function<void(const QString&)> logFn)
     -> decltype(f())
 {
@@ -382,6 +391,7 @@ static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
     //                      this op itself is slow and likely held GIL too)
     // Only log when above thresholds to keep release builds quiet.
     QMetaObject::invokeMethod(worker, [state, fn = std::forward<F>(f), acquireGil,
+                                       serializeUsb,
                                        t_dispatched, tag, logFn]() mutable {
         const qint64 t_lambda = QDateTime::currentMSecsSinceEpoch();
         const qint64 queue_wait = t_lambda - t_dispatched;
@@ -401,9 +411,13 @@ static auto invokeOnWorker(QObject *worker, QThread *thread, F &&f,
         }
         // Global libusb serialization — see g_libusbGlobalMutex docstring.
         // Acquired BEFORE GIL so blocked threads don't hold the GIL.
-        const qint64 t_lock_start = QDateTime::currentMSecsSinceEpoch();
-        QMutexLocker libusbLock(&g_libusbGlobalMutex);
-        const qint64 lock_wait = QDateTime::currentMSecsSinceEpoch() - t_lock_start;
+        std::unique_ptr<QMutexLocker> libusbLock;
+        qint64 lock_wait = 0;
+        if (serializeUsb) {
+            const qint64 t_lock_start = QDateTime::currentMSecsSinceEpoch();
+            libusbLock = std::make_unique<QMutexLocker>(&g_libusbGlobalMutex);
+            lock_wait = QDateTime::currentMSecsSinceEpoch() - t_lock_start;
+        }
         if (lock_wait > 50 && logFn) {
             logFn(QString("[invokeOnWorker] %1 libusb_lock_wait=%2ms tid=0x%3 — another instance was using USB")
                   .arg(tag).arg(lock_wait)
@@ -463,7 +477,8 @@ template<typename F>
 auto PythonBridge::dispatch(F &&f) -> decltype(f()) {
     auto log = [this](const QString &msg){ emit logMessage(msg); };
     return invokeOnWorker(m_pythonWorker, &m_pythonThread, std::forward<F>(f),
-                          /*acquireGil*/ true, QStringLiteral("dispatch"), log);
+                          /*acquireGil*/ true, m_serializeUsb,
+                          QStringLiteral("dispatch"), log);
 }
 
 void PythonBridge::dispatchVoid(std::function<void()> f) {
@@ -510,7 +525,7 @@ auto PythonBridge::dispatchToDevice(int instanceId, F &&f) -> decltype(f()) {
     };
     const QString tag = QString("dispatchToDevice[inst=%1]").arg(instanceId);
     return invokeOnWorker(worker, thread, std::forward<F>(f),
-                          /*acquireGil*/ true, tag, log);
+                          /*acquireGil*/ true, m_serializeUsb, tag, log);
 }
 
 void PythonBridge::dispatchVoidToDevice(int instanceId, std::function<void()> f) {
@@ -1336,6 +1351,9 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                 proc = new PanelSubprocess(nullptr);
                 proc->setPythonExe(m_subprocessPythonExe);
                 proc->setWorkerScript(m_workerScript);
+                proc->setExtraEnv(QStringList{
+                    QString("CORNEA_SERIALIZE_USB=%1").arg(m_serializeUsb ? 1 : 0)
+                });
                 // Qt::QueuedConnection because the signal fires on PanelSubprocess's
                 // worker thread; the slot mutates state owned by PythonBridge (logs)
                 // so it must hop over to PythonBridge's thread.
@@ -1374,7 +1392,8 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
             QJsonObject reply;
             qint64 initGateWaitMs = 0;
             {
-                LibusbGateLease initLease(QStringLiteral("init"), expectedSerial, 60000);
+                LibusbGateLease initLease(m_serializeUsb, QStringLiteral("init"),
+                                          expectedSerial, 60000);
                 if (initLease.acquired()) {
                     initGateWaitMs = initLease.waitMs();
                     // 60 s is generous for a cold cornea_rax720 ctor (typical
@@ -1734,7 +1753,8 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
         m_initOkMap.remove(instanceId);
         const QString serial = m_serialMap.take(instanceId);
         if (proc) {
-            LibusbGateLease teardownLease(QStringLiteral("teardown"), serial, 15000);
+            LibusbGateLease teardownLease(m_serializeUsb,
+                                          QStringLiteral("teardown"), serial, 15000);
             if (!teardownLease.acquired()) {
                 emit logMessage(QString("[Instance %1] USB_BUSY_TIMEOUT during teardown "
                                         "(serial=%2) — stopping subprocess without touching USB")
@@ -2649,7 +2669,7 @@ void PythonBridge::markSubprocessUnhealthy(int instanceId, const QString &operat
     // Do not delete a worker while another command is inside sendBlocking().
     // subprocessCall resolves the worker pointer only after taking this same
     // gate, which closes the previous stale-pointer/UAF window.
-    LibusbGateLease lease(QStringLiteral("isolate"), serial, 15000);
+    LibusbGateLease lease(m_serializeUsb, QStringLiteral("isolate"), serial, 15000);
     if (!lease.acquired()) {
         emit logMessage(QString("[Instance %1] unable to isolate unhealthy worker: "
                                 "USB_BUSY_TIMEOUT (serial=%2)")
@@ -2692,7 +2712,7 @@ QJsonObject PythonBridge::subprocessCall(int instanceId, const QString &cmd,
     const int gateWaitTimeoutMs =
         (cmd == QStringLiteral("getTemperature")) ? 0
         : ((cmd == QStringLiteral("powerOn")) ? 60000 : 15000);
-    LibusbGateLease lease(cmd, serial, gateWaitTimeoutMs);
+    LibusbGateLease lease(m_serializeUsb, cmd, serial, gateWaitTimeoutMs);
     if (!lease.acquired()) {
         return QJsonObject{
             {"success", false},

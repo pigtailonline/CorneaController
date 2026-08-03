@@ -29,6 +29,7 @@ public:
     void stop();
     bool isRunning() const;
     quint16 port() const;
+    void setSerializeUsb(bool on) { m_serializeUsb = on; }
 
 signals:
     void clientConnected(const QString &address);
@@ -77,6 +78,7 @@ private:
     // Protect against powerOn/powerOff resetting SPI/I2C while other commands run.
     // powerOn/powerOff take write lock (exclusive), all others take read lock (shared).
     QReadWriteLock m_deviceLock;
+    bool m_serializeUsb = false;
 };
 
 #endif // TCPSERVER_H

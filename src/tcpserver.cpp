@@ -165,12 +165,16 @@ void TcpServer::onReadyRead()
                 // powerOn/powerOff resets shared SPI/I2C controllers — take exclusive
                 // lock so no sendImage/getTemp runs during initialization.
                 // Other commands take shared lock — can run concurrently with each other.
-                if (isExclusive) {
-                    qInfo() << "[TCP] Waiting for exclusive lock:" << origCmd;
-                    m_deviceLock.lockForWrite();
-                    qInfo() << "[TCP] Acquired exclusive lock:" << origCmd;
-                } else {
-                    m_deviceLock.lockForRead();
+                bool lockHeld = false;
+                if (m_serializeUsb) {
+                    if (isExclusive) {
+                        qInfo() << "[TCP] Waiting for exclusive lock:" << origCmd;
+                        m_deviceLock.lockForWrite();
+                        qInfo() << "[TCP] Acquired exclusive lock:" << origCmd;
+                    } else {
+                        m_deviceLock.lockForRead();
+                    }
+                    lockHeld = true;
                 }
 
                 QJsonObject response;
@@ -182,8 +186,10 @@ void TcpServer::onReadyRead()
                     response = makeError("Unknown exception in async command");
                 }
 
-                m_deviceLock.unlock();
-                if (isExclusive) {
+                if (lockHeld) {
+                    m_deviceLock.unlock();
+                }
+                if (lockHeld && isExclusive) {
                     qInfo() << "[TCP] Released exclusive lock:" << origCmd;
                 }
 

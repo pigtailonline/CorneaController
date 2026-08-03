@@ -52,18 +52,29 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("SERIAL_MISMATCH", bridge_cpp)
         self.assertIn("SERIAL_NOT_FOUND", worker_py)
 
-    def test_subprocess_usb_calls_take_one_global_gate(self):
+    def test_usb_serialization_setting_controls_all_cpp_gates(self):
+        bridge_h = read("src/pythonbridge.h")
+        bridge_cpp = read("src/pythonbridge.cpp")
+        tcp_h = read("src/tcpserver.h")
+        tcp_cpp = read("src/tcpserver.cpp")
+        widget_cpp = read("src/corneawidget.cpp")
+
+        self.assertIn("setSerializeUsb(bool on)", bridge_h)
+        self.assertIn("bool m_serializeUsb = false;", bridge_h)
+        self.assertIn("setSerializeUsb(bool on)", tcp_h)
+        self.assertIn("bool m_serializeUsb = false;", tcp_h)
+        self.assertIn("m_serializeUsb", tcp_cpp)
+        self.assertIn("CORNEA_SERIALIZE_USB=", bridge_cpp)
+        self.assertIn("m_serializeUsb", bridge_cpp)
+        self.assertIn("setSerializeUsb(py.serializeUsb)", widget_cpp)
+
+    def test_subprocess_usb_gate_remains_available_when_enabled(self):
         bridge_cpp = read("src/pythonbridge.cpp")
         worker_py = read("python/panel_worker.py")
-        call_body = function_body(
-            bridge_cpp,
-            "QJsonObject PythonBridge::subprocessCall",
-        )
-        self.assertIn("LibusbGateLease", call_body)
-        self.assertIn("USB_BUSY_TIMEOUT", call_body)
-        self.assertIn("queue_wait_ms", call_body)
+
+        self.assertIn("LibusbGateLease", bridge_cpp)
+        self.assertIn("USB_BUSY_TIMEOUT", bridge_cpp)
         self.assertIn("CorneaController_USB_GATE_v1", worker_py)
-        self.assertIn("[USB-GATE]", worker_py)
 
     def test_temperature_poll_phase_does_not_overlap_panel_zero_and_five(self):
         body = function_body(

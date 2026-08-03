@@ -44,6 +44,8 @@ public:
     double spiClkFreq() const { return m_spiClkFreq; }
     void setLogApl(bool on) { m_logApl = on; }
     bool logApl() const { return m_logApl; }
+    void setSerializeUsb(bool on) { m_serializeUsb = on; }
+    bool serializeUsb() const { return m_serializeUsb; }
 
     // Phase 2 subprocess mode toggles. When enabled, createDeviceInstance
     // spawns a python.exe child running panel_worker.py and routes the
@@ -152,6 +154,7 @@ private:
     bool m_allowDefaultHdf5;
     double m_spiClkFreq = 15e6;
     bool m_logApl = false;
+    bool m_serializeUsb = false;
 
     // Multi-instance management
     QMap<int, PyObject*> m_deviceInstances;  // instanceId -> CorneaRax720

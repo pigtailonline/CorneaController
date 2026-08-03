@@ -222,6 +222,9 @@ bool CorneaWidget::initializePythonBridge()
     appendLog(QString("SPI clock freq: %1 MHz (from config)").arg(py.spiClkFreq / 1e6, 0, 'f', 1));
     m_pythonBridge->setLogApl(py.logApl);
     appendLog(QString("write_rj1_frame log_apl: %1 (from config)").arg(py.logApl ? "true" : "false"));
+    m_pythonBridge->setSerializeUsb(py.serializeUsb);
+    appendLog(QString("USB serialization: %1")
+                  .arg(py.serializeUsb ? "ENABLED" : "DISABLED"));
     // Phase 2 subprocess mode. When enabled, each panel runs in its own
     // python.exe via panel_worker.py — sidesteps the GIL cascade. Worker
     // script defaults to <appdir>/python/panel_worker.py beside the exe;
@@ -808,6 +811,7 @@ bool CorneaWidget::startTcpServer(quint16 port)
         connect(m_tcpServer.get(), &TcpServer::logMessage,
                 this, QOverload<const QString &>::of(&CorneaWidget::appendLog));
     }
+    m_tcpServer->setSerializeUsb(m_config.python().serializeUsb);
     return m_tcpServer->start(port);
 }
 
