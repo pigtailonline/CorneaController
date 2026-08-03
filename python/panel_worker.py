@@ -80,6 +80,20 @@ logging.basicConfig(
 log = logging.getLogger("panel_worker")
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+USB_SERIALIZATION_ENABLED = _env_flag("CORNEA_SERIALIZE_USB", False)
+
+
+def _command_requires_usb_gate(command: str) -> bool:
+    return USB_SERIALIZATION_ENABLED and command != "ping"
+
+
 class UsbGateTimeout(RuntimeError):
     """The process-wide USB gate could not be acquired within its deadline."""
 
@@ -597,6 +611,10 @@ class Worker:
 def main() -> int:
     log.info("panel_worker starting (pid=%d, python=%s)",
              os.getpid(), sys.version.split()[0])
+    log.info(
+        "USB serialization %s",
+        "ENABLED" if USB_SERIALIZATION_ENABLED else "DISABLED",
+    )
 
     worker = Worker()
     # Map cmd name → method. Adding a new command means adding a method
@@ -644,7 +662,7 @@ def main() -> int:
             emit(err(req_id, f"unknown cmd: {cmd!r}"))
             continue
 
-        gate_required = cmd not in {"ping"}
+        gate_required = _command_requires_usb_gate(cmd)
         gate_acquired = False
         try:
             gate_wait_ms = 0

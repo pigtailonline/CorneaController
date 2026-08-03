@@ -81,6 +81,30 @@ class PanelWorkerSerialBindingTests(unittest.TestCase):
             "init_rj1": True,
         }
 
+    def test_usb_serialization_defaults_disabled(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(
+                panel_worker._env_flag("CORNEA_SERIALIZE_USB", False)
+            )
+
+    def test_usb_serialization_accepts_explicit_true(self):
+        with patch.dict(
+            os.environ, {"CORNEA_SERIALIZE_USB": "1"}, clear=True
+        ):
+            self.assertTrue(
+                panel_worker._env_flag("CORNEA_SERIALIZE_USB", False)
+            )
+
+    def test_ping_never_uses_usb_gate(self):
+        with patch.object(panel_worker, "USB_SERIALIZATION_ENABLED", True):
+            self.assertFalse(panel_worker._command_requires_usb_gate("ping"))
+
+    def test_hardware_command_uses_gate_only_when_enabled(self):
+        with patch.object(panel_worker, "USB_SERIALIZATION_ENABLED", False):
+            self.assertFalse(panel_worker._command_requires_usb_gate("init"))
+        with patch.object(panel_worker, "USB_SERIALIZATION_ENABLED", True):
+            self.assertTrue(panel_worker._command_requires_usb_gate("init"))
+
     def test_resolves_current_index_by_stable_expected_serial(self):
         worker = panel_worker.Worker()
         with patch.dict(sys.modules, fake_modules()), patch.object(
