@@ -148,6 +148,50 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn("attempt", body)
         self.assertIn("init failed on attempt", body)
 
+    def test_subprocess_init_stops_after_deterministic_hardware_failure(self):
+        body = function_body(
+            read("src/pythonbridge.cpp"), "int PythonBridge::createDeviceInstance"
+        )
+        self.assertIn('data.value("retryable").toBool(false)', body)
+        self.assertIn('data.value("failure_kind")', body)
+        self.assertIn('data.value("failure_reason")', body)
+        self.assertIn("deterministic hardware failure", body)
+        self.assertIn("if (!retryable)", body)
+        non_retryable = body.index("if (!retryable)")
+        self.assertIn("break;", body[non_retryable:non_retryable + 500])
+
+    def test_subprocess_init_retries_only_allowlisted_transient_failures(self):
+        body = function_body(
+            read("src/pythonbridge.cpp"), "int PythonBridge::createDeviceInstance"
+        )
+        for marker in (
+            "USB_BUSY_TIMEOUT",
+            "USB_TRANSPORT_LOST",
+            "SERIAL_NOT_FOUND",
+            "No answer from FTDI",
+            "subprocess exited",
+            "timed out",
+        ):
+            self.assertIn(marker, body)
+        self.assertIn("const bool retryable =", body)
+        self.assertNotIn("const bool retryable = !deterministicHardwareFailure", body)
+
+    def test_subprocess_retry_delay_only_runs_before_another_attempt(self):
+        body = function_body(
+            read("src/pythonbridge.cpp"), "int PythonBridge::createDeviceInstance"
+        )
+        self.assertIn("attempt < kSubprocessInitAttempts", body)
+        self.assertNotIn("proc = nullptr;\n            QThread::msleep(1000);", body)
+
+    def test_subprocess_failure_log_reports_actual_attempt_count(self):
+        body = function_body(
+            read("src/pythonbridge.cpp"), "int PythonBridge::createDeviceInstance"
+        )
+        self.assertIn("int attemptsMade = 0", body)
+        self.assertIn("attemptsMade = attempt", body)
+        self.assertIn(".arg(attemptsMade)", body)
+        self.assertNotIn(".arg(kSubprocessInitAttempts)\n                    .arg(expectedSerial", body)
+
     def test_subprocess_worker_is_reused_but_hardware_instance_is_reset(self):
         bridge_cpp = read("src/pythonbridge.cpp")
         destroy_body = function_body(bridge_cpp, "void PythonBridge::destroyDeviceInstance(int instanceId)")

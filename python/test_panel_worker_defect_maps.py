@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import unittest
 import logging
+import sys
+import types
 from pathlib import Path
 from unittest.mock import patch
 
@@ -51,7 +53,40 @@ class FakeCorneaPowerOnFailure(FakeCornea):
         return False
 
 
+class FakeCorneaInitNack:
+    def __init__(self, **kwargs):
+        self.init_ok = False
+        self.cornea_serial = str(kwargs.get("cornea_serial") or "LITE_TEST")
+        logging.getLogger("ar_display_lab_lib.control_boards.cornea_rax720").error(
+            "Exception: NACK @ 0x20. Failure to sequence power supplies."
+        )
+
+
 class DefectMapExportTests(unittest.TestCase):
+    def test_init_classifies_panel_nack_as_non_retryable_hardware_failure(self):
+        package = types.ModuleType("ar_display_lab_lib")
+        package.__path__ = []
+        control_boards = types.ModuleType("ar_display_lab_lib.control_boards")
+        control_boards.__path__ = []
+        cornea_module = types.ModuleType(
+            "ar_display_lab_lib.control_boards.cornea_rax720"
+        )
+        cornea_module.CorneaRax720 = FakeCorneaInitNack
+
+        modules = {
+            "ar_display_lab_lib": package,
+            "ar_display_lab_lib.control_boards": control_boards,
+            "ar_display_lab_lib.control_boards.cornea_rax720": cornea_module,
+        }
+        worker = Worker()
+        with patch.dict(sys.modules, modules):
+            result = worker.cmd_init({"cornea_serial": ""})
+
+        self.assertFalse(result["init_ok"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(result["failure_kind"], "HARDWARE_NOT_READY")
+        self.assertIn("0x20", result["failure_reason"])
+
     def test_power_on_exports_defect_maps_once_after_panel_id_is_available(self):
         with tempfile.TemporaryDirectory() as tmp:
             worker = Worker()

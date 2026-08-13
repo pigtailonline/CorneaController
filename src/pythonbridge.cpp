@@ -1379,11 +1379,13 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         PanelSubprocess *proc = nullptr;
         QJsonObject data;
         bool initOk = false;
+        int attemptsMade = 0;
         const QString reuseKey = expectedSerial.isEmpty()
             ? QStringLiteral("index:%1").arg(deviceIndex)
             : expectedSerial;
 
         for (int attempt = 1; attempt <= kSubprocessInitAttempts; ++attempt) {
+            attemptsMade = attempt;
             if (attempt == 1) {
                 QMutexLocker lock(&m_panelProcsMutex);
                 proc = m_idlePanelProcs.take(reuseKey);
@@ -1438,7 +1440,9 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                                         .arg(instanceId).arg(attempt));
                     delete proc;
                     proc = nullptr;
-                    QThread::msleep(1000);
+                    if (attempt < kSubprocessInitAttempts) {
+                        QThread::msleep(1000);
+                    }
                     continue;
                 }
             }
@@ -1480,13 +1484,49 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                 }
             }
             if (!reply.value("success").toBool()) {
-                emit logMessage(QString("[Instance %1] init failed on attempt %2: %3")
+                const QString initError = reply.value("error").toString();
+                const QString errorCode = reply.value("errorCode").toString();
+                const bool deterministicHardwareFailure =
+                    errorCode == QStringLiteral("SERIAL_MISMATCH")
+                    || initError.contains(QStringLiteral("NACK @"), Qt::CaseInsensitive)
+                    || initError.contains(QStringLiteral("NACK from slave"), Qt::CaseInsensitive)
+                    || initError.contains(QStringLiteral("Failure to sequence power supplies"), Qt::CaseInsensitive)
+                    || initError.contains(QStringLiteral("empty Panel ID"), Qt::CaseInsensitive);
+                // Unknown errors fail closed. Retry only failures known to be
+                // transient worker/USB conditions; deterministic hardware
+                // failures and unclassified failures must not repeat power
+                // sequencing on a missing or unseated panel.
+                const bool retryable =
+                    errorCode == QStringLiteral("USB_BUSY_TIMEOUT")
+                    || errorCode == QStringLiteral("USB_TRANSPORT_LOST")
+                    || errorCode == QStringLiteral("SERIAL_NOT_FOUND")
+                    || initError.contains(QStringLiteral("No answer from FTDI"), Qt::CaseInsensitive)
+                    || initError.contains(QStringLiteral("subprocess exited"), Qt::CaseInsensitive)
+                    || initError.contains(QStringLiteral("timed out"), Qt::CaseInsensitive);
+                emit logMessage(QString("[Instance %1] init failed on attempt %2: "
+                                        "retryable=%3 kind=%4 reason=%5")
                                     .arg(instanceId).arg(attempt)
-                                    .arg(reply.value("error").toString()));
+                                    .arg(retryable ? QStringLiteral("true") : QStringLiteral("false"))
+                                    .arg(deterministicHardwareFailure
+                                             ? QStringLiteral("HARDWARE_NOT_READY")
+                                             : (retryable
+                                                    ? (errorCode.isEmpty()
+                                                           ? QStringLiteral("WORKER_OR_USB_TRANSIENT")
+                                                           : errorCode)
+                                                    : QStringLiteral("UNCLASSIFIED_NON_RETRYABLE")))
+                                    .arg(initError));
                 proc->stop(3000);
                 delete proc;
                 proc = nullptr;
-                QThread::msleep(1000);
+                if (!retryable) {
+                    emit logMessage(QString("[Instance %1] non-retryable init failure; "
+                                            "skipping remaining init attempts")
+                                        .arg(instanceId));
+                    break;
+                }
+                if (attempt < kSubprocessInitAttempts) {
+                    QThread::msleep(1000);
+                }
                 continue;
             }
 
@@ -1509,19 +1549,34 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                 break;
             }
 
-            emit logMessage(QString("[Instance %1] hardware init failed on attempt %2 "
-                                    "(init_ok=0) — restarting worker")
-                                .arg(instanceId).arg(attempt));
+            const bool retryable = data.value("retryable").toBool(false);
+            const QString failureKind = data.value("failure_kind").toString(
+                QStringLiteral("HARDWARE_NOT_READY"));
+            const QString failureReason = data.value("failure_reason").toString(
+                QStringLiteral("init_ok=False"));
+            emit logMessage(QString("[Instance %1] hardware init failed on attempt %2: "
+                                    "retryable=%3 kind=%4 reason=%5")
+                                .arg(instanceId).arg(attempt)
+                                .arg(retryable ? QStringLiteral("true") : QStringLiteral("false"))
+                                .arg(failureKind, failureReason));
             proc->stop(3000);
             delete proc;
             proc = nullptr;
-            QThread::msleep(1000);
+            if (!retryable) {
+                emit logMessage(QString("[Instance %1] deterministic hardware failure; "
+                                        "skipping remaining init attempts")
+                                    .arg(instanceId));
+                break;
+            }
+            if (attempt < kSubprocessInitAttempts) {
+                QThread::msleep(1000);
+            }
         }
 
         if (!proc || !initOk) {
             const QString detail = QString(
                 "Hardware init failed after %1 attempt(s); expected serial=%2")
-                    .arg(kSubprocessInitAttempts)
+                    .arg(attemptsMade)
                     .arg(expectedSerial.isEmpty() ? QStringLiteral("<index-only>") : expectedSerial);
             setError(detail);
             if (error) *error = detail;

@@ -182,6 +182,31 @@ class _PowerErrorCapture(logging.Handler):
             self.messages.append(msg)
 
 
+class _InitFailureCapture(logging.Handler):
+    """Collect deterministic hardware evidence emitted by the vendor ctor."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = record.getMessage()
+        if (
+            "NACK @" in msg
+            or "NACK from slave" in msg
+            or "Failure to sequence power supplies" in msg
+            or "NACK from slave encountered in init_cornea" in msg
+        ):
+            self.messages.append(msg)
+
+    def best_reason(self) -> str:
+        for preferred in ("0x20", "0x30", "Failure to sequence power supplies"):
+            for message in self.messages:
+                if preferred in message:
+                    return message
+        return self.messages[-1] if self.messages else "init_ok=False"
+
+
 def _handler_logger(logger):
     if logger is None:
         return None
@@ -303,7 +328,15 @@ class Worker:
             "hardware_variant":  str(args.get("hardware_variant", "F33L")),
         }
         t0 = time.monotonic()
-        self.cornea = CorneaRax720(**kwargs)
+        init_capture = _InitFailureCapture()
+        vendor_logger = logging.getLogger(
+            "ar_display_lab_lib.control_boards.cornea_rax720"
+        )
+        vendor_logger.addHandler(init_capture)
+        try:
+            self.cornea = CorneaRax720(**kwargs)
+        finally:
+            vendor_logger.removeHandler(init_capture)
         dt_ms = int((time.monotonic() - t0) * 1000)
         log.info("CorneaRax720 ctor done in %d ms (variant=%s, index=%d)",
                  dt_ms, kwargs["hardware_variant"], kwargs["cornea_index"])
@@ -321,7 +354,7 @@ class Worker:
                 f"actual {actual_serial or '<empty>'}"
             )
         panel_id = self._require_panel_id("init") if init_ok else ""
-        return {
+        result = {
             "init_ok": init_ok,
             "cornea_serial": actual_serial,
             "panel_id": panel_id,
@@ -332,6 +365,13 @@ class Worker:
                 "reason": "init_not_ok",
             },
         }
+        if not init_ok:
+            result.update({
+                "failure_kind": "HARDWARE_NOT_READY",
+                "failure_reason": init_capture.best_reason(),
+                "retryable": False,
+            })
+        return result
 
     def _require(self):
         if self.cornea is None:
