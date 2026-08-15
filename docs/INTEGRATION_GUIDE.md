@@ -206,7 +206,8 @@ win32 {
       "C:/Python312",
       "D:/projects/deps/dll"
     ],
-    "cal_path": "C:/google_cal/hdf5_files"
+    "cal_path": "C:/google_cal/hdf5_files",
+    "defect_map_output_root": "\\\\REMOTE-PC\\DefectMaps"
   },
   "devices": [
     { "serial": "LITE20240101", "variant": "standard", "brightness": 0.03 },
@@ -235,12 +236,36 @@ win32 {
 | `python.python_home` | Python installation directory |
 | `python.dll_paths` | Additional DLL search paths |
 | `python.cal_path` | Path to HDF5 calibration files |
+| `python.defect_map_output_root` | Optional defect-map output root; supports local and UNC paths |
 | `devices` | Array of device configurations (max 12) |
 | `devices[].serial` | Device serial number |
 | `devices[].variant` | Hardware variant: `standard`, `F33R`, `F33L`, or `F33LP` |
 | `devices[].brightness` | Default brightness (0.0 - 1.0) |
 
 **Note:** New devices are automatically added to the first `null` slot when discovered.
+
+#### Independent defect-map output
+
+Keep the large HDF5 files under the local `python.cal_path` and set
+`python.defect_map_output_root` to a separate local directory or SMB share.
+For the example above, each panel is written to:
+
+```text
+\\REMOTE-PC\DefectMaps\<Panel ID>\
+```
+
+In JSON, each backslash in a UNC path must be escaped. The Windows account
+running CorneaController must already have create/write permission on the
+share. HDF5 files are read only from `cal_path` and are not copied remotely.
+
+If the setting is absent or empty, the legacy output remains:
+
+```text
+<cal_path>\defect_maps\<Panel ID>\
+```
+
+An unreachable or unwritable output path records a defect-map export warning
+but does not fail an otherwise successful Power On.
 
 ---
 
