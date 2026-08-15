@@ -121,9 +121,38 @@ class DefectMapExportTests(unittest.TestCase):
             self.assertEqual(cmd[3], worker.cal_path)
             self.assertEqual(cmd[4], "04830377")
             self.assertEqual(cmd[5], "--get-defect-maps")
-            self.assertTrue(cmd[6].endswith("defect_maps/04830377"))
+            self.assertEqual(
+                Path(cmd[6]), Path(worker.cal_path) / "defect_maps" / "04830377"
+            )
             self.assertTrue(kwargs["capture_output"])
             self.assertTrue(kwargs["text"])
+
+    def test_configured_output_root_keeps_hdf5_input_local(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = Worker()
+            worker.cornea = FakeCornea()
+            worker.cal_path = str(Path(tmp) / "local_hdf5")
+            worker.defect_map_output_root = str(Path(tmp) / "remote_share")
+
+            def fake_run(cmd, **kwargs):
+                class Result:
+                    returncode = 0
+                    stdout = "ok"
+                    stderr = ""
+
+                return Result()
+
+            with patch("panel_worker.subprocess.run", side_effect=fake_run) as run:
+                result = worker.cmd_powerOn({})
+
+            cmd = run.call_args.args[0]
+            self.assertEqual(cmd[3], worker.cal_path)
+            self.assertEqual(
+                Path(cmd[6]), Path(worker.defect_map_output_root) / "04830377"
+            )
+            self.assertEqual(
+                Path(result["defect_maps"]["output_path"]), Path(cmd[6])
+            )
 
     def test_defect_map_export_failure_does_not_fail_power_on(self):
         with tempfile.TemporaryDirectory() as tmp:
