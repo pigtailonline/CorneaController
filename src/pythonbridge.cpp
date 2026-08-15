@@ -1451,6 +1451,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                 {"cornea_index",       deviceIndex},
                 {"hardware_variant",   hardwareVariant},
                 {"cal_path",           m_calPath},
+                {"defect_map_output_root", m_defectMapOutputRoot},
                 {"init_cornea",        true},
                 {"init_rj1",           true},
                 {"allow_default_hdf5", m_allowDefaultHdf5},

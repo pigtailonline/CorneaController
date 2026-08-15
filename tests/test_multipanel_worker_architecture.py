@@ -56,6 +56,30 @@ class MultiPanelWorkerArchitectureTests(unittest.TestCase):
         self.assertIn('["serialize_usb"] = m_python.serializeUsb', source)
         self.assertIn('"serialize_usb": false', example)
 
+    def test_defect_map_output_root_is_configured_end_to_end(self):
+        config_h = read("src/corneaconfig.h")
+        config_cpp = read("src/corneaconfig.cpp")
+        bridge_h = read("src/pythonbridge.h")
+        bridge_cpp = read("src/pythonbridge.cpp")
+        widget_cpp = read("src/corneawidget.cpp")
+        example = read("cornea_config.example.json")
+
+        self.assertIn("QString defectMapOutputRoot;", config_h)
+        self.assertIn('["defect_map_output_root"].toString()', config_cpp)
+        self.assertIn(
+            '["defect_map_output_root"] = m_python.defectMapOutputRoot',
+            config_cpp,
+        )
+        self.assertIn("setDefectMapOutputRoot", bridge_h)
+        self.assertIn("m_defectMapOutputRoot", bridge_h)
+        self.assertIn(
+            '{"defect_map_output_root", m_defectMapOutputRoot}', bridge_cpp
+        )
+        self.assertIn(
+            "setDefectMapOutputRoot(py.defectMapOutputRoot)", widget_cpp
+        )
+        self.assertIn('"defect_map_output_root": ""', example)
+
     def test_power_off_destroys_instance_between_duts(self):
         body = function_body(read("src/devicecontrolpanel.cpp"), "DeviceControlPanel::OpResult DeviceControlPanel::powerOffCore()")
         self.assertIn("m_controller->disconnect()", body)

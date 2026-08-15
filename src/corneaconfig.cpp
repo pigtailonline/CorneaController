@@ -76,6 +76,7 @@ bool CorneaConfig::load(const QString &path)
     m_python.venvPath = pythonObj["venv_path"].toString();
     m_python.pythonHome = pythonObj["python_home"].toString();
     m_python.calPath = pythonObj["cal_path"].toString();
+    m_python.defectMapOutputRoot = pythonObj["defect_map_output_root"].toString();
     m_python.allowDefaultHdf5 = pythonObj["allow_default_hdf5"].toBool(false);
     m_python.spiClkFreq = pythonObj["spi_clk_freq"].toDouble(15e6);
     m_python.logApl = pythonObj["log_apl"].toBool(false);
@@ -132,6 +133,7 @@ bool CorneaConfig::save(const QString &path)
     pythonObj["venv_path"] = m_python.venvPath;
     pythonObj["python_home"] = m_python.pythonHome;
     pythonObj["cal_path"] = m_python.calPath;
+    pythonObj["defect_map_output_root"] = m_python.defectMapOutputRoot;
     pythonObj["allow_default_hdf5"] = m_python.allowDefaultHdf5;
     pythonObj["spi_clk_freq"] = m_python.spiClkFreq;
     pythonObj["log_apl"] = m_python.logApl;

@@ -10,6 +10,7 @@ struct PythonConfig {
     QString pythonHome;
     QStringList dllPaths;
     QString calPath;
+    QString defectMapOutputRoot;
     bool allowDefaultHdf5 = false;
     double spiClkFreq = 15e6;       // SPI clock frequency in Hz (default 15MHz)
     // rax_lib's write_rj1_frame logs an APL line on every frame by default.

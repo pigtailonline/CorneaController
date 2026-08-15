@@ -46,6 +46,7 @@ public:
     bool logApl() const { return m_logApl; }
     void setSerializeUsb(bool on) { m_serializeUsb = on; }
     bool serializeUsb() const { return m_serializeUsb; }
+    void setDefectMapOutputRoot(const QString &path) { m_defectMapOutputRoot = path; }
 
     // Phase 2 subprocess mode toggles. When enabled, createDeviceInstance
     // spawns a python.exe child running panel_worker.py and routes the
@@ -156,6 +157,7 @@ private:
     QString m_pythonHome;
     QStringList m_dllPaths;
     QString m_calPath;
+    QString m_defectMapOutputRoot;
     bool m_allowDefaultHdf5;
     double m_spiClkFreq = 15e6;
     bool m_logApl = false;

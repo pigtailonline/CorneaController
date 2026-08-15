@@ -11,6 +11,7 @@
             "C:/google_env/dll"
         ],
         "cal_path": "C:/google_env/hdf5_files",
+        "defect_map_output_root": "",
         "allow_default_hdf5": false,
         "serialize_usb": false
     },

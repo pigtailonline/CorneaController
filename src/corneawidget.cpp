@@ -225,6 +225,7 @@ bool CorneaWidget::initializePythonBridge()
     m_pythonBridge->setSerializeUsb(py.serializeUsb);
     appendLog(QString("USB serialization: %1")
                   .arg(py.serializeUsb ? "ENABLED" : "DISABLED"));
+    m_pythonBridge->setDefectMapOutputRoot(py.defectMapOutputRoot);
     // Phase 2 subprocess mode. When enabled, each panel runs in its own
     // python.exe via panel_worker.py — sidesteps the GIL cascade. Worker
     // script defaults to <appdir>/python/panel_worker.py beside the exe;
