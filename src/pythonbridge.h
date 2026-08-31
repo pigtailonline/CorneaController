@@ -12,7 +12,9 @@
 #include <QMutex>
 #include <QRandomGenerator>
 #include <QJsonObject>
+#include <QAtomicInteger>
 #include <memory>
+#include <functional>
 
 class PanelSubprocess;
 
@@ -32,6 +34,24 @@ class PythonBridge : public QObject
     Q_OBJECT
 
 public:
+    enum class SessionState {
+        Ready,
+        Recovering,
+        Unavailable,
+    };
+
+    // A command's identity is kept separate from the worker RPC id.  The
+    // latter is local to one subprocess and can be reused after replacement;
+    // requestId + workerGeneration are what make late results harmless.
+    struct CommandContext {
+        QString requestId;
+        QString serial;
+        QString command;
+        qint64 deadlineMs = 0;
+        bool active = true;
+        quint64 workerGeneration = 0;
+    };
+
     explicit PythonBridge(QObject *parent = nullptr);
     ~PythonBridge();
 
@@ -47,6 +67,20 @@ public:
     void setSerializeUsb(bool on) { m_serializeUsb = on; }
     bool serializeUsb() const { return m_serializeUsb; }
     void setDefectMapOutputRoot(const QString &path) { m_defectMapOutputRoot = path; }
+
+    // Driver-owned deadlines.  The upstream client remains at 15 seconds;
+    // the initial Power budget is deliberately shorter and independently
+    // configurable from worker/recovery budgets.
+    static constexpr int DEFAULT_POWER_DEADLINE_MS = 14000;
+    static constexpr int DEFAULT_RECOVERY_BUDGET_MS = 5000;
+    void setPowerDeadlineMs(int timeoutMs) {
+        m_powerDeadlineMs = qBound(1, timeoutMs, 14999);
+    }
+    int powerDeadlineMs() const { return m_powerDeadlineMs.loadRelaxed(); }
+    void setRecoveryBudgetMs(int timeoutMs) {
+        m_recoveryBudgetMs = qMax(1, timeoutMs);
+    }
+    int recoveryBudgetMs() const { return m_recoveryBudgetMs.loadRelaxed(); }
 
     // Phase 2 subprocess mode toggles. When enabled, createDeviceInstance
     // spawns a python.exe child running panel_worker.py and routes the
@@ -76,6 +110,10 @@ public:
     bool isDeviceConnected(int instanceId) const;
     bool isDeviceInitOk(int instanceId) const;
     QString getDeviceSerial(int instanceId) const;
+    SessionState sessionState(int instanceId) const;
+    SessionState sessionStateForSerial(const QString &serial) const;
+    quint64 workerGeneration(int instanceId) const;
+    static QString sessionStateName(SessionState state);
 
     // Power control (per instance)
     bool systemPowerOn(int instanceId, QString *error = nullptr);
@@ -84,6 +122,8 @@ public:
 
     // Brightness control (per instance)
     bool setBrightness(int instanceId, double level, QString *error = nullptr);
+    bool setBrightnessWithDeadline(int instanceId, double level,
+                                   QString *error, int commandDeadlineMs);
     double getBrightness(int instanceId);
 
     // Flip control (per instance) - CalMetadata.x_flip / y_flip
@@ -131,6 +171,8 @@ public:
 signals:
     void errorOccurred(const QString &error);
     void logMessage(const QString &message);
+    void sessionStateChanged(const QString &serial, const QString &state,
+                             quint64 generation, const QString &error);
 
 private:
     // Internal methods (only called on Python worker thread)
@@ -145,6 +187,20 @@ private:
     void clearError();
     PyObject* getDeviceInstance(int instanceId) const;
 
+    bool isRetryableTransportFailure(const QString &errorCode,
+                                     const QString &detail) const;
+    void setSessionState(int instanceId, SessionState state,
+                         const QString &error = QString());
+    void quarantineSubprocess(int instanceId, const QString &operation,
+                              const QString &detail,
+                              int cleanupTimeoutMs = 1000);
+    bool recoverDeviceInstance(int instanceId, int budgetMs,
+                               QString *error = nullptr);
+    void startRecoveryAsync(int instanceId);
+    QJsonObject subprocessCallWithRecovery(int instanceId, const QString &cmd,
+                                           const QJsonObject &args,
+                                           int commandDeadlineMs,
+                                           bool retryOnTransport = true);
     bool m_initialized;
     PyObject *m_module;
     PyObject *m_corneaClass;
@@ -162,6 +218,8 @@ private:
     double m_spiClkFreq = 15e6;
     bool m_logApl = false;
     bool m_serializeUsb = false;
+    QAtomicInteger<int> m_powerDeadlineMs{DEFAULT_POWER_DEADLINE_MS};
+    QAtomicInteger<int> m_recoveryBudgetMs{DEFAULT_RECOVERY_BUDGET_MS};
 
     // Multi-instance management
     QMap<int, PyObject*> m_deviceInstances;  // instanceId -> CorneaRax720
@@ -181,6 +239,22 @@ private:
     QMap<int, PanelSubprocess*> m_panelProcs;
     QMap<QString, PanelSubprocess*> m_idlePanelProcs; // serial -> reset worker
     mutable QMutex m_panelProcsMutex;
+
+    struct InstanceMetadata {
+        int deviceIndex = -1;
+        QString hardwareVariant;
+        QString expectedSerial;
+    };
+    struct SessionCoordinator {
+        SessionState state = SessionState::Unavailable;
+        quint64 generation = 0;
+        int instanceId = -1;
+        bool recoveryStarted = false;
+        QString lastError;
+    };
+    QMap<int, InstanceMetadata> m_instanceMetadata;
+    QMap<QString, SessionCoordinator> m_sessions;
+    mutable QMutex m_sessionMutex;
 
     // Helper that routes one JSON-RPC call to the panel's subprocess.
     // Caller passes cmd + args; receives the full reply object so they

@@ -25,6 +25,7 @@ set(SOURCES
     src/imageloader.cpp
     src/devicecontrolpanel.cpp
     src/tcpserver.cpp
+    src/panelsubprocess.cpp
 )
 
 set(HEADERS
@@ -35,6 +36,7 @@ set(HEADERS
     src/imageloader.h
     src/devicecontrolpanel.h
     src/tcpserver.h
+    src/panelsubprocess.h
 )
 
 set(UI_FILES

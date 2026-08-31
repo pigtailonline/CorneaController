@@ -16,6 +16,12 @@ class CorneaController : public QObject
     Q_OBJECT
 
 public:
+    enum class PowerState {
+        Off,
+        On,
+        Unknown,
+    };
+
     // Constructor takes shared PythonBridge pointer (not owned)
     explicit CorneaController(PythonBridge *sharedBridge, QObject *parent = nullptr);
     ~CorneaController();
@@ -38,11 +44,15 @@ public:
     bool powerOn();
     bool powerOff();
     bool setVsysEnabled(bool enabled);
-    bool isPoweredOn() const { return m_poweredOn; }
+    bool isPoweredOn() const { return m_powerState == PowerState::On; }
+    PowerState powerState() const { return m_powerState; }
+    QString deviceState() const;
+    void markPowerStateUnknown(const QString &reason = QString());
     QString lastError() const;
 
     // Brightness
     bool setBrightness(double level);
+    bool setBrightness(double level, int commandDeadlineMs);
     double getBrightness();
 
     // Flip (CalMetadata.x_flip / y_flip)
@@ -98,6 +108,7 @@ signals:
     void connected();
     void disconnected();
     void powerStateChanged(bool poweredOn);
+    void deviceStateChanged(const QString &state);
     void brightnessChanged(double level);
     void xFlipChanged(bool flip);
     void yFlipChanged(bool flip);
@@ -119,6 +130,7 @@ private:
     PythonBridge *m_bridge;  // Shared, not owned
     QTimer *m_tempPollTimer;
     bool m_poweredOn;
+    PowerState m_powerState = PowerState::Unknown;
     double m_currentBrightness;
     bool m_currentXFlip;
     bool m_currentYFlip;

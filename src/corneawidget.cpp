@@ -548,6 +548,143 @@ CorneaController* CorneaWidget::getControllerBySerial(const QString &serial) con
     return panel ? panel->controller() : nullptr;
 }
 
+static QString classifyWidgetApiError(const QString &detail)
+{
+    const QString upper = detail.toUpper();
+    for (const QString &code : {
+             QStringLiteral("COMMAND_TIMEOUT"),
+             QStringLiteral("RECOVERY_IN_PROGRESS"),
+             QStringLiteral("RECOVERY_FAILED"),
+             QStringLiteral("USB_TRANSPORT_LOST"),
+             QStringLiteral("USB_BUSY_TIMEOUT"),
+             QStringLiteral("SERIAL_NOT_FOUND"),
+             QStringLiteral("SERIAL_MISMATCH"),
+             QStringLiteral("BRIGHTNESS_SET_FAILED"),
+             QStringLiteral("IMAGE_TRANSFER_FAILED"),
+             QStringLiteral("UCID"),
+             QStringLiteral("CALIBRATION") }) {
+        if (upper.contains(code)) return code;
+    }
+    return QString();
+}
+
+static ApiResult widgetApiFailure(const QString &detail,
+                                  const QString &requestId,
+                                  CorneaController *controller = nullptr,
+                                  int timeoutMs = 0)
+{
+    const QString error = detail.trimmed().isEmpty()
+        ? QStringLiteral("Device command failed") : detail;
+    return ApiResult::fail(error, classifyWidgetApiError(error), requestId,
+                           timeoutMs,
+                           controller ? controller->deviceState()
+                                      : QStringLiteral("unknown"));
+}
+
+ApiResult CorneaWidget::powerOnBySerialEx(const QString &serial,
+                                           const QString &variant,
+                                           const QString &requestId)
+{
+    DeviceControlPanel *panel = getPanelBySerial(serial);
+    if (!panel) {
+        return widgetApiFailure(QString("Device not found: %1").arg(serial),
+                                requestId, nullptr);
+    }
+    CorneaController *ctrl = panel->controller();
+    const PythonBridge::SessionState session =
+        m_pythonBridge->sessionStateForSerial(serial);
+    if (ctrl->isConnected() && session != PythonBridge::SessionState::Ready) {
+        const QString code = session == PythonBridge::SessionState::Recovering
+            ? QStringLiteral("RECOVERY_IN_PROGRESS")
+            : QStringLiteral("RECOVERY_FAILED");
+        return ApiResult::fail(
+            code == QStringLiteral("RECOVERY_IN_PROGRESS")
+                ? QStringLiteral("RECOVERY_IN_PROGRESS: serial is recovering")
+                : QStringLiteral("RECOVERY_FAILED: serial unavailable"),
+            code, requestId, m_pythonBridge->powerDeadlineMs(),
+            ctrl->deviceState());
+    }
+    if (ctrl->isConnected() && ctrl->isPoweredOn()) {
+        ApiResult result = ApiResult::ok(requestId);
+        result.deviceState = ctrl->deviceState();
+        return result;
+    }
+
+    const QString selectedVariant = variant.trimmed().isEmpty()
+        ? panel->currentVariant() : variant.trimmed();
+    const bool variantChanged = !variant.trimmed().isEmpty()
+        && panel->currentVariant() != selectedVariant;
+    if (!variant.trimmed().isEmpty()) {
+        panel->setCurrentVariant(selectedVariant);
+        QMetaObject::invokeMethod(panel, [panel, selectedVariant]() {
+            panel->setVariant(selectedVariant);
+        }, Qt::QueuedConnection);
+    }
+
+    bool ok = false;
+    if (ctrl->isConnected() && ctrl->isInitOk() && !variantChanged) {
+        // A recovered worker is Ready but the controller deliberately stays
+        // Unknown until this current-generation transition is verified.
+        ok = ctrl->powerOn();
+    } else {
+        if (ctrl->isConnected()) ctrl->disconnect();
+        ok = ctrl->connect(panel->deviceIndex(), selectedVariant, serial);
+    }
+    if (!ok) {
+        const QString detail = ctrl->lastError();
+        return widgetApiFailure(detail.isEmpty()
+                                    ? QString("Failed to power on device: %1").arg(serial)
+                                    : detail,
+                                requestId, ctrl,
+                                m_pythonBridge->powerDeadlineMs());
+    }
+    ApiResult result = ApiResult::ok(requestId);
+    result.deviceState = ctrl->deviceState();
+    return result;
+}
+
+ApiResult CorneaWidget::powerOffBySerialEx(const QString &serial,
+                                            const QString &requestId)
+{
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (!ctrl) {
+        return widgetApiFailure(QString("Device not found: %1").arg(serial),
+                                requestId, nullptr);
+    }
+    if (!ctrl->isConnected()) {
+        return widgetApiFailure(QString("Device not connected: %1").arg(serial),
+                                requestId, ctrl);
+    }
+    const PythonBridge::SessionState session =
+        m_pythonBridge->sessionStateForSerial(serial);
+    if (session != PythonBridge::SessionState::Ready) {
+        const QString code = session == PythonBridge::SessionState::Recovering
+            ? QStringLiteral("RECOVERY_IN_PROGRESS")
+            : QStringLiteral("RECOVERY_FAILED");
+        return ApiResult::fail(
+            code == QStringLiteral("RECOVERY_IN_PROGRESS")
+                ? QStringLiteral("RECOVERY_IN_PROGRESS: serial is recovering")
+                : QStringLiteral("RECOVERY_FAILED: serial unavailable"),
+            code, requestId, m_pythonBridge->powerDeadlineMs(),
+            ctrl->deviceState());
+    }
+    if (!ctrl->powerOff()) {
+        const QString detail = ctrl->lastError();
+        return widgetApiFailure(detail.isEmpty()
+                                    ? QString("Failed to power off device: %1").arg(serial)
+                                    : detail,
+                                requestId, ctrl,
+                                m_pythonBridge->powerDeadlineMs());
+    }
+    // Keep the existing production lifecycle (fresh serial-bound instance
+    // for the next DUT), but only after a verified current-generation power
+    // transition has completed.
+    ctrl->disconnect();
+    ApiResult result = ApiResult::ok(requestId);
+    result.deviceState = ctrl->deviceState();
+    return result;
+}
+
 bool CorneaWidget::powerOnBySerial(const QString &serial)
 {
     DeviceControlPanel *panel = getPanelBySerial(serial);
@@ -665,7 +802,7 @@ ApiResult CorneaWidget::sendImageBySerialEx(const QString &serial, const QString
 {
     QImage image(imagePath);
     if (image.isNull()) {
-        return ApiResult::fail(QString("Failed to load image: %1").arg(imagePath));
+        return widgetApiFailure(QString("Failed to load image: %1").arg(imagePath), QString());
     }
     return sendImageBySerialEx(serial, image);
 }
@@ -673,10 +810,23 @@ ApiResult CorneaWidget::sendImageBySerialEx(const QString &serial, const QString
 ApiResult CorneaWidget::sendImageBySerialEx(const QString &serial, const QImage &image)
 {
     DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) return ApiResult::fail(QString("Device not found: %1").arg(serial));
+    if (!panel) return widgetApiFailure(QString("Device not found: %1").arg(serial), QString());
 
     CorneaController *ctrl = panel->controller();
-    if (!ctrl->isConnected()) return ApiResult::fail(QString("Device not connected: %1").arg(serial));
+    const PythonBridge::SessionState session =
+        m_pythonBridge->sessionStateForSerial(serial);
+    if (session != PythonBridge::SessionState::Ready) {
+        const QString code = session == PythonBridge::SessionState::Recovering
+            ? QStringLiteral("RECOVERY_IN_PROGRESS")
+            : QStringLiteral("RECOVERY_FAILED");
+        return ApiResult::fail(
+            code == QStringLiteral("RECOVERY_IN_PROGRESS")
+                ? QStringLiteral("RECOVERY_IN_PROGRESS: serial is recovering")
+                : QStringLiteral("RECOVERY_FAILED: serial unavailable"),
+            code, QString(), m_pythonBridge->powerDeadlineMs(),
+            ctrl->deviceState());
+    }
+    if (!ctrl->isConnected()) return widgetApiFailure(QString("Device not connected: %1").arg(serial), QString(), ctrl);
 
     // APL check (thread-safe: static method + cached brightness)
     double patternApl = DeviceControlPanel::calculatePatternApl(image);
@@ -687,31 +837,50 @@ ApiResult CorneaWidget::sendImageBySerialEx(const QString &serial, const QImage 
     const double APL_LIMIT = 0.06;
     const double APL_LIMIT_EPSILON = 1e-4;
     if (totalApl > APL_LIMIT + APL_LIMIT_EPSILON) {
-        return ApiResult::fail(QString("APL_EXCEEDED: Total APL %1 > limit %2 (pattern=%3, brightness=%4)")
+        return widgetApiFailure(QString("APL_EXCEEDED: Total APL %1 > limit %2 (pattern=%3, brightness=%4)")
                                    .arg(totalApl, 0, 'f', 4).arg(APL_LIMIT, 0, 'f', 2)
-                                   .arg(patternApl, 0, 'f', 4).arg(brightness, 0, 'f', 2));
+                                   .arg(patternApl, 0, 'f', 4).arg(brightness, 0, 'f', 2), QString(), ctrl);
     }
 
     if (ctrl->sendImage(image)) {
-        return ApiResult::ok();
+        ApiResult result = ApiResult::ok();
+        result.deviceState = ctrl->deviceState();
+        return result;
     }
     const QString detail = ctrl->lastError();
-    return ApiResult::fail(
-        detail.isEmpty() ? QStringLiteral("Failed to send image to device") : detail);
+    return widgetApiFailure(
+        detail.isEmpty() ? QStringLiteral("Failed to send image to device") : detail,
+        QString(), ctrl);
 }
 
-ApiResult CorneaWidget::setBrightnessBySerialEx(const QString &serial, double level, bool waitProtection)
+ApiResult CorneaWidget::setBrightnessBySerialEx(const QString &serial, double level,
+                                                bool waitProtection,
+                                                int commandDeadlineMs)
 {
     DeviceControlPanel *panel = getPanelBySerial(serial);
-    if (!panel) return ApiResult::fail(QString("Device not found: %1").arg(serial));
+    if (!panel) return widgetApiFailure(QString("Device not found: %1").arg(serial), QString());
 
     CorneaController *ctrl = panel->controller();
-    if (!ctrl->isConnected()) return ApiResult::fail(QString("Device not connected: %1").arg(serial));
-
-    if (!ctrl->setBrightness(level)) {
-        const QString detail = ctrl->lastError();
+    const PythonBridge::SessionState session =
+        m_pythonBridge->sessionStateForSerial(serial);
+    if (session != PythonBridge::SessionState::Ready) {
+        const QString code = session == PythonBridge::SessionState::Recovering
+            ? QStringLiteral("RECOVERY_IN_PROGRESS")
+            : QStringLiteral("RECOVERY_FAILED");
         return ApiResult::fail(
-            detail.isEmpty() ? QStringLiteral("Failed to set brightness") : detail);
+            code == QStringLiteral("RECOVERY_IN_PROGRESS")
+                ? QStringLiteral("RECOVERY_IN_PROGRESS: serial is recovering")
+                : QStringLiteral("RECOVERY_FAILED: serial unavailable"),
+            code, QString(), m_pythonBridge->powerDeadlineMs(),
+            ctrl->deviceState());
+    }
+    if (!ctrl->isConnected()) return widgetApiFailure(QString("Device not connected: %1").arg(serial), QString(), ctrl);
+
+    if (!ctrl->setBrightness(level, commandDeadlineMs)) {
+        const QString detail = ctrl->lastError();
+        return widgetApiFailure(
+            detail.isEmpty() ? QStringLiteral("Failed to set brightness") : detail,
+            QString(), ctrl);
     }
 
     if (waitProtection) {
@@ -786,6 +955,32 @@ QString CorneaWidget::getVariantBySerial(const QString &serial) const
     DeviceControlPanel *panel = getPanelBySerial(serial);
     if (!panel) return QString();
     return panel->currentVariant();
+}
+
+QString CorneaWidget::deviceStateBySerial(const QString &serial) const
+{
+    CorneaController *ctrl = getControllerBySerial(serial);
+    return ctrl ? ctrl->deviceState() : QStringLiteral("unknown");
+}
+
+QString CorneaWidget::sessionStateBySerial(const QString &serial) const
+{
+    return m_pythonBridge
+        ? PythonBridge::sessionStateName(
+              m_pythonBridge->sessionStateForSerial(serial))
+        : QStringLiteral("Unavailable");
+}
+
+int CorneaWidget::powerDeadlineMs() const
+{
+    return m_pythonBridge ? m_pythonBridge->powerDeadlineMs() : 14000;
+}
+
+void CorneaWidget::markPowerStateUnknownBySerial(const QString &serial,
+                                                  const QString &reason)
+{
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (ctrl) ctrl->markPowerStateUnknown(reason);
 }
 
 QStringList CorneaWidget::getImageNames() const

@@ -39,6 +39,7 @@
 #include <QSet>
 #include <QThread>
 #include <QTimer>
+#include <QtConcurrent>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -1363,6 +1364,18 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
     m_simDevices[instanceId] = sim;
     m_initOkMap[instanceId] = true;
     m_serialMap[instanceId] = serial;
+    {
+        QMutexLocker lock(&m_sessionMutex);
+        InstanceMetadata &metadata = m_instanceMetadata[instanceId];
+        metadata.deviceIndex = deviceIndex;
+        metadata.hardwareVariant = hardwareVariant;
+        metadata.expectedSerial = serial;
+        SessionCoordinator &session = m_sessions[serial];
+        session.instanceId = instanceId;
+        session.state = SessionState::Ready;
+        ++session.generation;
+        session.recoveryStarted = false;
+    }
 
     emit logMessage(QString("[SIM] Device instance %1 created: %2").arg(instanceId).arg(serial));
     return instanceId;
@@ -1380,11 +1393,19 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         QJsonObject data;
         bool initOk = false;
         int attemptsMade = 0;
+        QElapsedTimer powerDeadline;
+        powerDeadline.start();
+        const auto remainingPowerMs = [&powerDeadline, this]() -> int {
+            return qMax(0, powerDeadlineMs() - int(powerDeadline.elapsed()));
+        };
         const QString reuseKey = expectedSerial.isEmpty()
             ? QStringLiteral("index:%1").arg(deviceIndex)
             : expectedSerial;
 
         for (int attempt = 1; attempt <= kSubprocessInitAttempts; ++attempt) {
+            if (remainingPowerMs() <= 0) {
+                break;
+            }
             attemptsMade = attempt;
             if (attempt == 1) {
                 QMutexLocker lock(&m_panelProcsMutex);
@@ -1396,12 +1417,13 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                                         "(variant: %3, attempt %4/%5)...")
                                     .arg(instanceId).arg(reuseKey)
                                     .arg(hardwareVariant).arg(attempt).arg(kSubprocessInitAttempts));
-                const QJsonObject pingReply = proc->sendBlocking("ping", QJsonObject{}, 5000);
+                const QJsonObject pingReply = proc->sendBlocking(
+                    "ping", QJsonObject{}, qMin(5000, remainingPowerMs()));
                 if (!pingReply.value("success").toBool()) {
                     emit logMessage(QString("[Instance %1] idle subprocess ping failed: %2")
                                         .arg(instanceId)
                                         .arg(pingReply.value("error").toString()));
-                    proc->stop(3000);
+                    proc->stop(qMin(1000, qMax(1, remainingPowerMs())));
                     delete proc;
                     proc = nullptr;
                 }
@@ -1435,13 +1457,13 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                         },
                         Qt::QueuedConnection);
 
-                if (!proc->spawn(10000)) {
+                if (!proc->spawn(qMin(10000, remainingPowerMs()))) {
                     emit logMessage(QString("[Instance %1] subprocess spawn failed on attempt %2")
                                         .arg(instanceId).arg(attempt));
                     delete proc;
                     proc = nullptr;
-                    if (attempt < kSubprocessInitAttempts) {
-                        QThread::msleep(1000);
+                    if (attempt < kSubprocessInitAttempts && remainingPowerMs() > 0) {
+                        QThread::msleep(qMin(1000, remainingPowerMs()));
                     }
                     continue;
                 }
@@ -1468,12 +1490,14 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
             qint64 initGateWaitMs = 0;
             {
                 LibusbGateLease initLease(m_serializeUsb, QStringLiteral("init"),
-                                          expectedSerial, 60000);
+                                          expectedSerial,
+                                          qMin(60000, remainingPowerMs()));
                 if (initLease.acquired()) {
                     initGateWaitMs = initLease.waitMs();
                     // 60 s is generous for a cold cornea_rax720 ctor (typical
                     // 5–30 s including FTDI enum + RJ1 init + cal file load).
-                    reply = proc->sendBlocking("init", initArgs, 60000);
+                    reply = proc->sendBlocking("init", initArgs,
+                                               qMin(60000, remainingPowerMs()));
                 } else {
                     initGateWaitMs = initLease.waitMs();
                     reply = QJsonObject{
@@ -1516,7 +1540,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                                                            : errorCode)
                                                     : QStringLiteral("UNCLASSIFIED_NON_RETRYABLE")))
                                     .arg(initError));
-                proc->stop(3000);
+                proc->stop(qMin(1000, qMax(1, remainingPowerMs())));
                 delete proc;
                 proc = nullptr;
                 if (!retryable) {
@@ -1525,8 +1549,8 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                                         .arg(instanceId));
                     break;
                 }
-                if (attempt < kSubprocessInitAttempts) {
-                    QThread::msleep(1000);
+                if (attempt < kSubprocessInitAttempts && remainingPowerMs() > 0) {
+                    QThread::msleep(qMin(1000, remainingPowerMs()));
                 }
                 continue;
             }
@@ -1560,7 +1584,7 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                                 .arg(instanceId).arg(attempt)
                                 .arg(retryable ? QStringLiteral("true") : QStringLiteral("false"))
                                 .arg(failureKind, failureReason));
-            proc->stop(3000);
+            proc->stop(qMin(1000, qMax(1, remainingPowerMs())));
             delete proc;
             proc = nullptr;
             if (!retryable) {
@@ -1569,13 +1593,18 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
                                     .arg(instanceId));
                 break;
             }
-            if (attempt < kSubprocessInitAttempts) {
-                QThread::msleep(1000);
+                if (attempt < kSubprocessInitAttempts && remainingPowerMs() > 0) {
+                    QThread::msleep(qMin(1000, remainingPowerMs()));
             }
         }
 
         if (!proc || !initOk) {
-            const QString detail = QString(
+            const bool timedOut = remainingPowerMs() <= 0;
+            const QString detail = timedOut
+                ? QString("COMMAND_TIMEOUT: Power ON exceeded %1ms; expected serial=%2")
+                    .arg(powerDeadlineMs())
+                    .arg(expectedSerial.isEmpty() ? QStringLiteral("<index-only>") : expectedSerial)
+                : QString(
                 "Hardware init failed after %1 attempt(s); expected serial=%2")
                     .arg(attemptsMade)
                     .arg(expectedSerial.isEmpty() ? QStringLiteral("<index-only>") : expectedSerial);
@@ -1593,6 +1622,24 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         }
         m_initOkMap[instanceId] = initOk;
         m_serialMap[instanceId] = data.value("cornea_serial").toString(expectedSerial);
+        {
+            QMutexLocker lock(&m_sessionMutex);
+            InstanceMetadata &metadata = m_instanceMetadata[instanceId];
+            metadata.deviceIndex = deviceIndex;
+            metadata.hardwareVariant = hardwareVariant;
+            metadata.expectedSerial = expectedSerial.isEmpty()
+                ? m_serialMap.value(instanceId) : expectedSerial;
+            const QString serial = m_serialMap.value(instanceId);
+            SessionCoordinator &session = m_sessions[serial];
+            session.instanceId = instanceId;
+            session.state = SessionState::Ready;
+            ++session.generation;
+            session.recoveryStarted = false;
+            session.lastError.clear();
+        }
+        emit sessionStateChanged(m_serialMap.value(instanceId),
+                                 QStringLiteral("Ready"),
+                                 workerGeneration(instanceId), QString());
         return instanceId;
     }
 
@@ -1770,6 +1817,18 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
         m_deviceInstances[instanceId] = instance;
         m_initOkMap[instanceId] = true;
         m_serialMap[instanceId] = serial;
+        {
+            QMutexLocker lock(&m_sessionMutex);
+            InstanceMetadata &metadata = m_instanceMetadata[instanceId];
+            metadata.deviceIndex = deviceIndex;
+            metadata.hardwareVariant = hardwareVariant;
+            metadata.expectedSerial = expectedSerial.isEmpty() ? serial : expectedSerial;
+            SessionCoordinator &session = m_sessions[serial];
+            session.instanceId = instanceId;
+            session.state = SessionState::Ready;
+            ++session.generation;
+            session.recoveryStarted = false;
+        }
 
         emit logMessage(QString("[Instance %1] Connected to device %2 (Serial: %3)")
                         .arg(instanceId).arg(deviceIndex).arg(serial));
@@ -1783,6 +1842,403 @@ int PythonBridge::createDeviceInstance(int deviceIndex, const QString &hardwareV
     });
     if (error) *error = creationError->get();
     return instanceId;
+}
+
+QString PythonBridge::sessionStateName(SessionState state)
+{
+    switch (state) {
+    case SessionState::Ready:       return QStringLiteral("Ready");
+    case SessionState::Recovering:  return QStringLiteral("Recovering");
+    case SessionState::Unavailable: return QStringLiteral("Unavailable");
+    }
+    return QStringLiteral("Unavailable");
+}
+
+PythonBridge::SessionState PythonBridge::sessionState(int instanceId) const
+{
+    QMutexLocker lock(&m_sessionMutex);
+    const QString serial = m_serialMap.value(instanceId);
+    if (serial.isEmpty()) return SessionState::Unavailable;
+    return m_sessions.value(serial).state;
+}
+
+PythonBridge::SessionState PythonBridge::sessionStateForSerial(
+    const QString &serial) const
+{
+    QMutexLocker lock(&m_sessionMutex);
+    return m_sessions.value(serial).state;
+}
+
+quint64 PythonBridge::workerGeneration(int instanceId) const
+{
+    QMutexLocker lock(&m_sessionMutex);
+    const QString serial = m_serialMap.value(instanceId);
+    return serial.isEmpty() ? 0 : m_sessions.value(serial).generation;
+}
+
+void PythonBridge::setSessionState(int instanceId, SessionState state,
+                                   const QString &error)
+{
+    QString serial;
+    quint64 generation = 0;
+    {
+        QMutexLocker lock(&m_sessionMutex);
+        serial = m_serialMap.value(instanceId);
+        if (serial.isEmpty()) return;
+        SessionCoordinator &session = m_sessions[serial];
+        session.instanceId = instanceId;
+        session.state = state;
+        session.lastError = error;
+        if (state == SessionState::Ready || state == SessionState::Unavailable) {
+            session.recoveryStarted = false;
+        }
+        generation = session.generation;
+    }
+    emit sessionStateChanged(serial, sessionStateName(state), generation, error);
+}
+
+bool PythonBridge::isRetryableTransportFailure(const QString &errorCode,
+                                               const QString &detail) const
+{
+    const QString code = errorCode.trimmed().toUpper();
+    if (code == QStringLiteral("USB_TRANSPORT_LOST")
+        || code == QStringLiteral("WORKER_EXIT")
+        || code == QStringLiteral("WORKER_UNAVAILABLE")) {
+        return true;
+    }
+    const QString text = detail.toLower();
+    if (text.contains(QStringLiteral("calibration"))
+        || text.contains(QStringLiteral("ucid"))
+        || text.contains(QStringLiteral("serial_mismatch"))
+        || text.contains(QStringLiteral("argument"))
+        || text.contains(QStringLiteral("brightness_set_failed"))
+        || text.contains(QStringLiteral("image_transfer_failed"))
+        || text.contains(QStringLiteral("device_operation_failed"))
+        || text.contains(QStringLiteral("nack"))) {
+        return false;
+    }
+    return text.contains(QStringLiteral("subprocess exited"))
+        || text.contains(QStringLiteral("subprocess not running"))
+        || text.contains(QStringLiteral("timed out"))
+        || text.contains(QStringLiteral("broken pipe"))
+        || text.contains(QStringLiteral("transport"))
+        || text.contains(QStringLiteral("worker"));
+}
+
+void PythonBridge::quarantineSubprocess(int instanceId,
+                                        const QString &operation,
+                                        const QString &detail,
+                                        int cleanupTimeoutMs)
+{
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+    Q_UNUSED(instanceId);
+    Q_UNUSED(operation);
+    Q_UNUSED(detail);
+    return;
+#endif
+    if (!m_useSubprocess) return;
+
+    QString serial;
+    bool shouldQuarantine = false;
+    {
+        QMutexLocker lock(&m_sessionMutex);
+        serial = m_serialMap.value(instanceId);
+        if (serial.isEmpty()) return;
+        SessionCoordinator &session = m_sessions[serial];
+        session.instanceId = instanceId;
+        if (session.state == SessionState::Ready) {
+            session.state = SessionState::Recovering;
+            ++session.generation; // invalidate the failed worker generation
+            session.recoveryStarted = false;
+            session.lastError = detail;
+            shouldQuarantine = true;
+        }
+    }
+    if (!shouldQuarantine) return;
+
+    emit sessionStateChanged(serial, QStringLiteral("Recovering"),
+                             workerGeneration(instanceId), detail);
+    emit logMessage(QString("[Instance %1] %2 transport fault: %3 - "
+                            "session quarantined (serial=%4, generation=%5)")
+                        .arg(instanceId).arg(operation, detail, serial)
+                        .arg(workerGeneration(instanceId)));
+
+    PanelSubprocess *proc = nullptr;
+    {
+        QMutexLocker lock(&m_panelProcsMutex);
+        proc = m_panelProcs.take(instanceId);
+    }
+    m_initOkMap[instanceId] = false;
+    if (proc) {
+        // stop() bounds old-worker cleanup; it never waits for the recovery
+        // budget or for the expired command.
+        if (cleanupTimeoutMs > 0) {
+            proc->stop(cleanupTimeoutMs);
+            delete proc;
+        } else {
+            // The caller's deadline has already expired.  Reap the old worker
+            // asynchronously so cleanup cannot extend the TCP/UI response.
+            QtConcurrent::run([proc]() {
+                proc->stop(1000);
+                delete proc;
+            });
+        }
+    }
+}
+
+void PythonBridge::markSubprocessUnhealthy(int instanceId,
+                                           const QString &operation,
+                                           const QString &detail)
+{
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+    Q_UNUSED(instanceId);
+    Q_UNUSED(operation);
+    Q_UNUSED(detail);
+    return;
+#endif
+    if (!m_useSubprocess) return;
+    const QString code = detail.section(':', 0, 0).trimmed();
+    if (!isRetryableTransportFailure(code, detail)) {
+        emit logMessage(QString("[Instance %1] %2 terminal failure retained: %3")
+                            .arg(instanceId).arg(operation, detail));
+        return;
+    }
+    quarantineSubprocess(instanceId, operation, detail);
+    startRecoveryAsync(instanceId);
+}
+
+bool PythonBridge::recoverDeviceInstance(int instanceId, int budgetMs,
+                                         QString *error)
+{
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+    Q_UNUSED(instanceId);
+    Q_UNUSED(budgetMs);
+    if (error) *error = QStringLiteral("simulation session is always ready");
+    return true;
+#endif
+    if (error) error->clear();
+    if (!m_useSubprocess) {
+        if (error) *error = QStringLiteral("embedded worker recovery is unavailable");
+        return false;
+    }
+
+    InstanceMetadata metadata;
+    QString serial;
+    {
+        QMutexLocker lock(&m_sessionMutex);
+        serial = m_serialMap.value(instanceId);
+        metadata = m_instanceMetadata.value(instanceId);
+        if (serial.isEmpty() || metadata.deviceIndex < 0) {
+            if (error) *error = QStringLiteral("RECOVERY_FAILED: missing session metadata");
+            return false;
+        }
+        SessionCoordinator &session = m_sessions[serial];
+        if (session.state != SessionState::Recovering) {
+            if (error) *error = QStringLiteral("RECOVERY_IN_PROGRESS: session is not quarantined");
+            return false;
+        }
+        if (session.recoveryStarted) {
+            if (error) *error = QStringLiteral("RECOVERY_IN_PROGRESS: recovery already running");
+            return false;
+        }
+        session.recoveryStarted = true;
+    }
+
+    QElapsedTimer timer;
+    timer.start();
+    const int boundedBudget = qMax(1, budgetMs);
+    auto remaining = [&]() -> int {
+        return qMax(0, boundedBudget - int(timer.elapsed()));
+    };
+
+    PanelSubprocess *proc = new PanelSubprocess(nullptr);
+    proc->setPythonExe(m_subprocessPythonExe);
+    proc->setWorkerScript(m_workerScript);
+    proc->setExtraEnv(QStringList{
+        QString("CORNEA_SERIALIZE_USB=%1").arg(m_serializeUsb ? 1 : 0)
+    });
+    connect(proc, &PanelSubprocess::logMessage, this,
+            [this, instanceId](const QString &line) {
+                emit logMessage(QString("[Instance %1/recovery] %2")
+                                    .arg(instanceId).arg(line));
+            }, Qt::QueuedConnection);
+
+    const int spawnBudget = remaining();
+    if (spawnBudget <= 0 || !proc->spawn(qMin(5000, spawnBudget))) {
+        if (error) *error = QStringLiteral("RECOVERY_FAILED: worker spawn timed out");
+        proc->stop(qMin(500, qMax(1, remaining())));
+        delete proc;
+        setSessionState(instanceId, SessionState::Unavailable,
+                        error ? *error : QStringLiteral("RECOVERY_FAILED"));
+        return false;
+    }
+
+    QJsonObject initArgs{
+        {"cornea_index", metadata.deviceIndex},
+        {"hardware_variant", metadata.hardwareVariant},
+        {"cornea_serial", metadata.expectedSerial},
+        {"cal_path", m_calPath},
+        {"defect_map_output_root", m_defectMapOutputRoot},
+        {"init_cornea", true},
+        {"init_rj1", true},
+        {"allow_default_hdf5", m_allowDefaultHdf5},
+        {"spi_clk_freq", m_spiClkFreq},
+    };
+
+    QJsonObject reply;
+    const int gateBudget = remaining();
+    if (gateBudget > 0) {
+        LibusbGateLease lease(m_serializeUsb, QStringLiteral("recovery-init"),
+                              serial, gateBudget);
+        if (lease.acquired()) {
+            reply = proc->sendBlocking("init", initArgs, remaining());
+        } else {
+            reply = QJsonObject{
+                {"success", false},
+                {"error", QStringLiteral("USB_BUSY_TIMEOUT during recovery")},
+                {"errorCode", QStringLiteral("USB_BUSY_TIMEOUT")}
+            };
+        }
+    } else {
+        reply = QJsonObject{
+            {"success", false},
+            {"error", QStringLiteral("recovery budget expired")},
+            {"errorCode", QStringLiteral("COMMAND_TIMEOUT")}
+        };
+    }
+
+    const QJsonObject data = reply.value("data").toObject();
+    const QString actualSerial = data.value("cornea_serial").toString().trimmed();
+    const bool initOk = reply.value("success").toBool(false)
+        && data.value("init_ok").toBool(false)
+        && actualSerial == metadata.expectedSerial;
+    if (!initOk) {
+        const QString reason = reply.value("error").toString().isEmpty()
+            ? (actualSerial.isEmpty()
+                ? QStringLiteral("RECOVERY_FAILED: expected serial was not rediscovered")
+                : QString("RECOVERY_FAILED: serial mismatch expected=%1 actual=%2")
+                    .arg(metadata.expectedSerial, actualSerial))
+            : QString("RECOVERY_FAILED: %1").arg(reply.value("error").toString());
+        if (error) *error = reason;
+        proc->stop(qMin(1000, qMax(1, remaining())));
+        delete proc;
+        setSessionState(instanceId, SessionState::Unavailable, reason);
+        emit logMessage(QString("[Instance %1] recovery exhausted (serial=%2): %3")
+                            .arg(instanceId).arg(serial, reason));
+        return false;
+    }
+
+    {
+        QMutexLocker lock(&m_panelProcsMutex);
+        m_panelProcs.insert(instanceId, proc);
+    }
+    m_initOkMap[instanceId] = true;
+    m_serialMap[instanceId] = actualSerial;
+    {
+        QMutexLocker lock(&m_sessionMutex);
+        SessionCoordinator &session = m_sessions[serial];
+        session.instanceId = instanceId;
+        session.state = SessionState::Ready;
+        ++session.generation; // new worker generation; old results are stale
+        session.recoveryStarted = false;
+        session.lastError.clear();
+    }
+    emit sessionStateChanged(serial, QStringLiteral("Ready"),
+                             workerGeneration(instanceId), QString());
+    emit logMessage(QString("[Instance %1] recovery ready serial=%2 generation=%3")
+                        .arg(instanceId).arg(serial)
+                        .arg(workerGeneration(instanceId)));
+    return true;
+}
+
+void PythonBridge::startRecoveryAsync(int instanceId)
+{
+#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+    Q_UNUSED(instanceId);
+    return;
+#endif
+    if (!m_useSubprocess) return;
+    const int budget = recoveryBudgetMs();
+    QtConcurrent::run([this, instanceId, budget]() {
+        QString reason;
+        recoverDeviceInstance(instanceId, budget, &reason);
+    });
+}
+
+QJsonObject PythonBridge::subprocessCallWithRecovery(
+    int instanceId, const QString &cmd, const QJsonObject &args,
+    int commandDeadlineMs, bool retryOnTransport)
+{
+    CommandContext context;
+    context.requestId = QStringLiteral("driver-%1-%2")
+        .arg(QDateTime::currentMSecsSinceEpoch())
+        .arg(instanceId);
+    context.serial = m_serialMap.value(instanceId);
+    context.command = cmd;
+    context.deadlineMs = QDateTime::currentMSecsSinceEpoch()
+        + commandDeadlineMs;
+    context.workerGeneration = workerGeneration(instanceId);
+
+    QElapsedTimer timer;
+    timer.start();
+    const auto remaining = [&]() -> int {
+        return qMax(0, commandDeadlineMs - int(timer.elapsed()));
+    };
+
+    QJsonObject reply = subprocessCall(instanceId, cmd, args, remaining());
+    if (reply.value("success").toBool(false) || !retryOnTransport) {
+        return reply;
+    }
+
+    const QString errorCode = reply.value("errorCode").toString();
+    const QString detail = reply.value("error").toString();
+    if (!isRetryableTransportFailure(errorCode, detail)) return reply;
+
+    quarantineSubprocess(instanceId, cmd, detail,
+                         qMin(1000, qMax(0, remaining())));
+    const int recoverMs = qMin(recoveryBudgetMs(), remaining());
+    if (recoverMs <= 0) {
+        context.active = false;
+        reply["errorCode"] = QStringLiteral("COMMAND_TIMEOUT");
+        reply["error"] = QStringLiteral("COMMAND_TIMEOUT: no time remained for recovery");
+        startRecoveryAsync(instanceId);
+        return reply;
+    }
+    QString recoveryError;
+    if (!recoverDeviceInstance(instanceId, recoverMs, &recoveryError)) {
+        context.active = false;
+        reply["errorCode"] = QStringLiteral("RECOVERY_FAILED");
+        reply["error"] = recoveryError.isEmpty()
+            ? QStringLiteral("RECOVERY_FAILED: expected serial unavailable")
+            : recoveryError;
+        return reply;
+    }
+
+    const int retryMs = remaining();
+    if (retryMs <= 0) {
+        context.active = false;
+        reply["errorCode"] = QStringLiteral("COMMAND_TIMEOUT");
+        reply["error"] = QStringLiteral("COMMAND_TIMEOUT: recovery completed after deadline");
+        return reply;
+    }
+    context.workerGeneration = workerGeneration(instanceId);
+    reply = subprocessCall(instanceId, cmd, args, retryMs);
+    if (!context.active || context.workerGeneration != workerGeneration(instanceId)) {
+        context.active = false;
+        return QJsonObject{
+            {"success", false},
+            {"error", QStringLiteral("COMMAND_TIMEOUT: stale completion discarded")},
+            {"errorCode", QStringLiteral("COMMAND_TIMEOUT")}
+        };
+    }
+    if (!reply.value("success").toBool(false)) {
+        const QString secondCode = reply.value("errorCode").toString();
+        const QString secondDetail = reply.value("error").toString();
+        if (isRetryableTransportFailure(secondCode, secondDetail)) {
+            quarantineSubprocess(instanceId, cmd, secondDetail);
+        }
+    }
+    return reply;
 }
 
 int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardwareVariant,
@@ -1856,6 +2312,18 @@ int PythonBridge::preInitDeviceInstance(int deviceIndex, const QString &hardware
         m_deviceInstances[instanceId] = instance;
         m_initOkMap[instanceId] = false;  // Not fully initialized yet
         m_serialMap[instanceId] = serial;
+        {
+            QMutexLocker lock(&m_sessionMutex);
+            InstanceMetadata &metadata = m_instanceMetadata[instanceId];
+            metadata.deviceIndex = deviceIndex;
+            metadata.hardwareVariant = hardwareVariant;
+            metadata.expectedSerial = expectedSerial.isEmpty() ? serial : expectedSerial;
+            SessionCoordinator &session = m_sessions[serial];
+            session.instanceId = instanceId;
+            session.state = SessionState::Ready;
+            ++session.generation;
+            session.recoveryStarted = false;
+        }
 
         emit logMessage(QString("[Instance %1] Pre-init OK: device %2 (Serial: %3) — FTDI ready, awaiting powerOn")
                         .arg(instanceId).arg(deviceIndex).arg(serial));
@@ -1874,7 +2342,16 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     m_simDevices.remove(instanceId);
     m_initOkMap.remove(instanceId);
-    m_serialMap.remove(instanceId);
+    const QString simSerial = m_serialMap.take(instanceId);
+    m_instanceMetadata.remove(instanceId);
+    {
+        QMutexLocker lock(&m_sessionMutex);
+        SessionCoordinator &session = m_sessions[simSerial];
+        session.instanceId = -1;
+        session.state = SessionState::Unavailable;
+        ++session.generation;
+        session.recoveryStarted = false;
+    }
     emit logMessage(QString("[SIM] Device instance %1 destroyed").arg(instanceId));
     return;
 #endif
@@ -1891,6 +2368,22 @@ void PythonBridge::destroyDeviceInstance(int instanceId)
         }
         m_initOkMap.remove(instanceId);
         const QString serial = m_serialMap.take(instanceId);
+        m_instanceMetadata.remove(instanceId);
+        quint64 destroyedGeneration = 0;
+        {
+            QMutexLocker lock(&m_sessionMutex);
+            SessionCoordinator &session = m_sessions[serial];
+            session.instanceId = -1;
+            session.state = SessionState::Unavailable;
+            ++session.generation;
+            session.recoveryStarted = false;
+            destroyedGeneration = session.generation;
+        }
+        if (!serial.isEmpty()) {
+            emit sessionStateChanged(serial, QStringLiteral("Unavailable"),
+                                     destroyedGeneration,
+                                     QStringLiteral("session destroyed"));
+        }
         if (proc) {
             LibusbGateLease teardownLease(m_serializeUsb,
                                           QStringLiteral("teardown"), serial, 15000);
@@ -2050,11 +2543,17 @@ bool PythonBridge::systemPowerOn(int instanceId, QString *error)
     };
 
     if (m_useSubprocess) {
-        const QJsonObject reply = subprocessCall(instanceId, "powerOn", {}, 60000);
+        // The child still has its historical 60 s worker-side ceiling, but
+        // this driver-owned command context is capped at 14 s by default.
+        const QJsonObject reply = subprocessCallWithRecovery(
+            instanceId, "powerOn", {}, powerDeadlineMs(), true);
         if (!reply.value("success").toBool()) {
+            const QString errorCode = reply.value("errorCode").toString();
             const QString detail = reply.value("error").toString("powerOn subprocess failed");
+            const QString codedDetail = errorCode.isEmpty()
+                ? detail : QString("%1: %2").arg(errorCode, detail);
             return fail(QString("[Instance %1] System power ON FAILED: %2")
-                            .arg(instanceId).arg(detail));
+                            .arg(instanceId).arg(codedDetail));
         }
         const QJsonObject data = reply.value("data").toObject();
         if (!data.value("init_ok").toBool()) {
@@ -2118,9 +2617,13 @@ bool PythonBridge::systemPowerOff(int instanceId)
     return true;
 #endif
     if (m_useSubprocess) {
-        const QJsonObject reply = subprocessCall(instanceId, "powerOff", {}, 30000);
+        const QJsonObject reply = subprocessCallWithRecovery(
+            instanceId, "powerOff", {}, powerDeadlineMs(), true);
         if (!reply.value("success").toBool()) {
-            const QString error = reply.value("error").toString("powerOff subprocess failed");
+            const QString errorCode = reply.value("errorCode").toString();
+            const QString detail = reply.value("error").toString("powerOff subprocess failed");
+            const QString error = errorCode.isEmpty()
+                ? detail : QString("%1: %2").arg(errorCode, detail);
             setError(QString("[Instance %1] System power OFF FAILED: %2").arg(instanceId).arg(error));
             emit logMessage(getLastError());
             return false;
@@ -2162,6 +2665,90 @@ bool PythonBridge::enableVsys(int instanceId, bool enable)
 
 bool PythonBridge::setBrightness(int instanceId, double level, QString *error)
 {
+ #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
+    simStallSleep(SIM_DELAY_MS);
+    if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].brightness = level;
+    if (error) error->clear();
+    return m_simDevices.contains(instanceId);
+ #endif
+    if (m_useSubprocess) {
+        const QJsonObject reply = subprocessCallWithRecovery(
+            instanceId, "setBrightness", QJsonObject{{"level", level}},
+            10000, true);
+        if (reply.value("success").toBool()) {
+            clearInstanceError(instanceId);
+            if (error) error->clear();
+            return true;
+        }
+        const QString errorCode = reply.value("errorCode").toString();
+        const QString detail = reply.value("error").toString("subprocess command failed");
+        const QString commandError = QString("%1: %2").arg(
+            errorCode.isEmpty() ? QStringLiteral("USB_TRANSPORT_LOST") : errorCode,
+            detail);
+        setInstanceError(instanceId, commandError);
+        if (error) *error = commandError;
+        if (errorCode == QStringLiteral("USB_BUSY_TIMEOUT")
+            || errorCode == QStringLiteral("BRIGHTNESS_SET_FAILED")) {
+            emit logMessage(QString("[Instance %1] setBrightness skipped: %2")
+                                .arg(instanceId).arg(detail));
+            return false;
+        }
+        markSubprocessUnhealthy(instanceId, "setBrightness", detail);
+        return false;
+    }
+    const auto fallbackDetail = std::make_shared<SharedErrorDetail>();
+    const bool success = dispatchToDevice(instanceId, [this, instanceId, level, fallbackDetail]() -> bool {
+        PyObject *args = PyTuple_Pack(1, PyFloat_FromDouble(level));
+        PyObject *result = callInstanceMethod(instanceId, "set_brightness", args);
+        Py_DECREF(args);
+        if (!result) {
+            fallbackDetail->set(QStringLiteral("BRIGHTNESS_SET_FAILED: set_brightness failed"));
+            return false;
+        }
+        const bool setterReturnedFalse = result == Py_False;
+        Py_DECREF(result);
+        if (setterReturnedFalse) {
+            fallbackDetail->set(QStringLiteral("BRIGHTNESS_SET_FAILED: set_brightness returned False"));
+            return false;
+        }
+        PyObject *readback = callInstanceMethod(instanceId, "get_brightness");
+        if (!readback) {
+            fallbackDetail->set(QStringLiteral("BRIGHTNESS_SET_FAILED: get_brightness failed"));
+            return false;
+        }
+        const double actual = PyFloat_AsDouble(readback);
+        Py_DECREF(readback);
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+            fallbackDetail->set(QStringLiteral("BRIGHTNESS_SET_FAILED: get_brightness failed"));
+            return false;
+        }
+        if (!std::isfinite(actual)
+            || qRound64(actual * 100.0) != qRound64(level * 100.0)) {
+            fallbackDetail->set(QString("BRIGHTNESS_SET_FAILED: requested=%1, actual=%2")
+                .arg(level, 0, 'f', 2).arg(actual, 0, 'f', 2));
+            return false;
+        }
+        emit logMessage(QString("[Instance %1] Brightness set to %2").arg(instanceId).arg(level));
+        return true;
+    });
+    if (success) {
+        clearInstanceError(instanceId);
+        if (error) error->clear();
+        return true;
+    }
+    const QString detail = fallbackDetail->get();
+    const QString commandError = detail.isEmpty()
+        ? QStringLiteral("BRIGHTNESS_SET_FAILED: set_brightness failed") : detail;
+    setInstanceError(instanceId, commandError);
+    if (error) *error = commandError;
+    return false;
+}
+
+bool PythonBridge::setBrightnessWithDeadline(int instanceId, double level,
+                                             QString *error,
+                                             int commandDeadlineMs)
+{
 #if defined(QT_DEBUG) && !defined(DISABLE_SIM)
     simStallSleep(SIM_DELAY_MS);
     if (m_simDevices.contains(instanceId)) m_simDevices[instanceId].brightness = level;
@@ -2169,8 +2756,9 @@ bool PythonBridge::setBrightness(int instanceId, double level, QString *error)
     return m_simDevices.contains(instanceId);
 #endif
     if (m_useSubprocess) {
-        const QJsonObject reply = subprocessCall(instanceId, "setBrightness",
-                                                  QJsonObject{{"level", level}}, 10000);
+        const QJsonObject reply = subprocessCallWithRecovery(
+            instanceId, "setBrightness", QJsonObject{{"level", level}},
+            qMax(1, commandDeadlineMs), true);
         if (reply.value("success").toBool()) {
             clearInstanceError(instanceId);
             if (error) error->clear();
@@ -2389,8 +2977,9 @@ bool PythonBridge::writeFrame(int instanceId, const QImage &image, QString *erro
             if (error) *error = commandError;
             return false;
         }
-        const QJsonObject reply = subprocessCall(
-            instanceId, "sendImage", QJsonObject{{"path", tmpPath}}, 30000);
+        const QJsonObject reply = subprocessCallWithRecovery(
+            instanceId, "sendImage", QJsonObject{{"path", tmpPath}},
+            30000, true);
         if (reply.value("success").toBool()) {
             if (!reply.value("data").toObject().value("ok").toBool(true)) {
                 const QString commandError = QStringLiteral(
@@ -2916,52 +3505,6 @@ QVariantMap PythonBridge::getDemuraRlutState(int instanceId)
     });
 }
 
-void PythonBridge::markSubprocessUnhealthy(int instanceId, const QString &operation,
-                                           const QString &detail)
-{
-#if defined(QT_DEBUG) && !defined(DISABLE_SIM)
-    Q_UNUSED(instanceId);
-    Q_UNUSED(operation);
-    Q_UNUSED(detail);
-    return;
-#endif
-    if (!m_useSubprocess) return;
-
-    PanelSubprocess *proc = nullptr;
-    QString serial;
-    {
-        QMutexLocker lock(&m_panelProcsMutex);
-        serial = m_serialMap.value(instanceId);
-    }
-
-    // Do not delete a worker while another command is inside sendBlocking().
-    // subprocessCall resolves the worker pointer only after taking this same
-    // gate, which closes the previous stale-pointer/UAF window.
-    LibusbGateLease lease(m_serializeUsb, QStringLiteral("isolate"), serial, 15000);
-    if (!lease.acquired()) {
-        emit logMessage(QString("[Instance %1] unable to isolate unhealthy worker: "
-                                "USB_BUSY_TIMEOUT (serial=%2)")
-                            .arg(instanceId).arg(serial));
-        return;
-    }
-    {
-        QMutexLocker lock(&m_panelProcsMutex);
-        proc = m_panelProcs.take(instanceId);
-    }
-
-    m_initOkMap.remove(instanceId);
-    m_serialMap.remove(instanceId);
-
-    emit logMessage(QString("[Instance %1] %2 failed: %3 — stopping unhealthy subprocess (serial=%4)")
-                        .arg(instanceId, 0, 10)
-                        .arg(operation, detail, serial));
-
-    if (proc) {
-        proc->stop(1000);
-        delete proc;
-    }
-}
-
 QJsonObject PythonBridge::subprocessCall(int instanceId, const QString &cmd,
                                           const QJsonObject &args, int timeoutMs)
 {
@@ -2974,12 +3517,30 @@ QJsonObject PythonBridge::subprocessCall(int instanceId, const QString &cmd,
         serial = m_serialMap.value(instanceId);
     }
 
+    // A quarantined serial is never allowed to queue work behind its dead
+    // worker.  The other serial coordinators have independent state and can
+    // continue using their own workers.
+    const SessionState state = sessionState(instanceId);
+    if (state != SessionState::Ready) {
+        const bool unavailable = state == SessionState::Unavailable;
+        return QJsonObject{
+            {"success", false},
+            {"error", unavailable
+                ? QStringLiteral("RECOVERY_FAILED: serial unavailable")
+                : QStringLiteral("RECOVERY_IN_PROGRESS: serial is recovering")},
+            {"errorCode", unavailable
+                ? QStringLiteral("RECOVERY_FAILED")
+                : QStringLiteral("RECOVERY_IN_PROGRESS")}
+        };
+    }
+
     // Temperature is background telemetry.  Never let it queue behind a
     // production image/brightness command; CorneaController retains the last
     // valid sample and the next timer tick will retry.
+    const int workerWaitLimitMs = (cmd == QStringLiteral("powerOn")) ? 60000 : 30000;
     const int gateWaitTimeoutMs =
         (cmd == QStringLiteral("getTemperature")) ? 0
-        : ((cmd == QStringLiteral("powerOn")) ? 60000 : 15000);
+        : qMin(workerWaitLimitMs, qMax(0, timeoutMs));
     LibusbGateLease lease(m_serializeUsb, cmd, serial, gateWaitTimeoutMs);
     if (!lease.acquired()) {
         return QJsonObject{
@@ -3007,7 +3568,8 @@ QJsonObject PythonBridge::subprocessCall(int instanceId, const QString &cmd,
         };
     }
 
-    QJsonObject reply = proc->sendBlocking(cmd, args, timeoutMs);
+    QJsonObject reply = proc->sendBlocking(cmd, args,
+                                           qMin(workerWaitLimitMs, qMax(0, timeoutMs)));
     reply["queue_wait_ms"] = lease.waitMs();
     if (!reply.value("success").toBool()
         && !reply.contains("errorCode")) {

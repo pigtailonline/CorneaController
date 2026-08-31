@@ -162,6 +162,9 @@ private:
     void setupConnections();
     void updateUIState();
     void updatePanelInfo();
+    void completePowerOperation(quint64 operationToken,
+                                const std::shared_ptr<std::atomic<bool>> &completionToken,
+                                bool success, const QString &error);
 
     int m_panelId;  // 0, 1, 2, ...
     PythonBridge *m_bridge;  // Shared, not owned
@@ -223,6 +226,7 @@ private:
     // between two CorneaRax720 instances. updateUIState() respects this flag.
     bool m_powerOpInProgress = false;
     bool m_commandError = false;
+    quint64 m_powerOperationToken = 0;
 
 public:
     // APL calculation with gamma LUT (fast, same result as std::pow)

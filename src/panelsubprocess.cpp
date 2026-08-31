@@ -194,6 +194,8 @@ void PanelSubprocess::stopImpl(int gracefulTimeoutMs)
 {
     if (!m_proc || m_proc->state() == QProcess::NotRunning) return;
     m_userInitiatedStop = true;
+    QElapsedTimer cleanupClock;
+    cleanupClock.start();
 
     if (m_proc->state() == QProcess::Running) {
         QJsonObject req{{"id", m_nextId.fetch_add(1)},
@@ -206,7 +208,12 @@ void PanelSubprocess::stopImpl(int gracefulTimeoutMs)
 
     if (!m_proc->waitForFinished(gracefulTimeoutMs)) {
         m_proc->kill();
-        m_proc->waitForFinished(2000);
+        // Do not turn a caller's expired command into another unbounded wait.
+        // The recovery coordinator owns any later rediscovery budget; this
+        // cleanup phase only gets the same bounded grace window.
+        const int remainingMs = qMax(0, gracefulTimeoutMs
+                                        - int(cleanupClock.elapsed()));
+        if (remainingMs > 0) m_proc->waitForFinished(remainingMs);
     }
 }
 

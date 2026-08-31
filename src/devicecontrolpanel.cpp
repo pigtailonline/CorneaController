@@ -582,6 +582,8 @@ void DeviceControlPanel::updateUIState()
     // instance alive (for fast re-power) so isConnected() stays true even when
     // the rails are down. UI must reflect actual power state.
     bool poweredOn = isPoweredOn();
+    const bool powerUnknown = m_controller
+        && m_controller->powerState() == CorneaController::PowerState::Unknown;
     bool hasDevice = m_deviceInfo.index >= 0;
 
     // Power buttons - mutually exclusive
@@ -613,6 +615,9 @@ void DeviceControlPanel::updateUIState()
     // user-visible "Connecting → Off → On" oscillation.
     if (m_powerOpInProgress) {
         // status label preserved by the on-click handler
+    } else if (powerUnknown) {
+        m_lblStatus->setText(m_commandError ? "Unknown - Command Error" : "Unknown");
+        m_lblStatus->setStyleSheet("color: darkorange; font-weight: bold;");
     } else if (poweredOn && m_commandError) {
         m_lblStatus->setText("On - Command Error");
         m_lblStatus->setStyleSheet(
@@ -658,6 +663,30 @@ void DeviceControlPanel::updatePanelInfo()
     });
 }
 
+void DeviceControlPanel::completePowerOperation(
+    quint64 operationToken,
+    const std::shared_ptr<std::atomic<bool>> &completionToken,
+    bool success, const QString &error)
+{
+    // This method is always invoked on the UI thread.  The atomic token is
+    // consumed by exactly one of the normal completion, exception, disconnect,
+    // or watchdog paths; late callbacks are intentionally no-ops.
+    if (!completionToken || completionToken->exchange(true)) return;
+    if (operationToken != m_powerOperationToken) return;
+
+    m_powerOpInProgress = false;
+    if (!success && !error.isEmpty()) {
+        m_commandError = true;
+        if (error.contains(QStringLiteral("COMMAND_TIMEOUT"))
+            || error.contains(QStringLiteral("USB_TRANSPORT_LOST"))
+            || error.contains(QStringLiteral("RECOVERY_"))) {
+            m_controller->markPowerStateUnknown(error);
+        }
+        emit logMessage(panelLabel(), QString("Power operation failed: %1").arg(error));
+    }
+    updateUIState();
+}
+
 void DeviceControlPanel::onPowerOnClicked()
 {
     if (m_deviceInfo.index < 0) {
@@ -669,6 +698,8 @@ void DeviceControlPanel::onPowerOnClicked()
         return;
     }
     m_powerOpInProgress = true;
+    const quint64 operationToken = ++m_powerOperationToken;
+    auto completionToken = std::make_shared<std::atomic<bool>>(false);
 
     // Transient UI feedback
     m_btnPowerOn->setEnabled(false);
@@ -680,13 +711,28 @@ void DeviceControlPanel::onPowerOnClicked()
                         .arg(m_deviceInfo.displayName, m_currentVariant));
 
     auto guard = m_asyncGuard;
-    QtConcurrent::run([this, guard]() {
+    const int watchdogMs = m_bridge->powerDeadlineMs() + 250;
+    QTimer::singleShot(watchdogMs, this,
+                       [this, operationToken, completionToken]() {
+        completePowerOperation(operationToken, completionToken, false,
+                               QStringLiteral("COMMAND_TIMEOUT: UI watchdog"));
+    });
+    QtConcurrent::run([this, guard, operationToken, completionToken]() {
         if (!guard->load()) return;
-        powerOnCore();   // logs success/fail internally
-        QMetaObject::invokeMethod(this, [this, guard]() {
+        OpResult result;
+        try {
+            result = powerOnCore();   // logs success/fail internally
+        } catch (const std::exception &e) {
+            result.error = QString("Exception: %1").arg(e.what());
+        } catch (...) {
+            result.error = QStringLiteral("Unknown exception during power on");
+        }
+        if (!guard->load()) return;
+        QMetaObject::invokeMethod(this, [this, guard, operationToken,
+                                         completionToken, result]() {
             if (!guard->load()) return;
-            m_powerOpInProgress = false;
-            updateUIState();
+            completePowerOperation(operationToken, completionToken,
+                                   result.ok, result.error);
         }, Qt::QueuedConnection);
     });
 }
@@ -697,6 +743,8 @@ void DeviceControlPanel::onPowerOffClicked()
         return;
     }
     m_powerOpInProgress = true;
+    const quint64 operationToken = ++m_powerOperationToken;
+    auto completionToken = std::make_shared<std::atomic<bool>>(false);
     m_btnPowerOn->setEnabled(false);
     m_btnPowerOff->setEnabled(false);
     m_lblStatus->setText("Powering off...");
@@ -704,13 +752,28 @@ void DeviceControlPanel::onPowerOffClicked()
     emit logMessage(panelLabel(), QStringLiteral("Powering off..."));
 
     auto guard = m_asyncGuard;
-    QtConcurrent::run([this, guard]() {
+    const int watchdogMs = m_bridge->powerDeadlineMs() + 250;
+    QTimer::singleShot(watchdogMs, this,
+                       [this, operationToken, completionToken]() {
+        completePowerOperation(operationToken, completionToken, false,
+                               QStringLiteral("COMMAND_TIMEOUT: UI watchdog"));
+    });
+    QtConcurrent::run([this, guard, operationToken, completionToken]() {
         if (!guard->load()) return;
-        powerOffCore();
-        QMetaObject::invokeMethod(this, [this, guard]() {
+        OpResult result;
+        try {
+            result = powerOffCore();
+        } catch (const std::exception &e) {
+            result.error = QString("Exception: %1").arg(e.what());
+        } catch (...) {
+            result.error = QStringLiteral("Unknown exception during power off");
+        }
+        if (!guard->load()) return;
+        QMetaObject::invokeMethod(this, [this, guard, operationToken,
+                                         completionToken, result]() {
             if (!guard->load()) return;
-            m_powerOpInProgress = false;
-            updateUIState();
+            completePowerOperation(operationToken, completionToken,
+                                   result.ok, result.error);
         }, Qt::QueuedConnection);
     });
 }
@@ -1190,6 +1253,12 @@ void DeviceControlPanel::onControllerError(const QString &error)
     emit logMessage(panelLabel(), QString("ERROR: %1").arg(error));
     if (isPoweredOn()) {
         m_commandError = true;
+        updateUIState();
+    } else if (m_controller
+               && m_controller->powerState() == CorneaController::PowerState::Unknown) {
+        // A transport/timeout error must not be rendered as a truthful Off;
+        // Unknown remains retryable and keeps the stale On presentation gone.
+        m_commandError |= true;
         updateUIState();
     }
 }

@@ -18,6 +18,46 @@ CorneaController::CorneaController(PythonBridge *sharedBridge, QObject *parent)
     m_cacheClock.start();
     QObject::connect(m_tempPollTimer, &QTimer::timeout,
                      this, &CorneaController::onTemperaturePollTimeout);
+    // PythonBridge invalidates a worker generation before stopping it.  This
+    // queued notification is the controller's source of truth for a
+    // transport fault; a cached boolean must never keep reporting On after
+    // the USB session has become unknown.
+    QObject::connect(m_bridge, &PythonBridge::sessionStateChanged,
+                     this, [this](const QString &serial, const QString &state,
+                                  quint64, const QString &error) {
+        if (serial.isEmpty() || serial != m_deviceSerial
+            || state == QStringLiteral("Ready")) {
+            return;
+        }
+        m_powerState = PowerState::Unknown;
+        m_poweredOn = false;
+        emit deviceStateChanged(QStringLiteral("unknown"));
+        emit powerStateChanged(false); // compatibility: false means not On
+        if (!error.isEmpty()) emit errorOccurred(error);
+    }, Qt::QueuedConnection);
+}
+
+QString CorneaController::deviceState() const
+{
+    switch (m_powerState) {
+    case PowerState::On: return QStringLiteral("on");
+    case PowerState::Off: return QStringLiteral("off");
+    case PowerState::Unknown: return QStringLiteral("unknown");
+    }
+    return QStringLiteral("unknown");
+}
+
+void CorneaController::markPowerStateUnknown(const QString &reason)
+{
+    m_poweredOn = false;
+    m_powerState = PowerState::Unknown;
+    if (!reason.trimmed().isEmpty()) {
+        setLastError(reason);
+    }
+    emit deviceStateChanged(QStringLiteral("unknown"));
+    // Keep the legacy signal truthful: false means the rails are not known
+    // to be on, while deviceStateChanged carries the distinction from Off.
+    emit powerStateChanged(false);
 }
 
 CorneaController::~CorneaController()
@@ -67,6 +107,7 @@ bool CorneaController::connect(int deviceIndex, const QString &hardwareVariant,
         }
         m_currentBrightness = m_bridge->getBrightness(instanceId);
         m_poweredOn = true;
+        m_powerState = PowerState::On;
         setLastError(QString());
 
         emit connected();
@@ -109,6 +150,7 @@ bool CorneaController::preInit(int deviceIndex, const QString &hardwareVariant,
             m_deviceSerial = expectedSerial;
         }
         m_poweredOn = false; // FTDI ready but not powered on
+        m_powerState = PowerState::Off;
         setLastError(QString());
 
         emit logMessage(QString("Pre-init OK: %1 (FTDI ready)").arg(getDeviceLabel()));
@@ -129,6 +171,7 @@ void CorneaController::disconnect()
         m_deviceIndex = -1;
         m_deviceSerial.clear();
         m_poweredOn = false;
+        m_powerState = PowerState::Off;
         setLastError(QString());
 
         emit disconnected();
@@ -140,6 +183,14 @@ bool CorneaController::isConnected() const
 {
     bool hasInstanceId = m_instanceId >= 0;
     bool bridgeConnected = hasInstanceId && m_bridge->isDeviceConnected(m_instanceId);
+    if (!bridgeConnected && hasInstanceId && m_powerState == PowerState::On) {
+        // A worker can exit between two polls, before its queued state signal
+        // reaches this controller.  Make the synchronous accessor truthful as
+        // well as the signal-driven UI path.
+        auto self = const_cast<CorneaController*>(this);
+        self->m_powerState = PowerState::Unknown;
+        self->m_poweredOn = false;
+    }
     if (!bridgeConnected && hasInstanceId) {
         qDebug() << "CorneaController::isConnected: instanceId=" << m_instanceId
                  << "hasInstanceId=" << hasInstanceId
@@ -170,14 +221,23 @@ bool CorneaController::powerOn()
     QString commandError;
     if (m_bridge->systemPowerOn(m_instanceId, &commandError)) {
         m_poweredOn = true;
+        m_powerState = PowerState::On;
         setLastError(QString());
         emit powerStateChanged(true);
+        emit deviceStateChanged(QStringLiteral("on"));
         emit logMessage("Power ON");
         // Pre-warm temperature cache on the reuse path too — see connect().
         getRj1Temperature();
         return true;
     }
 
+    if (commandError.contains(QStringLiteral("COMMAND_TIMEOUT"))
+        || commandError.contains(QStringLiteral("USB_TRANSPORT_LOST"))
+        || commandError.contains(QStringLiteral("RECOVERY_"))) {
+        m_poweredOn = false;
+        m_powerState = PowerState::Unknown;
+        emit deviceStateChanged(QStringLiteral("unknown"));
+    }
     return failWithError(commandError.isEmpty()
         ? QStringLiteral("Power on failed")
         : commandError);
@@ -191,13 +251,22 @@ bool CorneaController::powerOff()
 
     if (m_bridge->systemPowerOff(m_instanceId)) {
         m_poweredOn = false;
+        m_powerState = PowerState::Off;
         setLastError(QString());
         emit powerStateChanged(false);
+        emit deviceStateChanged(QStringLiteral("off"));
         emit logMessage("Power OFF");
         return true;
     }
 
     const QString bridgeError = m_bridge->getLastError(m_instanceId);
+    if (bridgeError.contains(QStringLiteral("COMMAND_TIMEOUT"))
+        || bridgeError.contains(QStringLiteral("USB_TRANSPORT_LOST"))
+        || bridgeError.contains(QStringLiteral("RECOVERY_"))) {
+        m_poweredOn = false;
+        m_powerState = PowerState::Unknown;
+        emit deviceStateChanged(QStringLiteral("unknown"));
+    }
     return failWithError(bridgeError.isEmpty()
         ? QStringLiteral("Power off failed")
         : bridgeError);
@@ -237,6 +306,30 @@ bool CorneaController::setBrightness(double level)
 
     QString commandError;
     if (m_bridge->setBrightness(m_instanceId, level, &commandError)) {
+        setLastError(QString());
+        m_currentBrightness = level;
+        emit brightnessChanged(level);
+        return true;
+    }
+
+    setLastError(commandError);
+    emit errorOccurred(commandError);
+    return false;
+}
+
+bool CorneaController::setBrightness(double level, int commandDeadlineMs)
+{
+    if (!requirePoweredOn("setBrightness")) return false;
+
+    // Clamp to valid range
+    level = qBound(0.0, level, 1.0);
+
+    QString commandError;
+    const bool brightnessOk = commandDeadlineMs > 0
+        ? m_bridge->setBrightnessWithDeadline(m_instanceId, level,
+                                              &commandError, commandDeadlineMs)
+        : m_bridge->setBrightness(m_instanceId, level, &commandError);
+    if (brightnessOk) {
         setLastError(QString());
         m_currentBrightness = level;
         emit brightnessChanged(level);

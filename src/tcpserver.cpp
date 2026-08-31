@@ -5,10 +5,29 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QDateTime>
+#include <QElapsedTimer>
 #include <QImage>
 #include <QtConcurrent>
 #include <QThreadPool>
 #include <cmath>
+
+namespace {
+std::atomic<quint64> g_requestSequence{1};
+
+QString ensureRequestId(QJsonObject &command)
+{
+    QString requestId = command.value(QStringLiteral("requestId"))
+                            .toString().trimmed();
+    if (requestId.isEmpty()) {
+        requestId = QStringLiteral("cc-%1-%2")
+            .arg(QDateTime::currentMSecsSinceEpoch())
+            .arg(g_requestSequence.fetch_add(1, std::memory_order_relaxed));
+        command[QStringLiteral("requestId")] = requestId;
+    }
+    return requestId;
+}
+}
 
 TcpServer::TcpServer(CorneaWidget *corneaWidget, QObject *parent)
     : QObject(parent)
@@ -139,6 +158,7 @@ void TcpServer::onReadyRead()
         }
 
         QJsonObject cmd = doc.object();
+        const QString requestId = ensureRequestId(cmd);
         QString cmdName = cmd["cmd"].toString().toLower();
 
         // Log received command. Filter removed 2026-05-16 for libusb stress
@@ -160,31 +180,47 @@ void TcpServer::onReadyRead()
             QPointer<QTcpSocket> clientPtr(client);
             bool isExclusive = (cmdName == "poweron" || cmdName == "poweroff");
 
-            QtConcurrent::run([this, guard, clientPtr, cmd, origCmd, origSerial, isExclusive]() {
+            QtConcurrent::run([this, guard, clientPtr, cmd, origCmd, origSerial,
+                               requestId, isExclusive]() {
                 if (!guard->load()) return;
 
                 // powerOn/powerOff resets shared SPI/I2C controllers — take exclusive
                 // lock so no sendImage/getTemp runs during initialization.
                 // Other commands take shared lock — can run concurrently with each other.
                 bool lockHeld = false;
+                bool lockTimedOut = false;
                 if (m_serializeUsb) {
                     if (isExclusive) {
                         qInfo() << "[TCP] Waiting for exclusive lock:" << origCmd;
-                        m_deviceLock.lockForWrite();
-                        qInfo() << "[TCP] Acquired exclusive lock:" << origCmd;
+                        lockHeld = m_deviceLock.tryLockForWrite(
+                            m_corneaWidget->powerDeadlineMs());
+                        lockTimedOut = !lockHeld;
+                        if (lockHeld) {
+                            qInfo() << "[TCP] Acquired exclusive lock:" << origCmd;
+                        }
                     } else {
                         m_deviceLock.lockForRead();
+                        lockHeld = true;
                     }
-                    lockHeld = true;
                 }
 
                 QJsonObject response;
-                try {
-                    response = processCommand(cmd);
-                } catch (const std::exception &e) {
-                    response = makeError(QString("Exception: %1").arg(e.what()));
-                } catch (...) {
-                    response = makeError("Unknown exception in async command");
+                if (lockTimedOut) {
+                    const QString timeout = QStringLiteral(
+                        "COMMAND_TIMEOUT: exclusive device lock exceeded driver deadline");
+                    m_corneaWidget->markPowerStateUnknownBySerial(
+                        origSerial, timeout);
+                    response = makeError(timeout);
+                    response["timeout_ms"] = m_corneaWidget->powerDeadlineMs();
+                    response["deviceState"] = QStringLiteral("unknown");
+                } else {
+                    try {
+                        response = processCommand(cmd);
+                    } catch (const std::exception &e) {
+                        response = makeError(QString("Exception: %1").arg(e.what()));
+                    } catch (...) {
+                        response = makeError("Unknown exception in async command");
+                    }
                 }
 
                 if (lockHeld) {
@@ -197,6 +233,7 @@ void TcpServer::onReadyRead()
                 // Always echo cmd+serial so client can match response
                 response["cmd"] = origCmd;
                 if (!origSerial.isEmpty()) response["serial"] = origSerial;
+                response["requestId"] = requestId;
 
                 QMetaObject::invokeMethod(this, [this, guard, clientPtr, response]() {
                     if (!guard->load()) return;
@@ -210,6 +247,7 @@ void TcpServer::onReadyRead()
             QJsonObject response = processCommand(cmd);
             response["cmd"] = origCmd;
             if (!origSerial.isEmpty()) response["serial"] = origSerial;
+            response["requestId"] = requestId;
             sendResponse(client, response);
         }
     }
@@ -271,11 +309,16 @@ QJsonObject TcpServer::handlePowerOn(const QJsonObject &params)
     }
 
     QString variant = params["variant"].toString();
-    bool result = variant.isEmpty()
-        ? m_corneaWidget->powerOnBySerial(serial)
-        : m_corneaWidget->powerOnBySerial(serial, variant);
-    if (!result) {
-        return makeError(QString("Failed to power on device: %1").arg(serial));
+    const QString requestId = params.value(QStringLiteral("requestId")).toString();
+    QElapsedTimer powerClock;
+    powerClock.start();
+    ApiResult power = m_corneaWidget->powerOnBySerialEx(serial, variant, requestId);
+    if (!power.success) {
+        QJsonObject response = makeError(power.error);
+        if (!power.errorCode.isEmpty()) response["errorCode"] = power.errorCode;
+        if (power.timeoutMs > 0) response["timeout_ms"] = power.timeoutMs;
+        if (!power.deviceState.isEmpty()) response["deviceState"] = power.deviceState;
+        return response;
     }
 
     // Apply a safe default brightness synchronously before returning. RJ1
@@ -292,15 +335,42 @@ QJsonObject TcpServer::handlePowerOn(const QJsonObject &params)
     double level = params.contains("brightness")
         ? params["brightness"].toDouble(kDefaultBrightness)
         : kDefaultBrightness;
-    if (!m_corneaWidget->setBrightnessBySerial(serial, level)) {
+    const int remainingPowerMs = qMax(0, m_corneaWidget->powerDeadlineMs()
+                                         - int(powerClock.elapsed()));
+    if (remainingPowerMs <= 0) {
+        const QString timeout = QStringLiteral(
+            "COMMAND_TIMEOUT: Power ON post-transition work exceeded driver deadline");
+        m_corneaWidget->markPowerStateUnknownBySerial(serial, timeout);
+        QJsonObject response = makeError(timeout);
+        response["timeout_ms"] = m_corneaWidget->powerDeadlineMs();
+        response["deviceState"] = QStringLiteral("unknown");
+        return response;
+    }
+    ApiResult brightness = m_corneaWidget->setBrightnessBySerialEx(
+        serial, level, false, remainingPowerMs);
+    if (!brightness.success) {
+        if (brightness.errorCode == QStringLiteral("COMMAND_TIMEOUT")) {
+            m_corneaWidget->markPowerStateUnknownBySerial(serial, brightness.error);
+            QJsonObject response = makeError(brightness.error);
+            response["errorCode"] = QStringLiteral("COMMAND_TIMEOUT");
+            response["timeout_ms"] = m_corneaWidget->powerDeadlineMs();
+            response["deviceState"] = QStringLiteral("unknown");
+            return response;
+        }
         QJsonObject response = makeSuccess();
         response["warning"] = true;
         response["warningCode"] = QStringLiteral("BRIGHTNESS_SET_FAILED");
-        response["warningMessage"] = m_corneaWidget->lastErrorForSerial(serial);
+        response["warningMessage"] = brightness.error.isEmpty()
+            ? m_corneaWidget->lastErrorForSerial(serial) : brightness.error;
+        response["deviceState"] = brightness.deviceState.isEmpty()
+            ? m_corneaWidget->deviceStateBySerial(serial) : brightness.deviceState;
         return response;
     }
 
-    return makeSuccess();
+    QJsonObject response = makeSuccess();
+    response["deviceState"] = power.deviceState.isEmpty()
+        ? m_corneaWidget->deviceStateBySerial(serial) : power.deviceState;
+    return response;
 }
 
 QJsonObject TcpServer::handlePowerOff(const QJsonObject &params)
@@ -310,12 +380,19 @@ QJsonObject TcpServer::handlePowerOff(const QJsonObject &params)
         return makeError("Missing 'serial' parameter");
     }
 
-    bool result = m_corneaWidget->powerOffBySerial(serial);
-    if (result) {
-        return makeSuccess();
-    } else {
-        return makeError(QString("Failed to power off device: %1").arg(serial));
+    const QString requestId = params.value(QStringLiteral("requestId")).toString();
+    ApiResult power = m_corneaWidget->powerOffBySerialEx(serial, requestId);
+    if (power.success) {
+        QJsonObject response = makeSuccess();
+        response["deviceState"] = power.deviceState.isEmpty()
+            ? m_corneaWidget->deviceStateBySerial(serial) : power.deviceState;
+        return response;
     }
+    QJsonObject response = makeError(power.error);
+    if (!power.errorCode.isEmpty()) response["errorCode"] = power.errorCode;
+    if (power.timeoutMs > 0) response["timeout_ms"] = power.timeoutMs;
+    if (!power.deviceState.isEmpty()) response["deviceState"] = power.deviceState;
+    return response;
 }
 
 QJsonObject TcpServer::handleSendImage(const QJsonObject &params)
@@ -332,9 +409,15 @@ QJsonObject TcpServer::handleSendImage(const QJsonObject &params)
 
     ApiResult result = m_corneaWidget->sendImageBySerialEx(serial, path);
     if (result.success) {
-        return makeSuccess();
+        QJsonObject response = makeSuccess();
+        if (!result.deviceState.isEmpty()) response["deviceState"] = result.deviceState;
+        return response;
     } else {
-        return makeError(result.error);
+        QJsonObject response = makeError(result.error);
+        if (!result.errorCode.isEmpty()) response["errorCode"] = result.errorCode;
+        if (result.timeoutMs > 0) response["timeout_ms"] = result.timeoutMs;
+        if (!result.deviceState.isEmpty()) response["deviceState"] = result.deviceState;
+        return response;
     }
 }
 
@@ -350,15 +433,19 @@ QJsonObject TcpServer::handleSetBrightness(const QJsonObject &params)
     }
     double level = params["level"].toDouble();
 
-    // Set brightness and start background protection monitoring
-    // Returns success immediately, protection runs in background
-    // If overheat detected, device will auto power off
-    bool result = m_corneaWidget->setBrightnessBySerial(serial, level);
-    if (result) {
-        return makeSuccess();
-    } else {
-        return makeError(m_corneaWidget->lastErrorForSerial(serial));
+    // Set brightness and start background protection monitoring. Transport
+    // failures use the same per-serial recovery coordinator as Power/image.
+    ApiResult result = m_corneaWidget->setBrightnessBySerialEx(serial, level);
+    if (result.success) {
+        QJsonObject response = makeSuccess();
+        if (!result.deviceState.isEmpty()) response["deviceState"] = result.deviceState;
+        return response;
     }
+    QJsonObject response = makeError(result.error);
+    if (!result.errorCode.isEmpty()) response["errorCode"] = result.errorCode;
+    if (result.timeoutMs > 0) response["timeout_ms"] = result.timeoutMs;
+    if (!result.deviceState.isEmpty()) response["deviceState"] = result.deviceState;
+    return response;
 }
 
 QJsonObject TcpServer::handleSetFlip(const QJsonObject &params)
@@ -454,6 +541,8 @@ QJsonObject TcpServer::handleGetStatus(const QJsonObject &params)
         dev["connected"] = m_corneaWidget->isConnectedBySerial(serial);
         dev["panelId"] = m_corneaWidget->getPanelIdBySerial(serial);
         dev["variant"] = m_corneaWidget->getVariantBySerial(serial);
+        dev["deviceState"] = m_corneaWidget->deviceStateBySerial(serial);
+        dev["sessionState"] = m_corneaWidget->sessionStateBySerial(serial);
         devices.append(dev);
     }
 
@@ -527,9 +616,16 @@ QJsonObject TcpServer::handleSendImageByName(const QJsonObject &params)
 
     ApiResult result = m_corneaWidget->sendImageBySerialEx(serial, image);
     if (result.success)
-        return makeSuccess();
-    else
-        return makeError(result.error);
+    {
+        QJsonObject response = makeSuccess();
+        if (!result.deviceState.isEmpty()) response["deviceState"] = result.deviceState;
+        return response;
+    }
+    QJsonObject response = makeError(result.error);
+    if (!result.errorCode.isEmpty()) response["errorCode"] = result.errorCode;
+    if (result.timeoutMs > 0) response["timeout_ms"] = result.timeoutMs;
+    if (!result.deviceState.isEmpty()) response["deviceState"] = result.deviceState;
+    return response;
 }
 
 QJsonObject TcpServer::makeSuccess(const QVariant &data)
@@ -553,7 +649,13 @@ QJsonObject TcpServer::makeError(const QString &message)
     QJsonObject obj;
     obj["success"] = false;
     obj["error"] = message;
-    if (message.contains(QStringLiteral("USB_BUSY_TIMEOUT"))) {
+    if (message.contains(QStringLiteral("COMMAND_TIMEOUT"))) {
+        obj["errorCode"] = QStringLiteral("COMMAND_TIMEOUT");
+    } else if (message.contains(QStringLiteral("RECOVERY_IN_PROGRESS"))) {
+        obj["errorCode"] = QStringLiteral("RECOVERY_IN_PROGRESS");
+    } else if (message.contains(QStringLiteral("RECOVERY_FAILED"))) {
+        obj["errorCode"] = QStringLiteral("RECOVERY_FAILED");
+    } else if (message.contains(QStringLiteral("USB_BUSY_TIMEOUT"))) {
         obj["errorCode"] = QStringLiteral("USB_BUSY_TIMEOUT");
     } else if (message.contains(QStringLiteral("USB_TRANSPORT_LOST"))) {
         obj["errorCode"] = QStringLiteral("USB_TRANSPORT_LOST");
@@ -567,6 +669,8 @@ QJsonObject TcpServer::makeError(const QString &message)
         obj["errorCode"] = QStringLiteral("IMAGE_TRANSFER_FAILED");
     } else if (message.contains(QStringLiteral("INVALID_TEMPERATURE"))) {
         obj["errorCode"] = QStringLiteral("INVALID_TEMPERATURE");
+    } else if (message.contains(QStringLiteral("POWER_READ_FAILED"))) {
+        obj["errorCode"] = QStringLiteral("POWER_READ_FAILED");
     }
     return obj;
 }

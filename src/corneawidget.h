@@ -13,8 +13,32 @@ struct ApiResult {
     bool success = false;
     QString error;
 
-    static ApiResult ok() { return {true, QString()}; }
-    static ApiResult fail(const QString &err) { return {false, err}; }
+    // Optional protocol metadata. Existing callers may continue using the
+    // two-field aggregate and ApiResult::ok()/fail() helpers unchanged.
+    QString errorCode;
+    QString requestId;
+    int timeoutMs = 0;
+    QString deviceState;
+
+    static ApiResult ok(const QString &requestId = QString()) {
+        ApiResult result;
+        result.success = true;
+        result.requestId = requestId;
+        return result;
+    }
+    static ApiResult fail(const QString &err,
+                          const QString &errorCode = QString(),
+                          const QString &requestId = QString(),
+                          int timeoutMs = 0,
+                          const QString &deviceState = QString()) {
+        ApiResult result;
+        result.error = err;
+        result.errorCode = errorCode;
+        result.requestId = requestId;
+        result.timeoutMs = timeoutMs;
+        result.deviceState = deviceState;
+        return result;
+    }
 };
 
 QT_BEGIN_NAMESPACE
@@ -79,9 +103,16 @@ public:
     bool setFlipBySerial(const QString &serial, bool xFlip, bool yFlip);
 
     // === Public API with detailed error (for TCP) ===
+    ApiResult powerOnBySerialEx(const QString &serial,
+                                const QString &variant = QString(),
+                                const QString &requestId = QString());
+    ApiResult powerOffBySerialEx(const QString &serial,
+                                 const QString &requestId = QString());
     ApiResult sendImageBySerialEx(const QString &serial, const QString &imagePath);
     ApiResult sendImageBySerialEx(const QString &serial, const QImage &image);
-    ApiResult setBrightnessBySerialEx(const QString &serial, double level, bool waitProtection = false);
+    ApiResult setBrightnessBySerialEx(const QString &serial, double level,
+                                      bool waitProtection = false,
+                                      int commandDeadlineMs = -1);
 
     // === Status Query (by serial) ===
     bool isConnectedBySerial(const QString &serial) const;
@@ -89,6 +120,11 @@ public:
     double getTemperatureBySerial(const QString &serial) const;
     QString lastErrorForSerial(const QString &serial) const;
     QString getVariantBySerial(const QString &serial) const;
+    QString deviceStateBySerial(const QString &serial) const;
+    QString sessionStateBySerial(const QString &serial) const;
+    int powerDeadlineMs() const;
+    void markPowerStateUnknownBySerial(const QString &serial,
+                                       const QString &reason);
     QVariantMap getPowerBySerial(const QString &serial) const;  // {vsys_power_mw, vddio_power_mw}
 
     // === Image Access (for TCP API) ===
