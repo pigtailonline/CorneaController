@@ -63,3 +63,10 @@ python -c "from ar_display_lab_lib.control_boards.cornea_rax720 import CorneaRax
 ```
 
 ---
+## F43V3 SDK Runtime
+
+The `Seeyond Release 2026.8.21.1` delivery includes `ar_display_lab_lib` 2026.8.21.1 and `rj1lib_external` 2026.7.22. Install both packages in the Python environment actually used by Cornea Controller.
+
+The release `setup_station.ps1` creates its own `station_venv` beside the delivered wheels. Production startup loads `cornea_config.json` and uses `python.venv_path`; when `python.use_subprocess` is enabled, `python.python_exe` can override the default `<venv_path>/Scripts/python.exe`. Installing into the release-created environment does not update a different environment selected by the Controller configuration.
+
+The release setup uses Python 3.12.7, which meets the project requirement of Python >=3.10.

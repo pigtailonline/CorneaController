@@ -387,6 +387,7 @@ void DeviceControlPanel::setupUI()
     m_cmbVariant->addItem("F33RP");      // alias of standard — Pilot run-LBU (IMU DNP)
     m_cmbVariant->addItem("F33R");       // alias of F43V2 — PMIC=0x7A
     m_cmbVariant->addItem("F43V2");      // alias of F33R — F43 V2.0
+    m_cmbVariant->addItem("F43V3");   // F43 V3.0, MAX77675@0x44 + MAX77713@0x65
     m_cmbVariant->addItem("F33L");       // PMIC=0x7B, VLED_r=0x32
     m_cmbVariant->addItem("F33LP");      // Pilot run-LBU — PMIC=0x6A, VLED_r=0x32
     m_cmbVariant->addItem("F33RV2");     // F33R V2.0 — Max77675@0x44 + Max77713@0x65

@@ -70,7 +70,8 @@ CorneaWidget 內建 TCP server，供其他應用程式遠端控制設備。
 {"cmd": "powerOn", "serial": "LITE20240101", "variant": "F33R"}
 → {"success": true, "cmd": "powerOn", "serial": "LITE20240101"}
 ```
-支援的 variant：`standard`、`F33R`、`F33L`、`F33LP`
+支援的 variant：`standard`、`F33R`、`F33L`、`F33LP`、`F43V3`（MAX77675@0x44、MAX77713@0x65）
+> 更換 variant 時，請先執行 `powerOff`，再以新 variant 執行 `powerOn`。設備若仍為 powered-on 狀態，現有 `powerOn` 會回覆成功但不會重新初始化或切換 variant。
 
 **關閉設備：**
 ```json
