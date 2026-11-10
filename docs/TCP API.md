@@ -53,6 +53,7 @@ CorneaWidget 內建 TCP server，供其他應用程式遠端控制設備。
 | `isConnected` | `serial` | `connected` | 檢查連線狀態 |
 | `getPanelId` | `serial` | `panelId` | 取得 Panel ID |
 | `getTemperature` | `serial` | `temperature` | 取得 RJ1 溫度 |
+| getVersions | serial | software_version、ar_display_lab_lib、rj1lib_external | 取得軟體及套件版本 |
 | `getStatus` | （無） | `devices[]` | 取得所有設備狀態 |
 | `listDevices` | （無） | `devices[]` | 列出所有設備序號 |
 | `refreshDevices` | （無） | `deviceCount` | 重新掃描設備 |
@@ -128,6 +129,12 @@ CorneaWidget 內建 TCP server，供其他應用程式遠端控制設備。
 → {"cmd": "getTemperature", "serial": "LITE20240101", "success": true, "data": {"temperature": 42.5}}
 ```
 
+**取得軟體及套件版本：**
+```json
+{"cmd": "getVersions", "serial": "LITE20240101"}
+→ {"cmd": "getVersions", "success": true, "data": {"software_version": "1.1.31", "ar_display_lab_lib": "<installed version>", "rj1lib_external": "<installed version>"}}
+```
+getVersions needs the serial of an initialized, connected controller because package versions come from that controller's existing Python instance. It is read-only and does not power or otherwise change the device. If either package version is unavailable, the response has success false; data still contains software_version and uses an empty string for each unavailable package value.
 **列出設備：**
 ```json
 {"cmd": "listDevices"}
@@ -172,6 +179,7 @@ print(send_command("setBrightness", serial="LITE20240101", level=0.05))         
 print(send_command("listImages"))                                               # 列出可用圖片
 print(send_command("sendImageByName", serial="LITE20240101", name="720x720_Black.png"))  # 用名稱發送
 print(send_command("sendImage", serial="LITE20240101", path="D:/test/image.png"))        # 用路徑發送
+print(send_command("getVersions", serial="LITE20240101"))
 print(send_command("powerOff", serial="LITE20240101"))                          # 關閉設備
 ```
 

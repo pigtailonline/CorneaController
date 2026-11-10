@@ -56,6 +56,7 @@ private:
     QJsonObject handleGetPanelId(const QJsonObject &params);
     QJsonObject handleGetTemperature(const QJsonObject &params);
     QJsonObject handleGetPower(const QJsonObject &params);
+    QJsonObject handleGetVersions(const QJsonObject &params);
     QJsonObject handleGetStatus(const QJsonObject &params);
     QJsonObject handleListDevices(const QJsonObject &params);
     QJsonObject handleRefreshDevices(const QJsonObject &params);

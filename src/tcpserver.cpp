@@ -1,5 +1,6 @@
 #include "tcpserver.h"
 #include "corneawidget.h"
+#include <QCoreApplication>
 
 #include <QHostAddress>
 #include <QJsonDocument>
@@ -259,6 +260,7 @@ bool TcpServer::isAsyncCommand(const QString &cmdName)
         "poweron", "poweroff",
         "sendimage", "sendimagebyname",
         "gettemperature", "getpanelid",
+        "getversions",
         "setbrightness", "getpower"
     };
     return asyncCommands.contains(cmdName);
@@ -286,6 +288,8 @@ QJsonObject TcpServer::processCommand(const QJsonObject &cmd)
         return handleGetTemperature(cmd);
     } else if (cmdName == "getpower") {
         return handleGetPower(cmd);
+    } else if (cmdName == "getversions") {
+        return handleGetVersions(cmd);
     } else if (cmdName == "getstatus") {
         return handleGetStatus(cmd);
     } else if (cmdName == "listdevices") {
@@ -528,6 +532,47 @@ QJsonObject TcpServer::handleGetPower(const QJsonObject &params)
     return makeSuccess(data);
 }
 
+QJsonObject TcpServer::handleGetVersions(const QJsonObject &params)
+{
+    const QString serial = params.value(QStringLiteral("serial")).toString().trimmed();
+    QVariantMap packageVersions;
+    if (!serial.isEmpty()) {
+        packageVersions = m_corneaWidget->getPackageVersionsBySerial(serial);
+    }
+
+    const QString arDisplayLabVersion =
+        packageVersions.value(QStringLiteral("ar_display_lab_lib")).toString().trimmed();
+    const QVariant rj1VersionValue = packageVersions.contains(QStringLiteral("rj1lib_external"))
+        ? packageVersions.value(QStringLiteral("rj1lib_external"))
+        : packageVersions.value(QStringLiteral("rj1lib"));
+    const QString rj1ExternalVersion = rj1VersionValue.toString().trimmed();
+
+    QJsonObject data;
+    data[QStringLiteral("software_version")] = QCoreApplication::applicationVersion();
+    data[QStringLiteral("ar_display_lab_lib")] = arDisplayLabVersion;
+    data[QStringLiteral("rj1lib_external")] = rj1ExternalVersion;
+
+    if (serial.isEmpty()) {
+        QJsonObject response = makeError(QStringLiteral("Missing 'serial' parameter"));
+        response[QStringLiteral("data")] = data;
+        return response;
+    }
+
+    QStringList unavailable;
+    if (arDisplayLabVersion.isEmpty()) {
+        unavailable.append(QStringLiteral("ar_display_lab_lib"));
+    }
+    if (rj1ExternalVersion.isEmpty()) {
+        unavailable.append(QStringLiteral("rj1lib_external"));
+    }
+    if (!unavailable.isEmpty()) {
+        QJsonObject response = makeError(
+            QStringLiteral("Package versions unavailable: %1").arg(unavailable.join(QStringLiteral(", "))));
+        response[QStringLiteral("data")] = data;
+        return response;
+    }
+    return makeSuccess(data);
+}
 QJsonObject TcpServer::handleGetStatus(const QJsonObject &params)
 {
     Q_UNUSED(params);

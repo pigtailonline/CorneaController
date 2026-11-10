@@ -126,6 +126,7 @@ public:
     void markPowerStateUnknownBySerial(const QString &serial,
                                        const QString &reason);
     QVariantMap getPowerBySerial(const QString &serial) const;  // {vsys_power_mw, vddio_power_mw}
+    QVariantMap getPackageVersionsBySerial(const QString &serial) const;
 
     // === Image Access (for TCP API) ===
     QStringList getImageNames() const;

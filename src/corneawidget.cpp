@@ -950,6 +950,12 @@ QVariantMap CorneaWidget::getPowerBySerial(const QString &serial) const
     return ctrl->getPowerMeasurements();
 }
 
+QVariantMap CorneaWidget::getPackageVersionsBySerial(const QString &serial) const
+{
+    CorneaController *ctrl = getControllerBySerial(serial);
+    if (!ctrl || !ctrl->isConnected()) return QVariantMap();
+    return ctrl->getPackageVersions();
+}
 QString CorneaWidget::getVariantBySerial(const QString &serial) const
 {
     DeviceControlPanel *panel = getPanelBySerial(serial);
