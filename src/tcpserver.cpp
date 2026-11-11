@@ -558,19 +558,6 @@ QJsonObject TcpServer::handleGetVersions(const QJsonObject &params)
         return response;
     }
 
-    QStringList unavailable;
-    if (arDisplayLabVersion.isEmpty()) {
-        unavailable.append(QStringLiteral("ar_display_lab_lib"));
-    }
-    if (rj1ExternalVersion.isEmpty()) {
-        unavailable.append(QStringLiteral("rj1lib_external"));
-    }
-    if (!unavailable.isEmpty()) {
-        QJsonObject response = makeError(
-            QStringLiteral("Package versions unavailable: %1").arg(unavailable.join(QStringLiteral(", "))));
-        response[QStringLiteral("data")] = data;
-        return response;
-    }
     return makeSuccess(data);
 }
 QJsonObject TcpServer::handleGetStatus(const QJsonObject &params)

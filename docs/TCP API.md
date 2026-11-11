@@ -132,9 +132,9 @@ CorneaWidget 內建 TCP server，供其他應用程式遠端控制設備。
 **取得軟體及套件版本：**
 ```json
 {"cmd": "getVersions", "serial": "LITE20240101"}
-→ {"cmd": "getVersions", "success": true, "data": {"software_version": "1.1.31", "ar_display_lab_lib": "<installed version>", "rj1lib_external": "<installed version>"}}
+→ {"cmd": "getVersions", "success": true, "data": {"software_version": "1.1.32", "ar_display_lab_lib": "<installed version>", "rj1lib_external": "<installed version>"}}
 ```
-getVersions needs the serial of an initialized, connected controller because package versions come from that controller's existing Python instance. It is read-only and does not power or otherwise change the device. If either package version is unavailable, the response has success false; data still contains software_version and uses an empty string for each unavailable package value.
+getVersions requires a serial parameter. Package-version lookup uses the corresponding initialized, connected Python instance; unavailable package values remain empty. It is read-only and does not power or otherwise change the device. If one or both package version fields are unavailable, the response still has success true; data keeps all three fields, with an empty string for each unavailable package version. Omitting serial retains the existing success false error response.
 **列出設備：**
 ```json
 {"cmd": "listDevices"}
